@@ -72,58 +72,35 @@ BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 
 
-
 # =========================================================
-# CONEXIÓN A GOOGLE SHEETS (LOCAL Y STREAMLIT CLOUD)
+# CONEXIÓN A GOOGLE SHEETS (LOCAL CON CREDENTIALS.JSON)
 # =========================================================
 
 def conectar_google_sheets():
-
+    ruta = Path(__file__).parent / "credentials.json"
+    with open(ruta, "r", encoding="utf-8") as archivo:
+        credenciales_json = json.load(archivo)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
-
-    ruta = Path(__file__).parent / "credentials.json"
-
-    # En computadora local: utilizar credentials.json
-    if ruta.exists():
-        with open(ruta, "r", encoding="utf-8") as archivo:
-            credenciales_json = json.load(archivo)
-
-    # En Streamlit Cloud: utilizar Secrets
-    else:
-        try:
-            credenciales_json = dict(st.secrets["gcp_service_account"])
-        except (KeyError, FileNotFoundError) as error:
-            raise RuntimeError(
-                "No se encontraron las credenciales de Google Sheets. "
-                "Configura gcp_service_account en Streamlit Secrets."
-            ) from error
-
     credenciales = Credentials.from_service_account_info(
         credenciales_json,
         scopes=scopes
     )
-
     cliente = gspread.authorize(credenciales)
 
     try:
         spreadsheet_id = "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY"
-
         documento = cliente.open_by_key(spreadsheet_id)
-
         hoja = documento.worksheet("OFICIOS")
-
-    except gspread.exceptions.APIError as error:
+        
+    except gspread.exceptions.APIError as e:
         raise RuntimeError(
-            f"Error al abrir Google Sheets: {error.response.text}"
-        ) from error
-
-    except Exception as error:
-        raise RuntimeError(
-            f"Error en la conexión con Google Sheets: {error}"
-        ) from error
+            f"Error al abrir el archivo: {e.response.text}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"Error en la conexión: {e}") from e
 
     return hoja
 
@@ -716,6 +693,40 @@ div[data-testid="stDateInput"] input:focus {
         padding-left: 20px !important;
         padding-right: 20px !important;
     }
+}
+
+/* =========================================================
+   FORMULARIO DE REGISTRO - TEXTO LEGIBLE
+   ========================================================= */
+
+/* Títulos del formulario */
+[data-testid="stMain"] h1,
+[data-testid="stMain"] h2,
+[data-testid="stMain"] h3,
+[data-testid="stMain"] h4 {
+    color: #10283b !important;
+}
+
+/* Etiquetas de campos */
+[data-testid="stMain"] label,
+[data-testid="stMain"] label p {
+    color: #10283b !important;
+}
+
+/* Texto auxiliar */
+[data-testid="stMain"] .stMarkdown p {
+    color: #10283b;
+}
+
+/* Texto escrito en campos normales */
+[data-testid="stMain"] input,
+[data-testid="stMain"] textarea {
+    color: #10283b !important;
+}
+
+/* Evitar que el texto de los botones cambie */
+[data-testid="stMain"] button p {
+    color: inherit !important;
 }
 
 </style>
