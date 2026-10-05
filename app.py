@@ -73,17 +73,28 @@ ASSETS_DIR = BASE_DIR / "assets"
 
 
 # =========================================================
-# CONEXIÓN A GOOGLE SHEETS (LOCAL CON CREDENTIALS.JSON)
+# CONEXIÓN A GOOGLE SHEETS (HÍBRIDA: LOCAL + SECRETS)
 # =========================================================
 
 def conectar_google_sheets():
-    ruta = Path(__file__).parent / "credentials.json"
-    with open(ruta, "r", encoding="utf-8") as archivo:
-        credenciales_json = json.load(archivo)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
+
+    ruta = Path(__file__).parent / "credentials.json"
+
+    if ruta.exists():
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            credenciales_json = json.load(archivo)
+    else:
+        try:
+            credenciales_json = dict(st.secrets["gcp_service_account"])
+        except (KeyError, FileNotFoundError) as error:
+            raise RuntimeError(
+                "No se encontraron las credenciales de Google Sheets."
+            ) from error
+
     credenciales = Credentials.from_service_account_info(
         credenciales_json,
         scopes=scopes
