@@ -72,35 +72,58 @@ BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 
 
+
 # =========================================================
-# CONEXIÓN A GOOGLE SHEETS (LOCAL CON CREDENTIALS.JSON)
+# CONEXIÓN A GOOGLE SHEETS (LOCAL Y STREAMLIT CLOUD)
 # =========================================================
 
 def conectar_google_sheets():
-    ruta = Path(__file__).parent / "credentials.json"
-    with open(ruta, "r", encoding="utf-8") as archivo:
-        credenciales_json = json.load(archivo)
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
+
+    ruta = Path(__file__).parent / "credentials.json"
+
+    # En computadora local: utilizar credentials.json
+    if ruta.exists():
+        with open(ruta, "r", encoding="utf-8") as archivo:
+            credenciales_json = json.load(archivo)
+
+    # En Streamlit Cloud: utilizar Secrets
+    else:
+        try:
+            credenciales_json = dict(st.secrets["gcp_service_account"])
+        except (KeyError, FileNotFoundError) as error:
+            raise RuntimeError(
+                "No se encontraron las credenciales de Google Sheets. "
+                "Configura gcp_service_account en Streamlit Secrets."
+            ) from error
+
     credenciales = Credentials.from_service_account_info(
         credenciales_json,
         scopes=scopes
     )
+
     cliente = gspread.authorize(credenciales)
 
     try:
         spreadsheet_id = "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY"
+
         documento = cliente.open_by_key(spreadsheet_id)
+
         hoja = documento.worksheet("OFICIOS")
-        
-    except gspread.exceptions.APIError as e:
+
+    except gspread.exceptions.APIError as error:
         raise RuntimeError(
-            f"Error al abrir el archivo: {e.response.text}"
-        ) from e
-    except Exception as e:
-        raise RuntimeError(f"Error en la conexión: {e}") from e
+            f"Error al abrir Google Sheets: {error.response.text}"
+        ) from error
+
+    except Exception as error:
+        raise RuntimeError(
+            f"Error en la conexión con Google Sheets: {error}"
+        ) from error
 
     return hoja
 
