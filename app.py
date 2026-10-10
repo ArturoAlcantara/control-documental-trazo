@@ -10,6 +10,23 @@ import streamlit.components.v1 as components
 import gspread
 from google.oauth2.service_account import Credentials
 
+from io import BytesIO
+from datetime import datetime
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Table,
+    TableStyle,
+    Paragraph,
+    Spacer,
+    KeepTogether,
+)
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.enums import TA_CENTER
+from xml.sax.saxutils import escape
+
 
 # =========================================================
 # CONFIGURACIÓN
@@ -22,10 +39,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-
-# =========================================================
-# FUNCIÓN PARA APLICAR EL FONDO
-# =========================================================
 
 def aplicar_fondo():
     ruta = Path(__file__).parent / "assets" / "fondo_ferroviario.png"
@@ -70,6 +83,57 @@ if "autenticado" not in st.session_state:
     st.session_state.autenticado = False
 if "usuario_actual" not in st.session_state:
     st.session_state.usuario_actual = None
+if "usuario_id" not in st.session_state:
+    st.session_state.usuario_id = None
+if "rol" not in st.session_state:
+    st.session_state.rol = "auxiliar"
+if "cargo_institucional" not in st.session_state:
+    st.session_state.cargo_institucional = ""
+if "responsable_oficios" not in st.session_state:
+    st.session_state.responsable_oficios = ""
+
+
+# Los roles se definen en .streamlit/secrets.toml, NO por similitud de nombres.
+ROLES_VALIDOS = ("propietario", "administrador", "auxiliar")
+
+
+def obtener_rol():
+    """Rol de la sesión autenticada; sin asignación explícita = auxiliar."""
+    rol = str(st.session_state.get("rol", "auxiliar")).strip().lower()
+    return rol if rol in ROLES_VALIDOS else "auxiliar"
+
+
+def es_administrador():
+    return obtener_rol() in ("propietario", "administrador")
+
+
+def es_propietario():
+    return obtener_rol() == "propietario"
+
+
+# PASO 2: permisos. El responsable se configura por cuenta en secrets.toml.
+# No se conceden permisos de edición por coincidencias parciales de nombres.
+def responsable_de_sesion():
+    return str(st.session_state.get("responsable_oficios", "")).strip()
+
+
+def puede_editar_responsable(responsable):
+    if not st.session_state.get("autenticado", False):
+        return False
+    if es_administrador():
+        return True
+    asignado = responsable_de_sesion()
+    return bool(asignado) and normalizar_texto(asignado) == normalizar_texto(responsable)
+
+
+def exigir_permiso_edicion(responsable):
+    if not puede_editar_responsable(responsable):
+        raise PermissionError("Solo puedes modificar oficios asignados a tu cuenta.")
+
+
+def exigir_sesion():
+    if not st.session_state.get("autenticado", False):
+        raise PermissionError("Debes iniciar sesión para realizar esta operación.")
 
 
 # =========================================================
@@ -116,10 +180,19 @@ def mostrar_login():
             key="login_boton"
         ):
             try:
-                datos_usuario = st.secrets["usuarios"][usuario.lower()]
+                identificador = usuario.strip().lower()
+                datos_usuario = st.secrets["usuarios"][identificador]
                 if contrasena == datos_usuario["password"]:
+                    rol_configurado = str(datos_usuario.get("rol", "auxiliar")).strip().lower()
+                    if rol_configurado not in ROLES_VALIDOS:
+                        st.error("El rol de esta cuenta no es válido. Contacta al responsable del sistema.")
+                        return
                     st.session_state.autenticado = True
+                    st.session_state.usuario_id = identificador
                     st.session_state.usuario_actual = datos_usuario["nombre"]
+                    st.session_state.rol = rol_configurado
+                    st.session_state.cargo_institucional = str(datos_usuario.get("cargo", ""))
+                    st.session_state.responsable_oficios = str(datos_usuario.get("responsable", "")).strip()
                     st.session_state.menu_activo = "home"
                     st.rerun()
                 else:
@@ -131,8 +204,10 @@ def mostrar_login():
 def mostrar_sesion():
     col_sesion1, col_sesion2 = st.columns([6, 1])
     with col_sesion2:
+        rol = st.session_state.get("rol", "auxiliar")
         st.caption(
-            f"Sesión: {st.session_state.usuario_actual}"
+           f"Sesión: {st.session_state.usuario_actual} | "
+         f"{rol.capitalize()}"
         )
         if st.button(
             "Cerrar sesión",
@@ -141,6 +216,10 @@ def mostrar_sesion():
         ):
             st.session_state.autenticado = False
             st.session_state.usuario_actual = None
+            st.session_state.usuario_id = None
+            st.session_state.rol = "auxiliar"
+            st.session_state.cargo_institucional = ""
+            st.session_state.responsable_oficios = ""
             st.session_state.menu_activo = "home"
             st.rerun()
 
@@ -153,9 +232,6 @@ if not st.session_state.autenticado:
     mostrar_login()
     st.stop()
 
-
-if st.session_state.menu_activo == "home":
-    aplicar_fondo()
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -252,6 +328,7 @@ def buscar_oficios(consulta):
     return resultados
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def obtener_oficios():
     try:
         hoja = conectar_google_sheets()
@@ -262,11 +339,318 @@ def obtener_oficios():
 
 
 def guardar_oficio(datos):
+    exigir_sesion()
     hoja = conectar_google_sheets()
     hoja.append_row(
         datos,
         value_input_option="USER_ENTERED"
     )
+    obtener_oficios.clear()
+
+
+def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valor):
+    """Actualiza una sola celda del oficio, verificando la identidad antes de escribir[cite: 4]."""
+    hoja = conectar_google_sheets()
+    valores = hoja.get_all_values()
+    if not valores:
+        raise ValueError("La hoja de oficios está vacía.")
+    cabeceras = [c.strip() for c in valores[0]]
+    for nombre in ("Folio", "No. de oficio", columna):
+        if nombre not in cabeceras:
+            raise ValueError(f"No se encontró la columna {nombre} en Google Sheets.")
+    col_folio = cabeceras.index("Folio")
+    col_numero = cabeceras.index("No. de oficio")
+    col_destino = cabeceras.index(columna)
+    coincidencias = []
+    for indice, fila in enumerate(valores[1:], start=2):
+        folio = fila[col_folio].strip() if col_folio < len(fila) else ""
+        numero = fila[col_numero].strip() if col_numero < len(fila) else ""
+        if folio == str(folio_original).strip() and numero == str(numero_original).strip():
+            coincidencias.append(indice)
+    if len(coincidencias) != 1:
+        raise ValueError("No se pudo identificar de forma única el oficio. No se guardaron cambios.")
+    fila_objetivo = coincidencias[0]
+    if "Responsable" not in cabeceras:
+        raise ValueError("No existe la columna Responsable en Google Sheets.")
+    fila_actual = valores[fila_objetivo - 1]
+    col_responsable = cabeceras.index("Responsable")
+    responsable_actual = fila_actual[col_responsable] if col_responsable < len(fila_actual) else ""
+    exigir_permiso_edicion(responsable_actual)
+    # Un auxiliar no puede transferir un oficio a otra persona.
+    if columna == "Responsable" and not es_administrador():
+        if normalizar_texto(nuevo_valor) != normalizar_texto(responsable_actual):
+            raise PermissionError("Solo los administradores pueden reasignar oficios.")
+    if columna in ("Folio", "No. de oficio"):
+        for indice, fila in enumerate(valores[1:], start=2):
+            if indice == fila_objetivo:
+                continue
+            valor = fila[col_destino].strip() if col_destino < len(fila) else ""
+            if valor == str(nuevo_valor).strip():
+                raise ValueError(f"Ya existe otro oficio con ese valor en {columna}.")
+    hoja.update_cell(fila_objetivo, col_destino + 1, nuevo_valor)
+    obtener_oficios.clear()
+
+
+def actualizar_estatus_y_entrega(folio_original, numero_original, nuevo_estatus, fecha_entrega):
+    """Guarda juntos el estatus y la fecha; conserva documentos ya archivados."""
+    if nuevo_estatus not in ESTATUS_OFICIOS:
+        raise ValueError("Selecciona uno de los seis estatus permitidos.")
+    if nuevo_estatus == "Firmado" and not fecha_entrega:
+        raise ValueError("Debes seleccionar una fecha de entrega para un oficio firmado.")
+
+    hoja = conectar_google_sheets()
+    valores = hoja.get_all_values()
+    if not valores:
+        raise ValueError("La hoja de oficios está vacía.")
+    cabeceras = [nombre.strip() for nombre in valores[0]]
+    requeridas = ("Folio", "No. de oficio", "Estatus", "Fecha de entrega")
+    for nombre in requeridas:
+        if nombre not in cabeceras:
+            raise ValueError(f"No existe la columna {nombre} en Google Sheets.")
+
+    col_folio = cabeceras.index("Folio")
+    col_numero = cabeceras.index("No. de oficio")
+    coincidencias = []
+    for indice, fila in enumerate(valores[1:], start=2):
+        folio = fila[col_folio].strip() if col_folio < len(fila) else ""
+        numero = fila[col_numero].strip() if col_numero < len(fila) else ""
+        if folio == str(folio_original).strip() and numero == str(numero_original).strip():
+            coincidencias.append(indice)
+    if len(coincidencias) != 1:
+        raise ValueError("No se pudo identificar de forma única el oficio.")
+
+    if "Responsable" not in cabeceras:
+        raise ValueError("No existe la columna Responsable en Google Sheets.")
+    fila_actual = valores[coincidencias[0] - 1]
+    col_responsable = cabeceras.index("Responsable")
+    responsable_actual = fila_actual[col_responsable] if col_responsable < len(fila_actual) else ""
+    exigir_permiso_edicion(responsable_actual)
+
+    from gspread.utils import rowcol_to_a1
+    fila = coincidencias[0]
+    celda_estatus = rowcol_to_a1(fila, cabeceras.index("Estatus") + 1)
+    celda_entrega = rowcol_to_a1(fila, cabeceras.index("Fecha de entrega") + 1)
+    hoja.batch_update([
+        {"range": celda_estatus, "values": [[nuevo_estatus]]},
+        {"range": celda_entrega, "values": [[fecha_entrega if nuevo_estatus == "Firmado" else ""]]},
+    ], value_input_option="USER_ENTERED")
+    obtener_oficios.clear()
+
+
+ESTATUS_OFICIOS = [
+    "En elaboración",
+    "En correcciones",
+    "En revisión",
+    "En firma",
+    "Firmado",
+    "Recaído",
+]
+
+# =========================================================
+# GENERACIÓN DE REPORTE INSTITUCIONAL EN PDF
+# =========================================================
+
+def generar_pdf_oficios(registros):
+    """Reporte imprimible: fechas, observaciones y firmas según los responsables[cite: 7]."""
+    buffer = BytesIO()
+    ruta_logo = Path(__file__).parent / "assets" / "logo_diseno_geometrico.png"
+    ancho, alto = landscape(letter)
+    azul = colors.HexColor("#273B49")
+    acero = colors.HexColor("#647E8D")
+    dorado = colors.HexColor("#B99A65")
+    gris = colors.HexColor("#D9E2E7")
+
+    def dibujar_canvas(canvas_obj, doc):
+        canvas_obj.saveState()
+        if ruta_logo.exists():
+            try:
+                img_reader = ImageReader(str(ruta_logo))
+                canvas_obj.saveState()
+                canvas_obj.setFillAlpha(0.10)
+                canvas_obj.drawImage(
+                    img_reader, ancho / 2 - 190, alto / 2 - 190,
+                    width=380, height=380, mask="auto"
+                )
+                canvas_obj.restoreState()
+            except Exception:
+                pass
+        canvas_obj.setFillColor(azul)
+        canvas_obj.rect(35, alto - 49, ancho - 70, 29, fill=1, stroke=0)
+        canvas_obj.setFillColor(dorado)
+        canvas_obj.rect(35, alto - 52, ancho - 70, 3, fill=1, stroke=0)
+        canvas_obj.setFillColor(colors.white)
+        canvas_obj.setFont("Helvetica-Bold", 9)
+        canvas_obj.drawString(45, alto - 38, "CONTROL DOCUMENTAL - MESA DE DISEÑO GEOMÉTRICO")
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.drawRightString(
+            ancho - 45, alto - 38,
+            f"Fecha de emisión: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        )
+        canvas_obj.setFont("Helvetica", 8)
+        canvas_obj.setFillColor(acero)
+        canvas_obj.drawString(35, 30, "Sistema de Control Documental - Ferrocarriles")
+        canvas_obj.drawRightString(ancho - 35, 30, f"Página {doc.page}")
+        canvas_obj.restoreState()
+
+    documento = SimpleDocTemplate(
+        buffer, pagesize=(ancho, alto), leftMargin=35, rightMargin=35,
+        topMargin=59, bottomMargin=44
+    )
+    estilo_encabezado = ParagraphStyle(
+        "PDFEncabezadoCompacto", fontName="Helvetica-Bold", fontSize=6.4,
+        leading=7.4, textColor=colors.white, alignment=TA_CENTER,
+        splitLongWords=True
+    )
+    estilo_celda = ParagraphStyle(
+        "PDFCeldaCentrada", fontName="Helvetica", fontSize=6.4,
+        leading=7.6, textColor=colors.HexColor("#203849"),
+        alignment=TA_CENTER, splitLongWords=True
+    )
+    estilo_firma = ParagraphStyle(
+        "PDFFirma", fontName="Helvetica", fontSize=8,
+        leading=11, textColor=azul, alignment=TA_CENTER
+    )
+    estilo_titulo = ParagraphStyle(
+        "PDFTituloCompacto", fontName="Helvetica-Bold", fontSize=10,
+        leading=11.5, textColor=azul, alignment=TA_CENTER
+    )
+
+    def texto(valor):
+        if valor is None or pd.isna(valor):
+            return ""
+        return str(valor).strip()
+
+    def celda(valor, estilo=estilo_celda):
+        return Paragraph(escape(texto(valor)).replace("\n", "<br/>"), estilo)
+
+    def fecha_legible(valor):
+        cadena = texto(valor)
+        if not cadena:
+            return ""
+        for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(cadena[:10], formato).strftime("%d/%m/%Y")
+            except ValueError:
+                continue
+        return cadena
+
+    elementos = [
+        Paragraph("RELACIÓN INSTITUCIONAL DE OFICIOS EN TRÁMITE", estilo_titulo),
+        Spacer(1, 5),
+    ]
+    cabeceras = [
+        "Folio", "No. de oficio", "Asunto", "Proyecto", "Responsable",
+        "Estatus", "Recepción", "Entrega", "Observaciones"
+    ]
+    datos_tabla = [[celda(c, estilo_encabezado) for c in cabeceras]]
+    for _, fila in registros.iterrows():
+        estatus = texto(fila.get("Estatus", ""))
+        fecha_entrega = (
+            fecha_legible(fila.get("Fecha de entrega", "")) or "Pendiente"
+            if normalizar_texto(estatus) == normalizar_texto("Firmado")
+            else "Pendiente"
+        )
+        datos_tabla.append([
+            celda(fila.get("Folio", "")),
+            celda(fila.get("No. de oficio", "")),
+            celda(fila.get("Asunto", "")),
+            celda(fila.get("Proyecto", "")),
+            celda(fila.get("Responsable", "")),
+            celda(estatus),
+            celda(fecha_legible(fila.get("Fecha de recepción", ""))),
+            celda(fecha_entrega),
+            celda(fila.get("Observaciones", "")),
+        ])
+
+    anchos_columnas = [43, 65, 145, 90, 65, 58, 70, 70, 116]
+    tabla = Table(datos_tabla, colWidths=anchos_columnas, repeatRows=1, hAlign="CENTER")
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), azul),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("GRID", (0, 0), (-1, -1), 0.45, gris),
+    ]))
+    elementos.extend([tabla, Spacer(1, 12)])
+
+    auxiliares = {
+        "ricardo": "Ricardo Godínez",
+        "cecilia": "Cecilia Santos",
+        "jesus": "Jesús Rodriguez",
+        "alejandra": "Alejandra Cardoso",
+        "john": "John Bautista",
+        "magali": "Magali Rivera",
+    }
+    responsables = {
+        normalizar_texto(v)
+        for v in registros.get("Responsable", pd.Series(dtype=str)).fillna("").astype(str)
+    }
+    nombres_presentes = [
+        nombre for clave, nombre in auxiliares.items()
+        if clave in responsables or normalizar_texto(nombre) in responsables
+    ]
+
+    def bloque_firma_individual(nombre, cargo, ancho_linea=145, matricula=None):
+        if matricula:
+            texto_firma = (
+                f"<b>{escape(nombre)}</b><br/>"
+                f"{escape(cargo)}<br/>{escape(matricula)}"
+            )
+        else:
+            texto_firma = f"<b>{escape(nombre)}</b><br/>{escape(cargo)}"
+        contenido = Paragraph(texto_firma, estilo_firma)
+        bloque = Table(
+            [[contenido]], colWidths=[ancho_linea], hAlign="CENTER"
+        )
+        bloque.setStyle(TableStyle([
+            ("LINEABOVE", (0, 0), (0, 0), 0.8, azul),
+            ("ALIGN", (0, 0), (0, 0), "CENTER"),
+            ("TOPPADDING", (0, 0), (0, 0), 7),
+            ("LEFTPADDING", (0, 0), (0, 0), 2),
+            ("RIGHTPADDING", (0, 0), (0, 0), 2),
+        ]))
+        return bloque
+
+    elementos.append(KeepTogether([
+        Paragraph("VALIDACIÓN Y FIRMAS", estilo_titulo),
+        Spacer(1, 18),
+        bloque_firma_individual(
+            "Jefa de la Mesa de Diseño Geométrico de Vía Férrea",
+            "Tte. Alondra Leticia Barajas Ramirez",
+            ancho_linea=220,
+            matricula="(A-10057999)",
+        ),
+    ]))
+
+    if nombres_presentes:
+        for inicio in range(0, len(nombres_presentes), 3):
+            grupo = nombres_presentes[inicio:inicio + 3]
+            celdas = [
+                bloque_firma_individual(nombre, "Auxiliar Técnico")
+                for nombre in grupo
+            ]
+            while len(celdas) < 3:
+                celdas.append("")
+            fila_firmas = Table(
+                [celdas], colWidths=[240, 240, 242], hAlign="CENTER"
+            )
+            fila_firmas.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            elementos.append(Spacer(1, 20))
+            elementos.append(KeepTogether([fila_firmas]))
+
+    documento.build(elementos, onFirstPage=dibujar_canvas, onLaterPages=dibujar_canvas)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 # =========================================================
@@ -330,13 +714,91 @@ def formulario_nuevo_oficio():
             "Puedes capturar un nuevo oficio."
         )
 
-    # =====================================================
-    # DATOS GENERALES
-    # =====================================================
+    # =========================================================
+    # FORMULARIO NUEVO OFICIO - DISEÑO COMPACTO
+    # =========================================================
 
-    st.markdown("#### Datos generales")
+    components.html(
+        """
+        <html>
+        <body style="margin:0; padding:0; background:transparent; font-family:Arial,sans-serif;">
 
-    col1, col2 = st.columns(2, gap="medium")
+        <div style="
+            display:flex;
+            justify-content:space-between;
+            align-items:center;
+            gap:15px;
+            width:100%;
+            box-sizing:border-box;
+            border-bottom:1px solid #526878;
+            padding-bottom:14px;
+        ">
+
+            <div style="flex:1;">
+                <div style="color:#D2A45F;font-size:10px;font-weight:bold;letter-spacing:2px;">
+                    ADMINISTRACIÓN DOCUMENTAL
+                </div>
+
+                <div style="color:white;font-size:22px;font-weight:bold;margin-top:7px;">
+                    Registrar nuevo oficio
+                </div>
+
+                <div style="color:#B8CAD5;font-size:12px;margin-top:5px;">
+                    Alta y seguimiento de documentación
+                </div>
+            </div>
+
+            <svg xmlns="http://www.w3.org/2000/svg"
+                 viewBox="0 0 250 90"
+                 style="width:180px;height:75px;flex-shrink:0;">
+
+                <g stroke="#68879A" stroke-width=".7" opacity=".28">
+                    <path d="M0 20H250 M0 45H250 M0 70H250"/>
+                    <path d="M30 0V90 M80 0V90 M130 0V90 M180 0V90 M230 0V90"/>
+                </g>
+
+                <path d="M10 75 L65 75 L110 30 L185 30 L240 10"
+                      fill="none" stroke="#D2A45F" stroke-width="2.5"/>
+
+                <path d="M10 84 L70 84 L115 39 L190 39 L245 19"
+                      fill="none" stroke="#91AFC0" stroke-width="1.5"/>
+
+                <g fill="#27343F" stroke="#D2A45F" stroke-width="2">
+                    <circle cx="65" cy="75" r="3"/>
+                    <circle cx="110" cy="30" r="3"/>
+                    <circle cx="185" cy="30" r="3"/>
+                    <circle cx="240" cy="10" r="3"/>
+                </g>
+            </svg>
+
+        </div>
+        </body>
+        </html>
+        """,
+        height=85,
+        scrolling=False
+    )
+
+    # =========================================================
+    # 01 · DATOS PRINCIPALES
+    # =========================================================
+
+    st.markdown(
+        """
+        <div style="
+            color:#E8F0F5;
+            font-size:13px;
+            font-weight:800;
+            margin-bottom:8px;
+            text-align:center;
+        ">
+            01 &nbsp; Datos principales
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns([1, 1.25, 1])
 
     with col1:
         folio = st.text_input(
@@ -344,133 +806,13 @@ def formulario_nuevo_oficio():
             key=f"folio_{version}"
         )
 
-        # =====================================================
-        # PROGRAMA Y PROYECTO
-        # =====================================================
-
-        programa = st.selectbox(
-            "Programa",
-            [
-                "Tren Maya",
-                "Trenes del Norte"
-            ],
-            index=None,
-            placeholder="Seleccionar programa",
-            key=f"programa_{version}"
-        )
-
-        fase = None
-        proyecto_seleccionado = None
-
-        # -----------------------------------------------------
-        # TREN MAYA
-        # -----------------------------------------------------
-
-        if programa == "Tren Maya":
-
-            proyecto_seleccionado = st.selectbox(
-                "Proyecto",
-                [
-                    "Terminales de Carga",
-                    "Bases de Mantenimiento",
-                    "Vialidades de Acceso a las Edificaciones"
-                ],
-                index=None,
-                placeholder="Seleccionar proyecto",
-                key=f"proyecto_maya_{version}"
-            )
-
-        # -----------------------------------------------------
-        # TRENES DEL NORTE
-        # -----------------------------------------------------
-
-        elif programa == "Trenes del Norte":
-
-            fase = st.selectbox(
-                "Fase",
-                [
-                    "Ingeniería a Detalle, Fase 1",
-                    "Ingeniería Básica, Fase 2"
-                ],
-                index=None,
-                placeholder="Seleccionar fase",
-                key=f"fase_norte_{version}"
-            )
-
-            if fase == "Ingeniería a Detalle, Fase 1":
-
-                proyecto_seleccionado = st.selectbox(
-                    "Proyecto",
-                    [
-                        "AIFA-Pachuca",
-                        "México-Querétaro"
-                    ],
-                    index=None,
-                    placeholder="Seleccionar proyecto",
-                    key=f"proyecto_norte_fase1_{version}"
-                )
-
-            elif fase == "Ingeniería Básica, Fase 2":
-
-                proyecto_seleccionado = st.selectbox(
-                    "Proyecto",
-                    [
-                        "San Luis Potosí-Saltillo",
-                        "Querétaro-San Luis Potosí",
-                        "Mazatlán-Los Mochis",
-                        "Irapuato-Guadalajara"
-                    ],
-                    index=None,
-                    placeholder="Seleccionar proyecto",
-                    key=f"proyecto_norte_fase2_{version}"
-                )
-
-        # -----------------------------------------------------
-        # PROYECTO NUEVO / PERSONALIZADO
-        # -----------------------------------------------------
-
-        proyecto_nuevo = st.text_input(
-            "Proyecto nuevo (opcional)",
-            placeholder="Escribe aquí si el proyecto no aparece en la lista...",
-            key=f"proyecto_nuevo_{version}"
-        )
-
-        # -----------------------------------------------------
-        # CONSTRUIR NOMBRE FINAL DEL PROYECTO
-        # -----------------------------------------------------
-
-        if proyecto_nuevo.strip():
-
-            # Si se escribió un proyecto nuevo, tiene prioridad
-            proyecto = proyecto_nuevo.strip()
-
-        elif programa == "Tren Maya" and proyecto_seleccionado:
-
-            proyecto = (
-                f"Tren Maya - {proyecto_seleccionado}"
-            )
-
-        elif (
-            programa == "Trenes del Norte"
-            and fase
-            and proyecto_seleccionado
-        ):
-
-            proyecto = (
-                f"Trenes del Norte - "
-                f"{fase} - "
-                f"{proyecto_seleccionado}"
-            )
-
-        else:
-            proyecto = ""
-
     with col2:
         numero = st.text_input(
             "No. de oficio",
             key=f"numero_{version}"
         )
 
+    with col3:
         responsable = st.selectbox(
             "Responsable",
             [
@@ -489,81 +831,279 @@ def formulario_nuevo_oficio():
             key=f"responsable_{version}"
         )
 
+    col4, col5 = st.columns([1, 1.6])
+
+    with col4:
+        programa = st.selectbox(
+            "Programa",
+            [
+                "Tren Maya",
+                "Trenes del Norte"
+            ],
+            index=None,
+            placeholder="Seleccionar programa",
+            key=f"programa_{version}"
+        )
+
+    with col5:
+        proyecto_nuevo = st.text_input(
+            "Proyecto nuevo (opcional)",
+            placeholder="Escribe aquí si el proyecto no aparece en la lista...",
+            key=f"proyecto_nuevo_{version}"
+        )
+
+    fase = None
+    proyecto_seleccionado = None
+
+    if programa == "Tren Maya":
+        proyecto_seleccionado = st.selectbox(
+            "Proyecto (Tren Maya)",
+            [
+                "Terminales de Carga",
+                "Bases de Mantenimiento",
+                "Vialidades de Acceso a las Edificaciones"
+            ],
+            index=None,
+            placeholder="Seleccionar proyecto",
+            key=f"proyecto_maya_{version}"
+        )
+    elif programa == "Trenes del Norte":
+        fase = st.selectbox(
+            "Fase",
+            [
+                "Ingeniería a Detalle, Fase 1",
+                "Ingeniería Básica, Fase 2"
+            ],
+            index=None,
+            placeholder="Seleccionar fase",
+            key=f"fase_norte_{version}"
+        )
+
+        if fase == "Ingeniería a Detalle, Fase 1":
+            proyecto_seleccionado = st.selectbox(
+                "Proyecto",
+                [
+                    "AIFA-Pachuca",
+                    "México-Querétaro"
+                ],
+                index=None,
+                placeholder="Seleccionar proyecto",
+                key=f"proyecto_norte_fase1_{version}"
+            )
+        elif fase == "Ingeniería Básica, Fase 2":
+            proyecto_seleccionado = st.selectbox(
+                "Proyecto",
+                [
+                    "San Luis Potosí-Saltillo",
+                    "Querétaro-San Luis Potosí",
+                    "Mazatlán-Los Mochis",
+                    "Irapuato-Guadalajara"
+                ],
+                index=None,
+                placeholder="Seleccionar proyecto",
+                key=f"proyecto_norte_fase2_{version}"
+            )
+
+    if proyecto_nuevo.strip():
+        proyecto = proyecto_nuevo.strip()
+    elif programa == "Tren Maya" and proyecto_seleccionado:
+        proyecto = f"Tren Maya - {proyecto_seleccionado}"
+    elif programa == "Trenes del Norte" and fase and proyecto_seleccionado:
+        proyecto = f"Trenes del Norte - {fase} - {proyecto_seleccionado}"
+    else:
+        proyecto = ""
+
     asunto = st.text_area(
         "Asunto",
         height=75,
         key=f"asunto_{version}"
     )
 
-    st.divider()
+    st.markdown(
+        """
+        <div style="
+            height:1px;
+            background:#607789;
+            margin:18px 0 16px 0;
+        "></div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    # =====================================================
-    # SEGUIMIENTO DEL TRÁMITE
-    # =====================================================
+    # =========================================================
+    # 02 · SEGUIMIENTO
+    # =========================================================
 
-    st.markdown("#### Seguimiento del trámite")
+    st.markdown(
+        """
+        <div style="
+            color:#E8F0F5;
+            font-size:13px;
+            font-weight:800;
+            margin-bottom:8px;
+            text-align:center;
+        ">
+            02 &nbsp; Seguimiento del trámite
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    col3, col4 = st.columns(2, gap="medium")
+    col6, col7, col8 = st.columns(3)
 
-    with col3:
+    with col6:
         estatus = st.selectbox(
-            "Estatus",
-            [
-                "En revisión",
-                "En espera de firma",
-                "Recaído",
-                "Concluido"
-            ],
-            key=f"estatus_{version}"
+            "Estatus", ESTATUS_OFICIOS, key=f"estatus_{version}"
         )
 
-        fecha_entrega = st.date_input(
-            "Fecha de entrega",
-            value=None,
-            key=f"entrega_{version}"
-        )
+    es_firmado = estatus == "Firmado"
 
-    with col4:
+    with col7:
         fecha_recepcion = st.date_input(
             "Fecha de recepción",
             value=None,
             key=f"recepcion_{version}"
         )
 
-        firmado = st.text_input(
-            "Oficio firmado · Enlace Drive",
-            key=f"firmado_{version}"
+    with col8:
+        fecha_entrega = st.date_input(
+            "Fecha de entrega",
+            value=None,
+            key=f"entrega_{version}",
+            disabled=not es_firmado
         )
 
-    st.divider()
+    # Oficio firmado
+    st.markdown(
+        """
+        <div style="
+            color:#E8F0F5;
+            font-size:11px;
+            font-weight:700;
+            margin-top:10px;
+            margin-bottom:4px;
+        ">
+            ▣ Oficio firmado
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-    # =====================================================
-    # DOCUMENTACIÓN ADJUNTA
-    # =====================================================
+    col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
 
-    st.markdown("#### Documentación adjunta")
-
-    col5, col6 = st.columns(2, gap="medium")
-
-    with col5:
-        st.markdown("**Antecedentes**")
-        antecedentes = documentos_formulario(
-            f"antecedentes_{version}"
+    with col_firmado_nombre:
+        nombre_firmado = st.text_input(
+            "Nombre del documento",
+            placeholder="Ej. LFSLPSTL-IB-26-2119",
+            key=f"nuevo_nombre_firmado_{version}",
+            disabled=not es_firmado
         )
 
-    with col6:
-        st.markdown("**Anexos**")
-        anexos = documentos_formulario(
-            f"anexos_{version}"
+    with col_firmado_link:
+        liga_firmado = st.text_input(
+            "Enlace de Drive",
+            placeholder="Pega aquí el enlace de Drive...",
+            key=f"nuevo_liga_firmado_{version}",
+            disabled=not es_firmado
         )
+
+    # Construir el JSON o string requerido para el guardado de 'firmado'
+    if es_firmado and (nombre_firmado.strip() or liga_firmado.strip()):
+        firmado = json.dumps([{
+            "nombre": nombre_firmado.strip(),
+            "url": liga_firmado.strip()
+        }], ensure_ascii=False)
+    else:
+        firmado = ""
+
+    st.markdown(
+        """
+        <div style="
+            height:1px;
+            background:#607789;
+            margin:18px 0 16px 0;
+        "></div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # =========================================================
+    # 03 · DOCUMENTACIÓN
+    # =========================================================
+
+    st.markdown(
+        """
+        <div style="
+            color:#E8F0F5;
+            font-size:13px;
+            font-weight:800;
+            margin-bottom:2px;
+            text-align:center;
+        ">
+            03 &nbsp; Documentación vinculada
+        </div>
+
+        <div style="
+            color:#B9CAD6;
+            font-size:10px;
+            margin-bottom:12px;
+        ">
+            Agrega los documentos relacionados con el expediente
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col_doc1, col_doc2 = st.columns(2)
+
+    with col_doc1:
+        st.markdown(
+            """
+            <div style="
+                color:#E8F0F5;
+                font-size:11px;
+                font-weight:700;
+                margin-bottom:4px;
+            ">
+                ▣ &nbsp; Antecedentes
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        antecedentes = documentos_formulario(f"antecedentes_{version}")
+
+    with col_doc2:
+        st.markdown(
+            """
+            <div style="
+                color:#E8F0F5;
+                font-size:11px;
+                font-weight:700;
+                margin-bottom:4px;
+            ">
+                ◇ &nbsp; Anexos
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        anexos = documentos_formulario(f"anexos_{version}")
 
     observaciones = st.text_area(
         "Observaciones",
-        height=75,
+        height=70,
         key=f"observaciones_{version}"
     )
 
-    st.divider()
+    st.markdown(
+        """
+        <div style="
+            height:1px;
+            background:#607789;
+            margin:18px 0 14px 0;
+        "></div>
+        """,
+        unsafe_allow_html=True
+    )
 
     # =====================================================
     # GUARDAR OFICIO
@@ -571,9 +1111,9 @@ def formulario_nuevo_oficio():
 
     if st.button(
         "Guardar oficio",
-        type="primary",
+        key="guardar_nuevo_oficio",
         use_container_width=True,
-        key=f"guardar_oficio_{version}"
+        type="primary"
     ):
 
         # Validar campos obligatorios
@@ -585,6 +1125,10 @@ def formulario_nuevo_oficio():
 
         if not responsable:
             st.error("Debes seleccionar un responsable.")
+            return
+
+        if es_firmado and fecha_entrega is None:
+            st.error("Para marcar un oficio como Firmado debes indicar su fecha de entrega.")
             return
 
         try:
@@ -605,7 +1149,7 @@ def formulario_nuevo_oficio():
                     )
                     return
 
-                # Preparar información (asegurando que el proyecto use el valor seleccionado)
+                # Preparar información
                 proyecto_str = str(proyecto) if proyecto else ""
                 datos = [
                     folio.strip(),
@@ -617,7 +1161,7 @@ def formulario_nuevo_oficio():
                     fecha_recepcion.isoformat()
                         if fecha_recepcion else "",
                     fecha_entrega.isoformat()
-                        if fecha_entrega else "",
+                        if es_firmado and fecha_entrega else "",
                     json.dumps(
                         antecedentes,
                         ensure_ascii=False
@@ -626,7 +1170,7 @@ def formulario_nuevo_oficio():
                         anexos,
                         ensure_ascii=False
                     ),
-                    firmado.strip(),
+                    firmado,
                     observaciones.strip()
                 ]
 
@@ -684,11 +1228,8 @@ def mostrar_documentos(oficio):
 
     firmado = oficio.get("Firmado", "")
 
-    if firmado:
-        st.link_button(
-            "Ver oficio firmado",
-            firmado
-        )
+    for documento in leer_documentos(firmado):
+        st.link_button(documento["nombre"], documento["url"])
 
     antecedentes = leer_documentos(
         oficio.get("Antecedente", "")
@@ -772,7 +1313,7 @@ html, body, [class*="css"] {
 }
 
 .stApp {
-    background-image: url("data:image/jpeg;base64,""" + obtener_imagen_base64("fondo_planos.jpg") + """");
+    background-image: url(""" + obtener_imagen_base64("fondo_planos.jpg") + """");
     background-size: cover;
     background-position: center center;
     background-repeat: no-repeat;
@@ -793,7 +1334,7 @@ footer {
 
 .block-container {
     max-width: 1200px !important;
-    padding-top: 8vh !important;
+    padding-top: 2rem !important;
     padding-left: 40px !important;
     padding-right: 40px !important;
     margin: 0 auto !important;
@@ -1058,6 +1599,16 @@ div[data-testid="stHorizontalBlock"] {
     gap: 12px;
 }
 
+/* =========================================================
+   PANEL DE INDICADORES Y CABECERAS
+   ========================================================= */
+
+.of-panel-header {
+    margin-top: 4px;
+    margin-bottom: 12px;
+    text-align: center;
+}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -1069,6 +1620,7 @@ div[data-testid="stHorizontalBlock"] {
 # =========================================================
 
 if st.session_state.menu_activo == "home":
+    aplicar_fondo()
 
     # -----------------------------------------------------
     # SESIÓN DEL USUARIO
@@ -1338,6 +1890,9 @@ if st.session_state.menu_activo == "home":
 
 elif st.session_state.menu_activo == "oficios":
 
+    # =========================================================
+    # ESTILO GRAFITO Y AZUL ACERO — MÓDULO OFICIOS
+    # =========================================================
     # -----------------------------------------------------
     # SESIÓN DEL USUARIO
     # -----------------------------------------------------
@@ -1351,14 +1906,13 @@ elif st.session_state.menu_activo == "oficios":
         st.markdown(
             f"""
             <style>
-            .stApp {{
-                background-image: url("data:image/png;base64,{fondo_oficios}");
-                background-size: cover;
-                background-position: center center;
-                background-repeat: no-repeat;
-                background-attachment: fixed;
+            [data-testid="stAppViewContainer"] {{
+                background-image: url("data:image/png;base64,{fondo_oficios}") !important;
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;
+                background-attachment: fixed !important;
             }}
-
             [data-testid="stSidebar"] {{
                 background-image: url("data:image/png;base64,{fondo_oficios}") !important;
                 background-size: cover !important;
@@ -1428,7 +1982,6 @@ elif st.session_state.menu_activo == "oficios":
         logo_base64 = cargar_imagen_base64(
             "assets/logo_diseno_geometrico.png"
         )
-
         if logo_base64:
             st.markdown(
                 f"""
@@ -1476,7 +2029,7 @@ elif st.session_state.menu_activo == "oficios":
         st.divider()
 
     # ============================================================
-    # 1. ENCABEZADO INSTITUCIONAL CON ESQUEMA FERROVIARIO
+    # 1. ENCABEZADO INSTITUCIONAL — DISEÑO MODERNO
     # ============================================================
 
     components.html(
@@ -1491,77 +2044,110 @@ elif st.session_state.menu_activo == "oficios":
             body {
                 margin: 0;
                 padding: 0;
-                font-family: Arial, sans-serif;
+                font-family: Arial, Helvetica, sans-serif;
                 background: transparent;
+                overflow: hidden;
             }
 
             .encabezado-oficios {
-                background-color: #343F46;
-                border-left: 5px solid #C6A36D;
-                border-radius: 10px;
-                padding: 25px 30px;
+                position: relative;
                 width: 100%;
-                min-height: 160px;
+                min-height: 178px;
+                padding: 30px 38px;
+                overflow: hidden;
 
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                gap: 25px;
+
+                background: linear-gradient(
+                    112deg,
+                    #142838 0%,
+                    #203B4B 58%,
+                    #314C58 100%
+                );
+
+                border: 1px solid rgba(198, 163, 109, 0.28);
+                border-radius: 14px;
+
+                box-shadow: 0 8px 24px rgba(16, 32, 48, 0.12);
+            }
+
+            .encabezado-oficios::before {
+                content: "";
+                position: absolute;
+                left: 0;
+                top: 26px;
+                bottom: 26px;
+                width: 4px;
+                background: #C6A36D;
+                border-radius: 0 4px 4px 0;
             }
 
             .encabezado-texto {
+                position: relative;
+                z-index: 2;
                 flex: 1;
                 min-width: 0;
             }
 
             .etiqueta {
-                color: #C6B18D;
-                font-size: 11px;
-                font-weight: bold;
-                letter-spacing: 2px;
+                display: inline-block;
+                color: #D9BF94;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 2.5px;
+                text-transform: uppercase;
             }
 
             .titulo {
+                margin: 13px 0 10px;
                 color: #FFFFFF;
-                font-size: 32px;
+                font-size: 31px;
                 font-weight: 700;
-                margin: 14px 0 0 0;
-                letter-spacing: 0.5px;
-            }
-
-            .linea-dorada {
-                background-color: #C6A36D;
-                width: 90px;
-                height: 3px;
-                margin: 12px 0;
+                letter-spacing: -0.6px;
+                line-height: 1.15;
             }
 
             .subtitulo {
-                color: #D2D9DD;
-                font-size: 14px;
                 margin: 0;
+                color: #C8D3D9;
+                font-size: 13px;
+                font-weight: 400;
+                line-height: 1.5;
+            }
+
+            .linea-dorada {
+                width: 44px;
+                height: 3px;
+                margin-top: 18px;
+                background: #C6A36D;
+                border-radius: 3px;
             }
 
             .esquema-ferroviario {
-                width: 35%;
-                max-width: 350px;
+                position: relative;
+                z-index: 1;
+                width: 38%;
+                max-width: 380px;
                 min-width: 200px;
-                opacity: 0.85;
+                opacity: 0.82;
             }
 
             .esquema-ferroviario svg {
+                display: block;
                 width: 100%;
                 height: auto;
-                display: block;
             }
 
             @media (max-width: 650px) {
                 .encabezado-oficios {
-                    padding: 22px;
+                    min-height: 155px;
+                    padding: 25px;
                 }
 
                 .titulo {
-                    font-size: 24px;
+                    font-size: 25px;
                 }
 
                 .esquema-ferroviario {
@@ -1577,18 +2163,18 @@ elif st.session_state.menu_activo == "oficios":
                 <div class="encabezado-texto">
 
                     <span class="etiqueta">
-                        CONTROL DOCUMENTAL
+                        CONTROL DOCUMENTAL / MESA DE DISEÑO GEOMÉTRICO
                     </span>
 
                     <h1 class="titulo">
-                        OFICIOS EN TRÁMITE
+                        Oficios en trámite
                     </h1>
 
-                    <div class="linea-dorada"></div>
-
                     <p class="subtitulo">
-                        Mesa de Diseño Geométrico · Seguimiento de oficios
+                        Consulta, registro y seguimiento documental
                     </p>
+
+                    <div class="linea-dorada"></div>
 
                 </div>
 
@@ -1598,9 +2184,9 @@ elif st.session_state.menu_activo == "oficios":
                          xmlns="http://www.w3.org/2000/svg">
 
                         <!-- Cuadrícula técnica -->
-                        <g stroke="#68777B"
+                        <g stroke="#8197A2"
                            stroke-width="0.5"
-                           opacity="0.35">
+                           opacity="0.28">
 
                             <path d="M15 5 V115"/>
                             <path d="M63 5 V115"/>
@@ -1614,21 +2200,20 @@ elif st.session_state.menu_activo == "oficios":
                             <path d="M0 45 H330"/>
                             <path d="M0 75 H330"/>
                             <path d="M0 105 H330"/>
-
                         </g>
 
-                        <!-- Alineamiento ferroviario -->
+                        <!-- Alineamiento principal -->
                         <path
                             d="M-10 100 C80 100 100 25 190 35 S280 85 340 20"
-                            stroke="#C6A36D"
-                            stroke-width="2.5"
+                            stroke="#D6B47C"
+                            stroke-width="2.8"
                             fill="none"
                         />
 
                         <!-- Línea paralela -->
                         <path
                             d="M-10 111 C80 111 100 36 190 46 S280 96 340 31"
-                            stroke="#A6B5BC"
+                            stroke="#A9BDC6"
                             stroke-width="1.5"
                             fill="none"
                         />
@@ -1636,30 +2221,29 @@ elif st.session_state.menu_activo == "oficios":
                         <!-- Trazo auxiliar -->
                         <path
                             d="M10 90 L48 80 L86 55 L130 30 L180 26 L230 43 L285 48"
-                            stroke="#A6B5BC"
-                            stroke-width="0.8"
+                            stroke="#B4C5CC"
+                            stroke-width="0.9"
                             stroke-dasharray="4 5"
                             fill="none"
-                            opacity="0.7"
+                            opacity="0.75"
                         />
 
                         <!-- Puntos de control -->
-                        <g fill="#343F46"
-                           stroke="#C6A36D"
-                           stroke-width="1.5">
+                        <g fill="#203B4B"
+                           stroke="#D6B47C"
+                           stroke-width="1.8">
 
-                            <circle cx="48" cy="80" r="3"/>
-                            <circle cx="130" cy="30" r="3"/>
-                            <circle cx="230" cy="43" r="3"/>
-
+                            <circle cx="48" cy="80" r="3.5"/>
+                            <circle cx="130" cy="30" r="3.5"/>
+                            <circle cx="230" cy="43" r="3.5"/>
                         </g>
 
-                        <!-- Identificador técnico -->
+                        <!-- Etiqueta técnica -->
                         <text
                             x="185"
                             y="112"
                             font-size="8"
-                            fill="#B5C0C5"
+                            fill="#C2CFD4"
                             letter-spacing="1.5"
                             text-anchor="middle"
                         >
@@ -1674,7 +2258,7 @@ elif st.session_state.menu_activo == "oficios":
         </body>
         </html>
         """,
-        height=190,
+        height=200,
         scrolling=False
     )
 
@@ -1693,8 +2277,8 @@ elif st.session_state.menu_activo == "oficios":
         estatus_series = df_oficios["Estatus"].astype(str).str.strip().str.lower()
         n_revision = (estatus_series == "en revisión").sum()
         n_firma = (estatus_series.isin(["en firma", "en espera de firma"])).sum()
-        n_concluidos = (estatus_series == "concluido").sum()
-        n_pendientes = (estatus_series != "concluido").sum()
+        n_concluidos = estatus_series.isin(["firmado", "concluido", "finalizado"]).sum()
+        n_pendientes = (~estatus_series.isin(["firmado", "concluido", "finalizado"])).sum()
 
     st.markdown(
         """
@@ -1705,8 +2289,8 @@ elif st.session_state.menu_activo == "oficios":
         ===================================================== */
 
         .of-panel-header {
-            margin-top: 18px;
-            margin-bottom: 18px;
+            margin-top: 4px;
+            margin-bottom: 12px;
         }
 
         .of-eyebrow {
@@ -1834,176 +2418,165 @@ elif st.session_state.menu_activo == "oficios":
     )
 
     # =========================================================
-    # INDICADORES (VIA COMPONENTS.HTML)
+    # INDICADORES — ESTILO INSTITUCIONAL MODERNO
     # =========================================================
 
     html_kpis = """
-<!DOCTYPE html>
-<html>
-<head>
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-<style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            font-family: Arial, Helvetica, sans-serif;
+            overflow: hidden;
+        }
 
-* {
-    box-sizing: border-box;
-}
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 13px;
+            width: 100%;
+            padding: 3px 1px 8px;
+        }
 
-body {
-    margin: 0;
-    padding: 0;
-    background: transparent;
-    font-family: Arial, sans-serif;
-}
+        .kpi {
+            position: relative;
+            height: 122px;
+            padding: 17px 19px;
+            background: #FFFFFF;
+            border: 1px solid #DFE5E9;
+            border-radius: 12px;
+            box-shadow: 0 4px 13px rgba(16, 40, 59, 0.07);
+            overflow: hidden;
+        }
 
-.kpi-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 14px;
-    width: 100%;
-}
+        .kpi::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            top: 17px;
+            bottom: 17px;
+            width: 3px;
+            background: #C6A36D;
+            border-radius: 0 3px 3px 0;
+        }
 
-.kpi {
-    position: relative;
-    overflow: hidden;
-    height: 125px;
-    padding: 18px 20px;
+        .kpi-top {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+        }
 
-    background: linear-gradient(
-        135deg,
-        #28586A 0%,
-        #347084 100%
-    );
+        .numero {
+            color: #142B3C;
+            font-size: 34px;
+            font-weight: 750;
+            line-height: 1;
+            letter-spacing: -1px;
+        }
 
-    border-radius: 10px;
-    border: 1px solid rgba(255,255,255,0.15);
+        .icono {
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #F0F4F6;
+            border: 1px solid #E2E8EC;
+            border-radius: 9px;
+            color: #496273;
+            font-size: 15px;
+            font-weight: 700;
+        }
 
-    box-shadow:
-        0 8px 18px rgba(16,40,59,0.10);
-}
+        .nombre {
+            margin-top: 12px;
+            color: #183348;
+            font-size: 12px;
+            font-weight: 750;
+        }
 
-.kpi::before {
-    content: "";
-    position: absolute;
+        .detalle {
+            margin-top: 5px;
+            color: #7C8B96;
+            font-size: 10px;
+            line-height: 1.3;
+        }
 
-    left: 0;
-    top: 0;
-    bottom: 0;
+        .revision::before {
+            background: #C6A36D;
+        }
 
-    width: 4px;
+        .firma::before {
+            background: #6887A0;
+        }
 
-    background: #B08A4A;
-}
+        .concluidos::before {
+            background: #4F927B;
+        }
 
-.kpi::after {
-    content: "";
-    position: absolute;
+        .pendientes::before {
+            background: #B77D61;
+        }
 
-    width: 170px;
-    height: 60px;
+        @media (max-width: 650px) {
+            .kpi-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+    </style>
+    </head>
 
-    right: -25px;
-    bottom: -31px;
+    <body>
+        <div class="kpi-grid">
 
-    border-top: 2px solid rgba(207,170,101,0.55);
-    border-radius: 50%;
+            <div class="kpi revision">
+                <div class="kpi-top">
+                    <div class="numero">__REVISION__</div>
+                    <div class="icono">R</div>
+                </div>
+                <div class="nombre">En revisión</div>
+                <div class="detalle">Documentación en análisis</div>
+            </div>
 
-    transform: rotate(-7deg);
-}
+            <div class="kpi firma">
+                <div class="kpi-top">
+                    <div class="numero">__FIRMA__</div>
+                    <div class="icono">F</div>
+                </div>
+                <div class="nombre">En firma</div>
+                <div class="detalle">Pendiente de formalización</div>
+            </div>
 
-.codigo {
-    position: absolute;
+            <div class="kpi concluidos">
+                <div class="kpi-top">
+                    <div class="numero">__CONCLUIDOS__</div>
+                    <div class="icono">✓</div>
+                </div>
+                <div class="nombre">Firmados</div>
+                <div class="detalle">Documentos formalizados</div>
+            </div>
 
-    right: 16px;
-    top: 14px;
+            <div class="kpi pendientes">
+                <div class="kpi-top">
+                    <div class="numero">__PENDIENTES__</div>
+                    <div class="icono">!</div>
+                </div>
+                <div class="nombre">Pendientes</div>
+                <div class="detalle">Requieren seguimiento</div>
+            </div>
 
-    color: rgba(255,255,255,0.25);
-
-    font-size: 9px;
-    font-weight: 700;
-
-    letter-spacing: 1.5px;
-}
-
-.numero {
-    position: relative;
-    z-index: 2;
-
-    color: #FFFFFF;
-
-    font-size: 35px;
-    font-weight: 700;
-
-    line-height: 1;
-
-    margin-bottom: 11px;
-}
-
-.nombre {
-    position: relative;
-    z-index: 2;
-
-    color: #D2AE69;
-
-    font-size: 10px;
-    font-weight: 700;
-
-    letter-spacing: 1.3px;
-
-    text-transform: uppercase;
-}
-
-.detalle {
-    position: relative;
-    z-index: 2;
-
-    color: #B8C2C8;
-
-    font-size: 10px;
-
-    margin-top: 6px;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="kpi-grid">
-
-    <div class="kpi">
-        <div class="codigo">REV</div>
-        <div class="numero">__REVISION__</div>
-        <div class="nombre">En revisión</div>
-        <div class="detalle">Documentación en análisis</div>
-    </div>
-
-    <div class="kpi">
-        <div class="codigo">FIR</div>
-        <div class="numero">__FIRMA__</div>
-        <div class="nombre">En firma</div>
-        <div class="detalle">Pendiente de formalización</div>
-    </div>
-
-    <div class="kpi">
-        <div class="codigo">CON</div>
-        <div class="numero">__CONCLUIDOS__</div>
-        <div class="nombre">Concluidos</div>
-        <div class="detalle">Expedientes finalizados</div>
-    </div>
-
-    <div class="kpi">
-        <div class="codigo">PEN</div>
-        <div class="numero">__PENDIENTES__</div>
-        <div class="nombre">Pendientes</div>
-        <div class="detalle">Requieren seguimiento</div>
-    </div>
-
-</div>
-
-</body>
-</html>
-"""
+        </div>
+    </body>
+    </html>
+    """
 
     html_kpis = (
         html_kpis
@@ -2152,261 +2725,349 @@ body {
         )
 
 
-        # =====================================================
-        # TÍTULO DEL PANEL
-        # =====================================================
+        # Detalle institucional del expediente
+        from html import escape
 
-        st.markdown(
-            """
-<div style="margin-top:18px; margin-bottom:10px;">
-    <div style="color:#10283B; font-size:17px; font-weight:750;">
-        ▣ &nbsp; Detalle del expediente
-    </div>
-    <div style="color:#81909B; font-size:10px; margin-left:27px; margin-top:2px;">
-        Información general del oficio seleccionado
-    </div>
-</div>
-""",
-            unsafe_allow_html=True
-        )
+        def dato_visible(valor, defecto="—"):
+            valor = str(valor or "").strip()
+            return escape(valor if valor and valor.lower() != "nan" else defecto)
 
-
-        # =====================================================
-        # EXPEDIENTE LOCALIZADO
-        # =====================================================
-
-        st.markdown(
-            f"""<div class="of-record" style="padding:18px 22px;"><div style="display:flex; justify-content:space-between; align-items:center; gap:20px;"><div><div class="of-record-label">EXPEDIENTE LOCALIZADO</div><div class="of-record-title">{numero_resultado or folio_resultado}</div><div class="of-record-project">{proyecto_resultado or "Proyecto no especificado"}</div></div><div style="flex-shrink:0; padding:7px 15px; border-radius:20px; background:rgba(176,138,74,0.25); border:1px solid rgba(213,174,96,0.70); color:#FFFFFF; font-size:10px; font-weight:600;">◷ &nbsp; {estatus_resultado or "Sin estatus"}</div></div></div>""",
-            unsafe_allow_html=True
-        )
-
-
-        # =====================================================
-        # INFORMACIÓN GENERAL — 3 COLUMNAS
-        # =====================================================
-
-        col_dato1, col_dato2, col_dato3 = st.columns(3)
-
-        with col_dato1:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ▤ &nbsp; FOLIO
-    </div>
-    <div style="color:#10283B; font-size:13px; font-weight:650; margin-top:4px;">
-        {folio_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-        with col_dato2:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px; border-left:1px solid #E3E8EB;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ♙ &nbsp; RESPONSABLE
-    </div>
-    <div style="color:#10283B; font-size:13px; font-weight:650; margin-top:4px;">
-        {responsable_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-        with col_dato3:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px; border-left:1px solid #E3E8EB;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ⚙ &nbsp; ESTATUS
-    </div>
-    <div style="color:#10283B; font-size:13px; font-weight:650; margin-top:4px;">
-        {estatus_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-
-        # =====================================================
-        # SEGUNDA FILA
-        # =====================================================
-
-        col_dato4, col_dato5, col_dato6 = st.columns(3)
-
-        with col_dato4:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ▦ &nbsp; FECHA DE RECEPCIÓN
-    </div>
-    <div style="color:#10283B; font-size:13px; font-weight:650; margin-top:4px;">
-        {fecha_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-        with col_dato5:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px; border-left:1px solid #E3E8EB;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ◇ &nbsp; PROYECTO
-    </div>
-    <div style="color:#10283B; font-size:13px; font-weight:650; margin-top:4px;">
-        {proyecto_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-        with col_dato6:
-            st.markdown(
-                f"""
-<div style="padding:10px 8px; border-left:1px solid #E3E8EB;">
-    <div style="color:#82919B; font-size:9px; font-weight:700; letter-spacing:1px;">
-        ▣ &nbsp; ASUNTO
-    </div>
-    <div style="color:#10283B; font-size:12px; font-weight:650; margin-top:4px; line-height:1.35;">
-        {asunto_resultado or "—"}
-    </div>
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-
-        # =====================================================
-        # SEGUIMIENTO VISUAL DEL OFICIO
-        # =====================================================
-
-        estatus_normalizado = estatus_resultado.strip().lower()
-
-        # Determinar la etapa actual
-        if estatus_normalizado in [
-            "firmado",
-            "concluido",
-            "finalizado"
-        ]:
-            etapa_actual = 4
-
-        elif estatus_normalizado in [
-            "en proceso de firma",
-            "en firma",
-            "en espera de firma"
-        ]:
-            etapa_actual = 3
-
-        elif estatus_normalizado in [
-            "en revisión",
-            "en revision",
-            "en proceso"
-        ]:
-            etapa_actual = 2
-
+        estado = estatus_resultado.strip().lower()
+        if estado in ("concluido", "firmado", "finalizado"):
+            paso = 4
+        elif estado in ("en firma", "en espera de firma", "en proceso de firma"):
+            paso = 3
+        elif estado in ("en revisión", "en revision", "en proceso"):
+            paso = 2
         else:
-            etapa_actual = 1
+            paso = 1
 
+        st.markdown("""
+        <style>
+        .exp-titulo {margin:18px 0 13px}
+        .exp-titulo strong {font-size:19px;color:#172F40}
+        .exp-titulo p {margin:5px 0 0;font-size:12px;color:#728693}
+        .exp-panel {border:1px solid #D7E1E7;border-radius:10px;overflow:hidden;
+            background:rgba(255,255,255,.95);box-shadow:0 7px 24px rgba(20,42,58,.07)}
+        .exp-cabecera {background:linear-gradient(110deg,#233541,#365B6D);
+            border-left:4px solid #C5A16C;padding:23px 26px}
+        .exp-cabecera-fila {display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
+        .exp-eyebrow {color:#D9BE90;letter-spacing:1.7px;font-size:10px;font-weight:750}
+        .exp-numero {color:white;font-size:22px;font-weight:750;margin-top:8px;overflow-wrap:anywhere}
+        .exp-proyecto {color:#D3E0E7;font-size:12px;margin-top:7px}
+        .exp-estado {color:#F3F7F9;border:1px solid #9CB4C1;border-radius:5px;
+            padding:8px 12px;font-size:11px;font-weight:650;white-space:nowrap}
+        .exp-datos {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));padding:12px 17px}
+        .exp-dato {padding:14px 13px;border-bottom:1px solid #E5ECEF;min-width:0}
+        .exp-dato:nth-child(3n+2),.exp-dato:nth-child(3n+3) {border-left:1px solid #E5ECEF}
+        .exp-dato:nth-last-child(-n+3) {border-bottom:none}
+        .exp-label {font-size:10px;letter-spacing:1px;color:#708694;font-weight:750;text-transform:uppercase}
+        .exp-value {font-size:12px;color:#203849;font-weight:650;line-height:1.5;margin-top:5px;overflow-wrap:anywhere;white-space:normal}
+        .exp-seguimiento {border-top:1px solid #DFE7EC;padding:19px 24px 23px}
+        .exp-seguimiento-label {font-size:11px;font-weight:750;letter-spacing:1px;color:#577283;margin-bottom:19px}
+        .exp-etapas {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));position:relative;gap:5px}
+        .exp-etapas:before {content:"";position:absolute;top:11px;left:12.5%;right:12.5%;height:1px;background:#CBD8E0}
+        .exp-etapa {position:relative;text-align:center}
+        .exp-punto {width:23px;height:23px;margin:0 auto 10px;border-radius:50%;display:flex;
+            align-items:center;justify-content:center;font-size:11px;font-weight:750;
+            color:#8799A4;background:#EDF2F5;border:1px solid #C7D4DC}
+        .exp-etapa.completa .exp-punto {background:#466B7D;border-color:#466B7D;color:white}
+        .exp-etapa.actual .exp-punto {background:white;border:2px solid #B48E54;color:#8B6A3A}
+        .exp-etapa-nombre {font-size:11px;font-weight:650;color:#8497A3}
+        .exp-etapa.completa .exp-etapa-nombre,.exp-etapa.actual .exp-etapa-nombre {color:#203849}
+        .exp-etapa-nota {font-size:10px;color:#8497A3;margin-top:5px}
+        @media(max-width:650px) {
+          .exp-datos {grid-template-columns:repeat(2,minmax(0,1fr))}
+          .exp-dato {border-left:none!important;border-bottom:1px solid #E5ECEF!important}
+          .exp-cabecera-fila {flex-direction:column}
+          .exp-numero {font-size:18px}
+          .exp-seguimiento {padding:16px 8px}
+          .exp-etapa-nombre {font-size:10px}
+          .exp-etapa-nota {font-size:9px}
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
-        # Crear visualmente cada etapa
-        def crear_etapa(numero, icono, titulo, descripcion):
+        # Presentación compacta: solo modifica la apariencia de las celdas editables.
+        st.markdown("""
+        <style>
+        .exp-titulo {margin:13px 0 10px}
+        .exp-cabecera {padding:17px 22px!important}
+        .exp-numero {font-size:20px!important;margin-top:6px!important}
+        .exp-proyecto {margin-top:5px!important}
+        .exp-seguimiento {padding:14px 22px 17px!important}
+        .exp-seguimiento-label {margin-bottom:13px!important}
 
-            # La etapa YA fue superada
-            if numero < etapa_actual:
-                fondo = "#1F7A5A"
-                borde = "#1F7A5A"
-                color_icono = "#FFFFFF"
-                contenido = "✓"
-                color_titulo = "#10283B"
+        .st-key-expediente_campos {
+            background:rgba(255,255,255,.97);
+            border:1px solid #D7E1E7;
+            border-top:0;
+            border-radius:0;
+            padding:0 14px 1px;
+            margin-top:0px;
+            padding-bottom: 12px !important;
+            margin-bottom: 0 !important;
+        }
+        .st-key-expediente_campos [data-testid="stHorizontalBlock"] {
+            gap:0!important;
+            align-items: stretch !important;
+            height: auto !important;
+        }
+        .st-key-expediente_campos .st-key-exp_celda_folio,
+        .st-key-expediente_campos .st-key-exp_celda_responsable,
+        .st-key-expediente_campos .st-key-exp_celda_estatus,
+        .st-key-expediente_campos .st-key-exp_celda_fecha,
+        .st-key-expediente_campos .st-key-exp_celda_proyecto,
+        .st-key-expediente_campos .st-key-exp_celda_asunto {
+            padding:9px 12px 9px;
+            min-height: 76px;
+            height: auto !important;
+            overflow: visible !important;
+            padding-bottom: 16px !important;
+            border-bottom:1px solid #E5ECEF;
+            transition:background .15s ease,border-color .15s ease;
+        }
+        .st-key-expediente_campos .st-key-exp_celda_responsable,
+        .st-key-expediente_campos .st-key-exp_celda_estatus,
+        .st-key-expediente_campos .st-key-exp_celda_proyecto,
+        .st-key-expediente_campos .st-key-exp_celda_asunto {
+            border-left:1px solid #E5ECEF;
+        }
+        .st-key-expediente_campos .st-key-exp_celda_fecha,
+        .st-key-expediente_campos .st-key-exp_celda_proyecto,
+        .st-key-expediente_campos .st-key-exp_celda_asunto {
+            border-bottom:0;
+        }
+        .st-key-expediente_campos .exp-label {
+            color:#6D8493!important;
+            font-size:9px!important;
+            letter-spacing:1px!important;
+        }
+        .st-key-expediente_campos .exp-value {
+            margin-top:5px!important;
+            font-size:12px!important;
+            line-height:1.5!important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_editar_"] button {
+            min-height:23px!important;
+            height:23px!important;
+            width:24px!important;
+            padding:0!important;
+            background:#EDF2F5!important;
+            border:1px solid #DDE6EB!important;
+            border-radius:4px!important;
+            box-shadow:none!important;
+            color:#36596C!important;
+            font-size:12px!important;
+            transform:none!important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_editar_"] button:hover {
+            background:#E2EBF0!important;
+            border-color:#B58F54!important;
+            color:#243E4D!important;
+        }
+        .st-key-expediente_campos [data-testid="stMarkdownContainer"] p {
+            margin:0!important;
+        }
+        .st-key-expediente_campos [data-testid="stTextInput"] input {
+            min-height:35px!important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"]:has(
+            [class*="st-key-exp_guardar_"]
+        ) {
+            background:#FFFDF8;
+            outline:1px solid #C5A16C;
+            outline-offset:-1px;
+            border-radius:4px;
+        }
+        @media(max-width:650px) {
+            .st-key-expediente_campos [class*="st-key-exp_celda_"] {
+                min-height:70px;
+            }
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
-            # Es la etapa ACTUAL
-            elif numero == etapa_actual:
+        campos = [
+            ("folio", "Folio", "Folio", folio_resultado),
+            ("responsable", "Responsable", "Responsable", responsable_resultado),
+            ("estatus", "Estatus", "Estatus", estatus_resultado),
+            ("fecha", "Fecha de recepción", "Fecha de recepción", fecha_resultado),
+            ("proyecto", "Proyecto", "Proyecto", proyecto_resultado),
+            ("asunto", "Asunto", "Asunto", asunto_resultado),
+        ]
+        identidad = (folio_resultado.strip(), numero_resultado.strip())
+        if st.session_state.get("exp_identidad") != identidad:
+            st.session_state.exp_identidad = identidad
+            st.session_state.exp_editando = None
+        if st.session_state.pop("exp_guardado", False):
+            st.success("Campo actualizado correctamente en Google Sheets.")
 
-                # Firmado es la única etapa actual que muestra ✓
-                if numero == 4:
-                    fondo = "#1F7A5A"
-                    borde = "#1F7A5A"
-                    color_icono = "#FFFFFF"
-                    contenido = "✓"
-
+        def editar_campo(codigo, etiqueta, columna, valor):
+            autorizado = puede_editar_responsable(responsable_resultado)
+            with st.container(key=f"exp_celda_{codigo}"):
+                titulo_col, boton_col = st.columns([8, 1], gap="small")
+                with titulo_col:
+                    st.markdown(f'<div class="exp-label">{escape(etiqueta)}</div>',
+                                unsafe_allow_html=True)
+                with boton_col:
+                    if autorizado and st.button("✎", key=f"exp_editar_{codigo}",
+                                 help=f"Editar {etiqueta}"):
+                        st.session_state.exp_editando = (
+                            None if st.session_state.get("exp_editando") == codigo else codigo
+                        )
+                        st.rerun()
+                if autorizado and st.session_state.get("exp_editando") == codigo:
+                    clave = f"exp_valor_{codigo}_{folio_resultado}_{numero_resultado}"
+                    if codigo == "responsable":
+                        opciones = ["Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
+                                    "Ricardo", "Magali", "John", "Karina"]
+                        if valor and valor not in opciones:
+                            opciones.insert(0, valor)
+                        nuevo = st.selectbox(etiqueta, opciones,
+                                             index=opciones.index(valor) if valor in opciones else 0,
+                                             key=clave, label_visibility="collapsed")
+                    elif codigo == "estatus":
+                        opciones = ESTATUS_OFICIOS.copy()
+                        if valor and valor not in opciones:
+                            opciones.insert(0, valor)
+                        nuevo = st.selectbox(etiqueta, opciones,
+                                             index=opciones.index(valor) if valor in opciones else 0,
+                                             key=clave, label_visibility="collapsed")
+                        fecha_firma = None
+                        if nuevo == "Firmado":
+                            fecha_guardada = str(oficio_encontrado.get("Fecha de entrega", "")).strip()
+                            fecha_inicial = None
+                            for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                                try:
+                                    fecha_inicial = datetime.strptime(fecha_guardada, formato).date()
+                                    break
+                                except ValueError:
+                                    continue
+                            fecha_firma = st.date_input(
+                                "Fecha de entrega (obligatoria)",
+                                value=fecha_inicial,
+                                key=f"exp_fecha_firma_{folio_resultado}_{numero_resultado}",
+                                format="DD/MM/YYYY",
+                            )
+                    elif codigo == "asunto":
+                        nuevo = st.text_area(etiqueta, value=valor, key=clave,
+                                             label_visibility="collapsed", height=75)
+                    elif codigo == "fecha":
+                        fecha_inicial = None
+                        for formato in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                            try:
+                                fecha_inicial = datetime.strptime(valor.strip(), formato).date()
+                                break
+                            except ValueError:
+                                pass
+                        fecha_nueva = st.date_input(etiqueta, value=fecha_inicial,
+                                                    key=clave, label_visibility="collapsed",
+                                                    format="DD/MM/YYYY")
+                        nuevo = fecha_nueva.strftime("%d/%m/%Y") if fecha_nueva else ""
+                    else:
+                        nuevo = st.text_input(etiqueta, value=valor, key=clave,
+                                              label_visibility="collapsed")
+                    guardar, cancelar = st.columns(2, gap="small")
+                    with guardar:
+                        if st.button("✓", key=f"exp_guardar_{codigo}", help="Guardar cambio",
+                                     use_container_width=True):
+                            if not str(nuevo).strip() and codigo in ("folio", "responsable"):
+                                st.error("Este campo no puede quedar vacío.")
+                            else:
+                                try:
+                                    if codigo == "estatus":
+                                        actualizar_estatus_y_entrega(
+                                            folio_resultado, numero_resultado, nuevo,
+                                            fecha_firma.isoformat() if fecha_firma else ""
+                                        )
+                                    else:
+                                        actualizar_campo_oficio(
+                                            folio_resultado, numero_resultado, columna, str(nuevo).strip()
+                                        )
+                                    st.session_state.exp_editando = None
+                                    st.session_state.exp_guardado = True
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"No se guardó el cambio: {error}")
+                    with cancelar:
+                        if st.button("×", key=f"exp_cancelar_{codigo}", help="Cancelar edición",
+                                     use_container_width=True):
+                            st.session_state.exp_editando = None
+                            st.rerun()
                 else:
-                    fondo = "#FFFFFF"
-                    borde = "#B08A4A"
-                    color_icono = "#B08A4A"
-                    contenido = icono
+                    if codigo in ("proyecto", "asunto") and len(str(valor)) > 110:
+                        with st.expander("Ver texto completo"):
+                            st.markdown(
+                                f'<div class="exp-value">{dato_visible(valor)}</div>',
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.markdown(
+                            f'<div class="exp-value">{dato_visible(valor)}</div>',
+                            unsafe_allow_html=True
+                        )
 
-                color_titulo = "#10283B"
+        etapas = [
+            ("Recepción", fecha_resultado or "Registro"),
+            ("Revisión", "Análisis documental"),
+            ("Proceso de firma", "Formalización"),
+            ("Firmado", "Documento formalizado"),
+        ]
+        etapas_html = ""
+        for i, (titulo, nota) in enumerate(etapas, 1):
+            clase = "completa" if i < paso else ("actual" if i == paso else "pendiente")
+            indicador = "✓" if i < paso or (i == 4 and paso == 4) else str(i)
+            etapas_html += (
+                f'<div class="exp-etapa {clase}"><div class="exp-punto">{indicador}</div>'
+                f'<div class="exp-etapa-nombre">{escape(titulo)}</div>'
+                f'<div class="exp-etapa-nota">{dato_visible(nota)}</div></div>'
+            )
 
-            # Todavía NO se llega a esta etapa
+        st.markdown(f"""
+        <div class="exp-titulo"><strong>Detalle del expediente</strong>
+          <p>Información general y seguimiento del oficio seleccionado</p></div>
+        <div class="exp-panel" style="border-bottom:0;border-radius:10px 10px 0 0">
+          <div class="exp-cabecera"><div class="exp-cabecera-fila">
+            <div><div class="exp-eyebrow">EXPEDIENTE LOCALIZADO</div>
+              <div class="exp-numero">{dato_visible(numero_resultado or folio_resultado)}</div>
+              <div class="exp-proyecto">{dato_visible(proyecto_resultado, 'Proyecto no especificado')}</div>
+            </div><div class="exp-estado">{dato_visible(estatus_resultado, 'Sin estatus')}</div>
+          </div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if not puede_editar_responsable(responsable_resultado):
+            if es_administrador():
+                st.error("No se pudo habilitar la edición. Vuelve a iniciar sesión y verifica el rol configurado.")
             else:
-                fondo = "#E7ECEF"
-                borde = "#E7ECEF"
-                color_icono = "#9AA7AF"
-                contenido = icono
-                color_titulo = "#8997A0"
+                st.info(
+                    "Consulta de solo lectura: este oficio pertenece a "
+                    f"{responsable_resultado or 'un responsable sin identificar'}. "
+                    "Para editarlo debes tenerlo asignado en tu cuenta o acceder con un rol administrador."
+                )
+        else:
+            st.caption("Para editar un dato, utiliza el icono ✎ junto al nombre del campo.")
 
-            return f"""<div style="text-align:center; position:relative; z-index:2;">
-<div style="width:32px; height:32px; border-radius:50%; background:{fondo}; border:3px solid {borde}; color:{color_icono}; margin:0 auto 7px auto; display:flex; align-items:center; justify-content:center; font-size:14px; font-weight:800;">{contenido}</div>
-<div style="font-size:11px; color:{color_titulo}; font-weight:750;">{titulo}</div>
-<div style="font-size:8px; color:#8B99A3; margin-top:3px;">{descripcion}</div>
-</div>"""
+        with st.container(key="expediente_campos"):
+            for inicio_fila in (0, 3):
+                columnas = st.columns(3, gap="small")
+                for columna_st, campo in zip(columnas, campos[inicio_fila:inicio_fila + 3]):
+                    with columna_st:
+                        editar_campo(*campo)
 
-
-        # Las cuatro etapas
-        etapa_1 = crear_etapa(
-            1,
-            "📅",
-            "Fecha de recepción",
-            fecha_resultado or "—"
-        )
-
-        etapa_2 = crear_etapa(
-            2,
-            "🔎",
-            "En revisión",
-            "Revisión del expediente"
-        )
-
-        etapa_3 = crear_etapa(
-            3,
-            "✍",
-            "En proceso de firma",
-            "Pendiente de formalización"
-        )
-
-        etapa_4 = crear_etapa(
-            4,
-            "✓",
-            "Firmado",
-            "Documento formalizado"
-        )
-
-
-        # Construir la línea de seguimiento
-        seguimiento_html = f"""<div style="position:relative; margin-top:17px; margin-bottom:18px;">
-<div style="position:absolute; top:15px; left:12%; right:12%; height:2px; background:#D5DDE2;"></div>
-<div style="display:grid; grid-template-columns:repeat(4,1fr); position:relative;">
-{etapa_1}
-{etapa_2}
-{etapa_3}
-{etapa_4}
-</div>
-</div>"""
-
-        st.markdown(
-            seguimiento_html,
-            unsafe_allow_html=True
-        )
-
+        st.markdown(f"""
+        <div class="exp-panel" style="border-radius:0 0 10px 10px;border-top:0;margin-top:0px">
+          <div class="exp-seguimiento"><div class="exp-seguimiento-label">SEGUIMIENTO DEL TRÁMITE</div>
+            <div class="exp-etapas">{etapas_html}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         # =====================================================
         # DOCUMENTOS DEL EXPEDIENTE
@@ -2432,49 +3093,40 @@ body {
         col_doc1, col_doc2, col_doc3 = st.columns(3)
 
         with col_doc1:
-            if antecedentes_resultado:
-                st.link_button(
-                    "▤  Antecedentes  ›",
-                    antecedentes_resultado[0]["url"],
-                    use_container_width=True
-                )
-            else:
-                st.button(
-                    "— Sin antecedentes",
-                    disabled=True,
-                    use_container_width=True,
-                    key="sin_antecedentes_consulta"
-                )
+            with st.expander(f"▤  Antecedentes ({len(antecedentes_resultado)})"):
+                if antecedentes_resultado:
+                    for indice, documento in enumerate(antecedentes_resultado, start=1):
+                        st.link_button(
+                            documento["nombre"],
+                            documento["url"],
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("Sin antecedentes registrados")
 
         with col_doc2:
-            if anexos_resultado:
-                st.link_button(
-                    "◇  Anexos  ›",
-                    anexos_resultado[0]["url"],
-                    use_container_width=True
-                )
-            else:
-                st.button(
-                    "— Sin anexos",
-                    disabled=True,
-                    use_container_width=True,
-                    key="sin_anexos_consulta"
-                )
+            with st.expander(f"◇  Anexos ({len(anexos_resultado)})"):
+                if anexos_resultado:
+                    for indice, documento in enumerate(anexos_resultado, start=1):
+                        st.link_button(
+                            documento["nombre"],
+                            documento["url"],
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("Sin anexos registrados")
 
         with col_doc3:
-            if firmado_resultado:
-                st.link_button(
-                    "▣  Oficio firmado  ›",
-                    firmado_resultado[0]["url"],
-                    use_container_width=True
-                )
-            else:
-                st.button(
-                    "— Sin oficio firmado",
-                    disabled=True,
-                    use_container_width=True,
-                    key="sin_firmado_consulta"
-                )
+            with st.expander(f"▣  Oficio firmado ({len(firmado_resultado)})"):
+                if firmado_resultado:
+                    for indice, documento in enumerate(firmado_resultado, start=1):
+                        st.link_button(
+                            documento["nombre"],
+                            documento["url"],
+                            use_container_width=True,
+                        )
+                else:
+                    st.caption("Sin oficio firmado registrado")
 
     elif consulta.strip():
         st.warning(
@@ -2510,15 +3162,90 @@ body {
     )
     st.markdown("<br>", unsafe_allow_html=True)
 
+  # =========================================================
+    # REGISTRO DE NUEVO OFICIO
+    # =========================================================
+
     if "mostrar_registro" not in st.session_state:
         st.session_state.mostrar_registro = False
 
-    if st.session_state.mostrar_registro:
-        with st.container(border=True):
-            formulario_nuevo_oficio()
+    # Los estilos se aplican solo al contenedor del formulario.
+    st.markdown("""
+    <style>
+    .st-key-tarjeta_registro_oficio {
+        background: #29343E !important;
+        border: 1px solid #607789 !important;
+        border-radius: 14px !important;
+        padding: 26px !important;
+        box-shadow: 0 12px 30px rgba(20, 35, 48, .16);
+    }
+    .st-key-tarjeta_registro_oficio label,
+    .st-key-tarjeta_registro_oficio [data-testid="stWidgetLabel"] p,
+    .st-key-tarjeta_registro_oficio .stMarkdown p,
+    .st-key-tarjeta_registro_oficio h1,
+    .st-key-tarjeta_registro_oficio h2,
+    .st-key-tarjeta_registro_oficio h3,
+    .st-key-tarjeta_registro_oficio strong {
+        color: #E8F0F5 !important;
+    }
+    .st-key-tarjeta_registro_oficio [data-testid="stTextInput"] input,
+    .st-key-tarjeta_registro_oficio [data-testid="stTextArea"] textarea,
+    .st-key-tarjeta_registro_oficio [data-testid="stDateInput"] input,
+    .st-key-tarjeta_registro_oficio [data-baseweb="select"] > div {
+        background: #394B59 !important;
+        color: #F4F8FB !important;
+        border: 1px solid #71899A !important;
+        border-radius: 7px !important;
+    }
+    .st-key-tarjeta_registro_oficio [data-baseweb="select"] span,
+    .st-key-tarjeta_registro_oficio [data-baseweb="select"] input,
+    .st-key-tarjeta_registro_oficio [data-baseweb="select"] svg {
+        color: #F4F8FB !important;
+        fill: #D8E5EC !important;
+    }
+    .st-key-tarjeta_registro_oficio input::placeholder,
+    .st-key-tarjeta_registro_oficio textarea::placeholder {
+        color: #B9CAD6 !important;
+        opacity: 1 !important;
+    }
+    .st-key-tarjeta_registro_oficio div[data-testid="stButton"] button {
+        background: #47677D !important;
+        border: 1px solid #7895A7 !important;
+        color: #FFFFFF !important;
+    }
+    .st-key-tarjeta_registro_oficio div[data-testid="stButton"] button:hover {
+        background: #587D96 !important;
+    }
+    .st-key-tarjeta_registro_oficio hr {
+        border-color: #647D8D !important;
+    }
+    /* La alineación de cada sección se define en su propio encabezado. */
+    </style>
+    """, unsafe_allow_html=True)
 
+    if st.session_state.mostrar_registro:
+
+        col_titulo, col_volver = st.columns([4, 1])
+
+        with col_titulo:
+            st.markdown("<h3 style='text-align:left;'>Registrar nuevo oficio</h3>", unsafe_allow_html=True)
+
+        with col_volver:
+            if st.button(
+                "← Volver a consulta",
+                key="volver_consulta_oficios",
+                use_container_width=True
+            ):
+                st.session_state.mostrar_registro = False
+                st.rerun()
+
+        with st.container(
+            border=True,
+            key="tarjeta_registro_oficio"
+        ):
+            formulario_nuevo_oficio()
     # =========================================================
-    # TABLA GENERAL DE OFICIOS
+    # TABLA GENERAL DE OFICIOS Y SELECCIÓN PARA PDF
     # =========================================================
     st.markdown("<br><br>", unsafe_allow_html=True)
     st.markdown(
@@ -2579,92 +3306,322 @@ body {
 
         tabla_oficios = tabla_oficios[columnas_disponibles].copy()
 
+        # Los enlaces de antecedentes y anexos se consultan en el expediente.
+        # No es necesario analizar JSON documental para pintar la tabla.
+
         # -------------------------------------------------
-        # PREPARAR COLUMNAS DOCUMENTALES
+        # TABLA INSTITUCIONAL Y SELECCIÓN DE OFICIOS
         # -------------------------------------------------
 
-        if "Antecedente" in tabla_oficios.columns:
-            tabla_oficios["Antecedente"] = tabla_oficios["Antecedente"].apply(
-                lambda valor: (
-                    leer_documentos(valor)[0]["url"]
-                    if leer_documentos(valor)
-                    else None
-                )
+        st.markdown("""
+        <style>
+        .st-key-tabla_institucional {
+            background: rgba(255,255,255,0.96);
+            border: 1px solid #D8E2E8;
+            border-radius: 10px;
+            padding: 18px;
+            box-shadow: 0 6px 20px rgba(25,48,63,0.06);
+        }
+
+        .st-key-tabla_institucional
+        [data-testid="stDataFrame"] {
+            border-radius: 7px;
+            overflow: hidden;
+        }
+
+        .st-key-tabla_institucional
+        [data-testid="stButton"] button {
+            border-radius: 5px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        with st.container(key="tabla_institucional"):
+
+            st.markdown(
+                "**CONSULTA Y EMISIÓN DOCUMENTAL**"
             )
 
-        if "Anexo" in tabla_oficios.columns:
-            tabla_oficios["Anexo"] = tabla_oficios["Anexo"].apply(
-                lambda valor: (
-                    leer_documentos(valor)[0]["url"]
-                    if leer_documentos(valor)
-                    else None
-                )
+            st.caption(
+                "Selecciona los registros que deseas incluir "
+                "en el reporte institucional."
             )
 
-        if "Firmado" in tabla_oficios.columns:
-            tabla_oficios["Firmado"] = tabla_oficios["Firmado"].apply(
-                lambda valor: (
-                    leer_documentos(valor)[0]["url"]
-                    if leer_documentos(valor)
-                    else None
-                )
+            busqueda_tabla = st.text_input(
+                "Buscar registros",
+                placeholder="Folio, oficio, proyecto o responsable...",
+                key="buscar_tabla_oficios",
             )
 
-        # -------------------------------------------------
-        # MOSTRAR TABLA
-        # -------------------------------------------------
+            col_proyecto, col_estado, col_responsable = st.columns(3)
 
-        st.dataframe(
-            tabla_oficios,
-            use_container_width=True,
-            hide_index=True,
-            height=420,
-            column_config={
-                "Folio": st.column_config.TextColumn(
-                    "Folio",
-                    width="small"
-                ),
-                "No. de oficio": st.column_config.TextColumn(
-                    "No. de oficio",
-                    width="medium"
-                ),
-                "Asunto": st.column_config.TextColumn(
-                    "Asunto",
-                    width="large"
-                ),
-                "Proyecto": st.column_config.TextColumn(
-                    "Proyecto",
-                    width="medium"
-                ),
-                "Responsable": st.column_config.TextColumn(
-                    "Responsable",
-                    width="medium"
-                ),
-                "Estatus": st.column_config.TextColumn(
-                    "Estatus",
-                    width="medium"
-                ),
-                "Antecedente": st.column_config.LinkColumn(
-                    "Antecedente",
-                    display_text="👁",
-                    width="small"
-                ),
-                "Anexo": st.column_config.LinkColumn(
-                    "Anexo",
-                    display_text="👁",
-                    width="small"
-                ),
-                "Firmado": st.column_config.LinkColumn(
-                    "Firmado",
-                    display_text="👁",
-                    width="small"
-                ),
-                "Observaciones": st.column_config.TextColumn(
-                    "Observaciones",
-                    width="large"
-                ),
-            }
-        )
+            def valores_filtro(columna):
+                if columna not in tabla_oficios.columns:
+                    return []
+                return sorted({
+                    str(valor).strip()
+                    for valor in tabla_oficios[columna].dropna()
+                    if str(valor).strip()
+                }, key=str.casefold)
+
+            proyectos_registrados = valores_filtro("Proyecto")
+
+            def grupo_de_proyecto(nombre):
+                normalizado = normalizar_texto(nombre)
+                if "tren maya" in normalizado:
+                    return "Tren Maya"
+                if "aifa" in normalizado and "pachuca" in normalizado:
+                    return "AIFA-Pachuca"
+                if "mexico-queretaro" in normalizado or "mexico–queretaro" in normalizado:
+                    return "México-Querétaro"
+                if "san luis potosi-saltillo" in normalizado:
+                    return "San Luis Potosí-Saltillo"
+                if "queretaro-san luis potosi" in normalizado:
+                    return "Querétaro-San Luis Potosí"
+                if "mazatlan-los mochis" in normalizado:
+                    return "Mazatlán-Los Mochis"
+                if "irapuato-guadalajara" in normalizado:
+                    return "Irapuato-Guadalajara"
+                return nombre
+
+            grupos_proyecto = sorted(
+                {grupo_de_proyecto(nombre) for nombre in proyectos_registrados},
+                key=str.casefold,
+            )
+
+            with col_proyecto:
+                filtro_proyecto = st.selectbox(
+                    "Filtrar por proyecto",
+                    ["Todos"] + grupos_proyecto,
+                    key="filtro_tabla_proyecto",
+                )
+
+                subproyectos_disponibles = [
+                    nombre for nombre in proyectos_registrados
+                    if filtro_proyecto != "Todos"
+                    and grupo_de_proyecto(nombre) == filtro_proyecto
+                ]
+                filtro_subproyecto = st.selectbox(
+                    "Subproyecto / tramo",
+                    ["Todos los subproyectos"] + subproyectos_disponibles,
+                    key="filtro_tabla_subproyecto",
+                    disabled=filtro_proyecto == "Todos",
+                    help="Muestra los nombres completos registrados en Google Sheets.",
+                )
+
+            with col_estado:
+                opciones_estatus = ["Todos"] + ESTATUS_OFICIOS
+
+                filtro_estatus = st.selectbox(
+                    "Filtrar por estatus",
+                    opciones_estatus,
+                    key="filtro_tabla_estatus",
+                )
+
+            with col_responsable:
+                filtro_responsable = st.selectbox(
+                    "Filtrar por responsable",
+                    ["Todos"] + valores_filtro("Responsable"),
+                    key="filtro_tabla_responsable",
+                )
+
+            tabla_filtrada = tabla_oficios.copy()
+
+            if busqueda_tabla:
+                coincidencias = (
+                    tabla_filtrada
+                    .fillna("")
+                    .astype(str)
+                    .apply(
+                        lambda columna: columna.str.contains(
+                            busqueda_tabla,
+                            case=False,
+                            regex=False,
+                        )
+                    )
+                    .any(axis=1)
+                )
+
+                tabla_filtrada = tabla_filtrada[
+                    coincidencias
+                ]
+
+            if filtro_proyecto != "Todos" and "Proyecto" in tabla_filtrada.columns:
+                tabla_filtrada = tabla_filtrada[
+                    tabla_filtrada["Proyecto"].fillna("").astype(str).map(
+                        grupo_de_proyecto
+                    ) == filtro_proyecto
+                ]
+                if filtro_subproyecto != "Todos los subproyectos":
+                    tabla_filtrada = tabla_filtrada[
+                        tabla_filtrada["Proyecto"].fillna("").astype(str).str.strip()
+                        == filtro_subproyecto
+                    ]
+
+            for columna, valor_filtro in (
+                ("Estatus", filtro_estatus),
+                ("Responsable", filtro_responsable),
+            ):
+                if valor_filtro != "Todos" and columna in tabla_filtrada.columns:
+                    tabla_filtrada = tabla_filtrada[
+                        tabla_filtrada[columna].fillna("").astype(str).str.strip()
+                        == valor_filtro
+                    ]
+
+            tabla_filtrada = tabla_filtrada.copy()
+
+            # Selección estable por identidad del oficio, incluso al filtrar.
+            if "oficios_marcados" not in st.session_state:
+                st.session_state.oficios_marcados = set()
+            if "pdf_reporte_generado" not in st.session_state:
+                st.session_state.pdf_reporte_generado = None
+
+            def identidad_oficio(fila):
+                return (
+                    str(fila.get("Folio", "")).strip(),
+                    str(fila.get("No. de oficio", "")).strip(),
+                )
+
+            # Se usa el índice original, no la posición del filtro, para
+            # que el PDF respete las filas seleccionadas.
+            ids_visibles = [identidad_oficio(fila) for _, fila in tabla_filtrada.iterrows()]
+            tabla_filtrada.insert(
+                0, "Seleccionar",
+                [identidad in st.session_state.oficios_marcados for identidad in ids_visibles],
+            )
+
+            # Cuando cambian los filtros, se recrea solo el editor.
+            # Los oficios seleccionados permanecen en session_state.
+            import hashlib
+            firma_filtro = repr((
+                busqueda_tabla, filtro_proyecto, filtro_subproyecto,
+                filtro_estatus, filtro_responsable, tuple(ids_visibles),
+            ))
+            version_editor = hashlib.sha1(firma_filtro.encode("utf-8")).hexdigest()[:12]
+            if st.session_state.get("firma_editor_actual") != version_editor:
+                st.session_state.firma_editor_actual = version_editor
+                st.session_state.epoch_editor = st.session_state.get("epoch_editor", 0) + 1
+            clave_editor = f"editor_seleccion_oficios_{st.session_state.epoch_editor}"
+
+            def sincronizar_seleccion():
+                cambios = st.session_state.get(clave_editor, {}).get("edited_rows", {})
+                marcados = st.session_state.oficios_marcados
+                for posicion, cambios_fila in cambios.items():
+                    posicion = int(posicion)
+                    if posicion < len(ids_visibles) and "Seleccionar" in cambios_fila:
+                        identidad = ids_visibles[posicion]
+                        if cambios_fila["Seleccionar"]:
+                            marcados.add(identidad)
+                        else:
+                            marcados.discard(identidad)
+                st.session_state.pdf_reporte_generado = None
+
+            columnas_visibles = [
+                "Seleccionar",
+                "Folio",
+                "No. de oficio",
+                "Fecha de recepción",
+                "Asunto",
+                "Proyecto",
+                "Responsable",
+                "Estatus",
+            ]
+
+            columnas_visibles = [
+                c for c in columnas_visibles
+                if c in tabla_filtrada.columns
+            ]
+
+            seleccion_editor = st.data_editor(
+                tabla_filtrada[columnas_visibles],
+                hide_index=True,
+                use_container_width=True,
+                height=410,
+                key=clave_editor,
+                on_change=sincronizar_seleccion,
+                disabled=[
+                    c for c in columnas_visibles
+                    if c != "Seleccionar"
+                ],
+                column_config={
+                    "Seleccionar": st.column_config.CheckboxColumn(
+                        "✓",
+                        width="small",
+                    ),
+                    "Folio": st.column_config.TextColumn(
+                        "Folio",
+                        width="small",
+                    ),
+                    "No. de oficio": st.column_config.TextColumn(
+                        "Número de oficio",
+                        width="medium",
+                    ),
+                    "Fecha de recepción": st.column_config.TextColumn(
+                        "Fecha de recepción",
+                        width="medium",
+                    ),
+                    "Asunto": st.column_config.TextColumn(
+                        "Asunto",
+                        width="large",
+                    ),
+                    "Proyecto": st.column_config.TextColumn(
+                        "Proyecto",
+                        width="medium",
+                    ),
+                    "Responsable": st.column_config.TextColumn(
+                        "Responsable",
+                        width="medium",
+                    ),
+                    "Estatus": st.column_config.TextColumn(
+                        "Estatus",
+                        width="medium",
+                    ),
+                },
+            )
+
+            # Seleccionados de toda la hoja, no solo del filtro actual.
+            marcados = st.session_state.oficios_marcados
+            oficios_seleccionados = tabla_oficios.loc[
+                tabla_oficios.apply(identidad_oficio, axis=1).isin(marcados)
+            ].copy()
+
+            st.caption(f"Registros seleccionados: {len(oficios_seleccionados)}")
+
+            col_generar, col_limpiar = st.columns([3, 1])
+            with col_generar:
+                if st.button(
+                    "Preparar reporte institucional en PDF",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=oficios_seleccionados.empty,
+                    key="preparar_reporte_oficios",
+                ):
+                    with st.spinner("Generando reporte PDF..."):
+                        st.session_state.pdf_reporte_generado = generar_pdf_oficios(
+                            oficios_seleccionados
+                        )
+            with col_limpiar:
+                if st.button("Limpiar selección", use_container_width=True,
+                             key="limpiar_seleccion_oficios"):
+                    st.session_state.oficios_marcados = set()
+                    st.session_state.pdf_reporte_generado = None
+                    st.session_state.epoch_editor = st.session_state.get("epoch_editor", 0) + 1
+                    # Nuevo editor para reflejar todas las casillas desmarcadas.
+                    st.rerun()
+
+            if st.session_state.pdf_reporte_generado is not None:
+                st.download_button(
+                    "⬇ Descargar reporte institucional en PDF",
+                    data=st.session_state.pdf_reporte_generado,
+                    file_name="relacion_oficios.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="descargar_reporte_oficios",
+                )
+            elif oficios_seleccionados.empty:
+                st.info("Selecciona al menos un oficio para generar el PDF.")
+            else:
+                st.caption("Cuando termines de seleccionar, presiona «Preparar reporte». ")
 
     else:
         st.info("No hay oficios registrados para mostrar.")
@@ -2682,11 +3639,3 @@ elif st.session_state.menu_activo == "diseno":
     st.markdown("---")
     st.markdown("## Ingeniería de Detalle Fase I")
     st.info("Espacio preparado para la gestión de proyectos y control de esta mesa.")
-
-    if st.button(
-        "Entrar a Ingeniería de Detalle Fase I",
-        key="btn_diseno",
-        use_container_width=True
-    ):
-        st.session_state.menu_activo = "diseno"
-        st.rerun()
