@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import time
+import random
 from pathlib import Path
 import textwrap
 import unicodedata
@@ -11,6 +13,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from io import BytesIO
+import re
+from urllib.parse import quote
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2.credentials import Credentials as OAuthCredentials
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from datetime import datetime
 from reportlab.platypus import (
     SimpleDocTemplate,
@@ -38,6 +45,36 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+
+# Estilo específico de envío a revisión: grafito cálido + acento dorado.
+# Se limita a estos dos botones para no modificar otras acciones del sistema.
+st.markdown("""
+<style>
+[class*="st-key-doc_reenviar_"] button,
+[class*="st-key-doc_tte_"] button {
+    background: #4A4844 !important;
+    border: 1px solid #C6A05D !important;
+    border-left: 4px solid #D0AA68 !important;
+    color: #FFFFFF !important;
+    border-radius: 8px !important;
+    font-weight: 650 !important;
+    box-shadow: 0 3px 10px rgba(35, 33, 29, 0.14) !important;
+    transition: background-color .18s ease, border-color .18s ease !important;
+}
+[class*="st-key-doc_reenviar_"] button:hover,
+[class*="st-key-doc_tte_"] button:hover {
+    background: #625B50 !important;
+    border-color: #E0BC7A !important;
+    color: #FFFFFF !important;
+}
+[class*="st-key-doc_reenviar_"] button:focus-visible,
+[class*="st-key-doc_tte_"] button:focus-visible {
+    outline: 2px solid #D0AA68 !important;
+    outline-offset: 2px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 def aplicar_fondo():
@@ -111,8 +148,56 @@ def es_propietario():
     return obtener_rol() == "propietario"
 
 
-# PASO 2: permisos. El responsable se configura por cuenta en secrets.toml.
-# No se conceden permisos de edición por coincidencias parciales de nombres.
+# Permisos funcionales: el rol general no equivale al puesto institucional.
+# Los identificadores corresponden a las secciones [usuarios.*] de secrets.toml.
+REVISORES_BORRADORES = frozenset({"jhon", "john", "alejandra"})
+USUARIOS_REVISION_FINAL = frozenset({"alondra"})
+
+
+def identificador_sesion():
+    return str(st.session_state.get("usuario_id") or "").strip().lower()
+
+
+def puede_gestionar_borradores():
+    """John y Alejandra reciben/corrigen borradores; propietario da soporte."""
+    return bool(st.session_state.get("autenticado")) and (
+        es_propietario() or (
+            obtener_rol() == "administrador"
+            and identificador_sesion() in REVISORES_BORRADORES
+        )
+    )
+
+
+def puede_realizar_revision_final():
+    """La aprobación institucional corresponde solo a la Tte. Alondra."""
+    return bool(st.session_state.get("autenticado")) and (
+        obtener_rol() == "administrador"
+        and identificador_sesion() in USUARIOS_REVISION_FINAL
+    )
+
+
+def exigir_permiso_borradores():
+    if not puede_gestionar_borradores():
+        raise PermissionError("Solo John y Alejandra pueden gestionar la revisión de borradores.")
+
+
+def exigir_permiso_revision_final():
+    if not puede_realizar_revision_final():
+        raise PermissionError("La revisión final está reservada a la Tte. Alondra.")
+
+
+def descripcion_acceso():
+    if es_propietario():
+        return "Propietario técnico · administración del sistema"
+    if puede_realizar_revision_final():
+        return "Administradora · revisión final institucional"
+    if puede_gestionar_borradores():
+        return "Administrador/a · recepción y corrección de borradores"
+    if es_administrador():
+        return "Administrador/a · gestión documental"
+    return "Auxiliar · seguimiento de oficios asignados"
+
+
 def responsable_de_sesion():
     return str(st.session_state.get("responsable_oficios", "")).strip()
 
@@ -134,6 +219,15 @@ def exigir_permiso_edicion(responsable):
 def exigir_sesion():
     if not st.session_state.get("autenticado", False):
         raise PermissionError("Debes iniciar sesión para realizar esta operación.")
+
+
+def navegar_a(destino):
+    """Cambia de módulo y actualiza la interfaz sin perder la sesión."""
+    destinos = {"home", "oficios", "diseno", "pendientes"}
+    if destino not in destinos:
+        raise ValueError("Módulo de navegación no reconocido.")
+    st.session_state.menu_activo = destino
+    st.rerun()
 
 
 # =========================================================
@@ -207,7 +301,7 @@ def mostrar_sesion():
         rol = st.session_state.get("rol", "auxiliar")
         st.caption(
            f"Sesión: {st.session_state.usuario_actual} | "
-         f"{rol.capitalize()}"
+           f"{rol.capitalize()}"
         )
         if st.button(
             "Cerrar sesión",
@@ -241,6 +335,7 @@ ASSETS_DIR = BASE_DIR / "assets"
 # CONEXIÓN A GOOGLE SHEETS (HÍBRIDA: LOCAL + SECRETS)
 # =========================================================
 
+@st.cache_resource(show_spinner=False)
 def conectar_google_sheets():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -265,6 +360,32 @@ def conectar_google_sheets():
         scopes=scopes
     )
     cliente = gspread.authorize(credenciales)
+    # La cuota se comparte entre las sesiones que usan esta cuenta de servicio.
+    # Reintentos acotados para respuestas 429 y errores temporales del servidor.
+    # Compatibilidad con gspread antiguo (Client.request) y reciente
+    # (Client.http_client.request). No acceder a http_client si no existe.
+    transporte = getattr(cliente, "http_client", None)
+    if transporte is None:
+        transporte = cliente
+    solicitud_original = getattr(transporte, "request", None)
+    if solicitud_original is None:
+        raise RuntimeError(
+            "La versión instalada de gspread no ofrece un método request compatible."
+        )
+
+    def solicitud_con_reintentos(*args, **kwargs):
+        for intento in range(4):
+            try:
+                return solicitud_original(*args, **kwargs)
+            except gspread.exceptions.APIError as error:
+                codigo = getattr(getattr(error, "response", None), "status_code", None)
+                # Reintentar errores de cuota; las escrituras con errores 5xx
+                # no se repiten automáticamente para evitar duplicados.
+                if codigo != 429 or intento == 3:
+                    raise
+                time.sleep(min(2 ** intento + random.uniform(0, 0.6), 9))
+
+    transporte.request = solicitud_con_reintentos
 
     try:
         spreadsheet_id = "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY"
@@ -281,6 +402,754 @@ def conectar_google_sheets():
     return hoja
 
 
+
+# =========================================================
+# BLOQUE 1: BORRADORES WORD EN GOOGLE DRIVE + SHEETS
+# =========================================================
+COLUMNAS_BORRADORES = [
+    "Folio", "No. de oficio", "Responsable", "Version", "Nombre",
+    "Drive ID", "URL", "Etapa", "Usuario", "Fecha registro",
+]
+ETAPA_BORRADOR = "Borrador cargado"
+ETAPA_ENVIADO = "Pendiente de revisión inicial"
+ETAPA_TTE = "Pendiente de revisión de la Tte."
+
+
+def _credenciales_drive():
+    """Drive personal usa OAuth del propietario, no la cuenta de servicio de Sheets.
+
+    Ejecuta configurar_drive_oauth.py una sola vez para obtener el token.
+    En despliegues remotos se puede configurar [drive_oauth] en secrets.toml.
+    """
+    alcance = ["https://www.googleapis.com/auth/drive"]
+    token_local = BASE_DIR / "drive_oauth_token.json"
+    if token_local.is_file():
+        datos = json.loads(token_local.read_text(encoding="utf-8"))
+    else:
+        try:
+            datos = dict(st.secrets["drive_oauth"])
+        except (KeyError, FileNotFoundError) as error:
+            raise RuntimeError(
+                "Drive personal aún no está autorizado. Ejecuta configurar_drive_oauth.py "
+                "y conserva drive_oauth_token.json de forma privada."
+            ) from error
+    credenciales = OAuthCredentials.from_authorized_user_info(datos, scopes=alcance)
+    if not credenciales.valid:
+        if credenciales.refresh_token:
+            credenciales.refresh(GoogleAuthRequest())
+            if token_local.is_file():
+                token_local.write_text(credenciales.to_json(), encoding="utf-8")
+        else:
+            raise RuntimeError("La autorización de Drive venció. Vuelve a ejecutar configurar_drive_oauth.py")
+    return credenciales
+
+
+def _carpeta_raiz_borradores():
+    """Obtiene el ID de carpeta desde Streamlit o secrets.toml local.
+
+    La lectura directa del archivo permite detectar cambios locales aun si
+    Streamlit todavía conserva una versión anterior de sus secretos.
+    """
+    carpeta = ""
+    ruta_secrets = BASE_DIR / ".streamlit" / "secrets.toml"
+
+    # En localhost priorizamos el archivo del proyecto, que el usuario edita.
+    if ruta_secrets.is_file():
+        try:
+            import tomllib
+            with ruta_secrets.open("rb") as archivo:
+                configuracion = tomllib.load(archivo)
+            carpeta = str(configuracion.get("drive_borradores_folder_id") or "").strip()
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                "No se pudo leer .streamlit/secrets.toml. Comprueba que el "
+                "archivo esté guardado y tenga sintaxis TOML válida."
+            ) from error
+
+    # En despliegues remotos, los secretos pueden existir solo en st.secrets.
+    if not carpeta:
+        try:
+            carpeta = str(st.secrets.get("drive_borradores_folder_id", "") or "").strip()
+        except (KeyError, FileNotFoundError):
+            pass
+
+    if not carpeta:
+        raise RuntimeError(
+            "No se encontró drive_borradores_folder_id. En localhost agrega "
+            "drive_borradores_folder_id = \"ID_DE_LA_CARPETA\" al inicio de "
+            "C:/Control_Trazo/.streamlit/secrets.toml, guarda el archivo y "
+            "reinicia Streamlit."
+        )
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", carpeta):
+        raise ValueError(
+            "El ID de la carpeta de borradores no es válido. "
+            "Pega únicamente el identificador, no la URL completa."
+        )
+    return carpeta
+
+
+def _drive_sesion():
+    return AuthorizedSession(_credenciales_drive())
+
+
+def _drive_json(respuesta, operacion):
+    if not respuesta.ok:
+        raise RuntimeError(
+            f"Google Drive rechazó {operacion} (HTTP {respuesta.status_code}): "
+            + respuesta.text[:350]
+        )
+    return respuesta.json()
+
+
+def _drive_carpeta_expediente(folio, numero):
+    """Busca o crea una carpeta por expediente bajo la raíz configurada."""
+    raiz = _carpeta_raiz_borradores()
+    etiqueta = re.sub(r"[^A-Za-z0-9._ -]", "_", f"{folio}_{numero}")[:100]
+    sesion = _drive_sesion()
+    consulta = (
+        f"'{raiz}' in parents and name = '{etiqueta.replace(chr(39), '')}' "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    r = sesion.get("https://www.googleapis.com/drive/v3/files",
+        params={"q": consulta, "fields": "files(id,name),nextPageToken",
+                "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
+                "pageSize": 10}, timeout=25)
+    carpetas = _drive_json(r, "consultar carpetas").get("files", [])
+    if carpetas:
+        return carpetas[0]["id"]
+    r = sesion.post("https://www.googleapis.com/drive/v3/files",
+        params={"fields": "id", "supportsAllDrives": "true"},
+        json={"name": etiqueta, "mimeType": "application/vnd.google-apps.folder",
+              "parents": [raiz]}, timeout=25)
+    return _drive_json(r, "crear carpeta del expediente")["id"]
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_borradores():
+    hoja_oficios = conectar_google_sheets()
+    libro = hoja_oficios.spreadsheet
+    try:
+        hoja = libro.worksheet("BORRADORES")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="BORRADORES", rows=1000, cols=12)
+        hoja.append_row(COLUMNAS_BORRADORES, value_input_option="RAW")
+    encabezados = hoja.row_values(1)
+    if encabezados != COLUMNAS_BORRADORES:
+        raise ValueError(
+            "La hoja BORRADORES tiene columnas distintas de las esperadas. "
+            "No se modificó su estructura para proteger los datos existentes."
+        )
+    return hoja
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_borradores():
+    return _hoja_borradores().get_all_records()
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_filas_borradores():
+    return _hoja_borradores().get_all_values()
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_eventos():
+    return _hoja_eventos_borradores().get_all_records()
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_oficios():
+    return conectar_google_sheets().get_all_records()
+
+
+def _invalidar_cache_documental(borradores=False, eventos=False, oficios=False):
+    if borradores:
+        _leer_registros_borradores.clear()
+        _leer_filas_borradores.clear()
+    if eventos:
+        _leer_registros_eventos.clear()
+    if oficios:
+        _leer_registros_oficios.clear()
+        obtener_oficios.clear()
+
+
+def _borradores_expediente(folio, numero):
+    registros = _leer_registros_borradores()
+    encontrados = [
+        r for r in registros
+        if str(r.get("Folio", "")).strip() == str(folio).strip()
+        and str(r.get("No. de oficio", "")).strip() == str(numero).strip()
+    ]
+    return sorted(encontrados, key=lambda r: int(r.get("Version") or 0))
+
+
+def _verificar_oficio_para_borrador(folio, numero):
+    """Valida acceso contra la hoja actual, no contra valores del navegador."""
+    hoja = conectar_google_sheets()
+    encontrados = [
+        r for r in _leer_registros_oficios()
+        if str(r.get("Folio", "")).strip() == str(folio).strip()
+        and str(r.get("No. de oficio", "")).strip() == str(numero).strip()
+    ]
+    if len(encontrados) != 1:
+        raise ValueError("El oficio no existe o su identificación no es única.")
+    exigir_permiso_edicion(encontrados[0].get("Responsable", ""))
+    return encontrados[0]
+
+
+def _subir_borrador_drive(archivo, folio, numero, version):
+    """Carga DOCX sin sobrescribir versiones; la carpeta debe permitir escritura."""
+    contenido = archivo.getvalue()
+    if len(contenido) > 15 * 1024 * 1024:
+        raise ValueError("El borrador no puede superar los 15 MB.")
+    if not archivo.name.lower().endswith(".docx") or not contenido.startswith(b"PK"):
+        raise ValueError("Selecciona un documento Word .docx válido.")
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    nombre_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", Path(archivo.name).name)
+    nombre = f"{folio}_v{version:03d}_{nombre_seguro}"[:180]
+    # Carga reanudable en dos pasos: evita construir multipart manualmente.
+    # Paso 1: crear la sesión de subida enviando únicamente los metadatos.
+    sesion = _drive_sesion()
+    tipo_word = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    r = sesion.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,name,webViewLink",
+                "supportsAllDrives": "true"},
+        json={"name": nombre, "parents": [carpeta], "mimeType": tipo_word},
+        headers={"X-Upload-Content-Type": tipo_word,
+                 "X-Upload-Content-Length": str(len(contenido))},
+        timeout=30,
+    )
+    if not r.ok:
+        _drive_json(r, "iniciar subida de borrador")
+    url_subida = r.headers.get("Location")
+    if not url_subida or not url_subida.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Google Drive no devolvió una URL válida para subir el Word.")
+
+    # Paso 2: enviar los bytes exactos del DOCX, sin codificación multipart.
+    r = sesion.put(
+        url_subida, data=contenido,
+        headers={"Content-Type": tipo_word,
+                 "Content-Length": str(len(contenido))},
+        timeout=120,
+    )
+    respuesta = _drive_json(r, "subir borrador")
+    return {"id": respuesta["id"], "nombre": nombre,
+            "url": respuesta.get("webViewLink") or
+                   f"https://drive.google.com/file/d/{respuesta['id']}/view"}
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_eventos_borradores():
+    """Bitácora independiente; nunca altera las columnas de BORRADORES."""
+    libro = conectar_google_sheets().spreadsheet
+    columnas = ["Folio", "No. de oficio", "Version", "Accion", "Usuario", "Fecha", "Detalle"]
+    try:
+        hoja = libro.worksheet("EVENTOS_BORRADORES")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="EVENTOS_BORRADORES", rows=1000, cols=7)
+        hoja.append_row(columnas, value_input_option="RAW")
+    if hoja.row_values(1) != columnas:
+        raise ValueError("La bitácora EVENTOS_BORRADORES tiene columnas inesperadas.")
+    return hoja
+
+
+def _registrar_evento_borrador(folio, numero, version, accion, detalle=""):
+    _hoja_eventos_borradores().append_row([
+        str(folio), str(numero), int(version), accion, identificador_sesion(),
+        datetime.now().astimezone().isoformat(timespec="seconds"), str(detalle)
+    ], value_input_option="RAW")
+    _invalidar_cache_documental(eventos=True)
+
+
+def _eventos_expediente(folio, numero):
+    return [r for r in _leer_registros_eventos()
+            if str(r.get("Folio", "")).strip() == str(folio).strip()
+            and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+
+
+ETAPA_CORRECCIONES = "Correcciones solicitadas por la Tte."
+ETAPA_FIRMA = "En proceso de firma"
+ETAPA_ARCHIVADO = "Firmado y archivado"
+ETAPA_RETORNO_FIRMA = "Devuelto de firma para correcciones"
+
+
+def _permiso_documental(responsable):
+    return puede_gestionar_borradores() or puede_realizar_revision_final() or puede_editar_responsable(responsable)
+
+
+def _verificar_expediente_documental(folio, numero):
+    hoja = conectar_google_sheets()
+    coincidencias = [r for r in _leer_registros_oficios()
+                     if str(r.get("Folio", "")).strip() == str(folio).strip()
+                     and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+    if len(coincidencias) != 1:
+        raise ValueError("No se encontró un oficio único con esos datos.")
+    if not _permiso_documental(coincidencias[0].get("Responsable", "")):
+        raise PermissionError("No tienes acceso a este expediente.")
+    return coincidencias[0]
+
+
+def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No especificada", origen=""):
+    oficio = _verificar_expediente_documental(folio, numero)
+    anteriores = _borradores_expediente(folio, numero)
+    etapa = str(anteriores[-1].get("Etapa", "")) if anteriores else ""
+    if puede_realizar_revision_final() and not puede_gestionar_borradores():
+        raise PermissionError("La revisión final no permite subir versiones Word.")
+    if anteriores:
+        if not puede_gestionar_borradores():
+            raise PermissionError("Tras la primera carga, las nuevas versiones corresponden a John y Alejandra.")
+        if etapa not in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA):
+            raise PermissionError("El expediente está en revisión final, firma o archivado. No se puede sustituir la versión enviada.")
+    version = max([int(x.get("Version") or 0) for x in anteriores], default=0) + 1
+    if version > 15:
+        raise ValueError("Este expediente alcanzó el máximo de 15 versiones. Contacta al administrador.")
+    subido = _subir_borrador_drive(archivo, folio, numero, version)
+    try:
+        _hoja_borradores().append_row([
+            str(folio), str(numero), str(oficio.get("Responsable", responsable)),
+            version, subido["nombre"], subido["id"], subido["url"],
+            ETAPA_BORRADOR, identificador_sesion(),
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+        ], value_input_option="RAW")
+    except Exception as error:
+        raise RuntimeError("El Word ya está en Drive, pero falló el registro en Sheets. "
+                           f"Recupéralo aquí: {subido['url']}. {error}") from error
+    _invalidar_cache_documental(borradores=True)
+    try:
+        _registrar_evento_borrador(folio, numero, version, "Versión cargada",
+                                  f"Procedencia: {procedencia}. Entregado/elaborado por: {origen or 'No indicado'}")
+    except Exception as error:
+        st.warning(f"La versión quedó guardada, pero falló el registro de procedencia: {error}")
+    return subido
+
+
+def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
+    oficio = _verificar_expediente_documental(folio, numero)
+    hoja = _hoja_borradores()
+    # Lectura fresca para validar transiciones entre sesiones y evitar envíos duplicados.
+    valores = hoja.get_all_values()
+    coincidencias = [(i, fila) for i, fila in enumerate(valores[1:], start=2)
+                     if len(fila) >= 8 and fila[0].strip() == str(folio).strip()
+                     and fila[1].strip() == str(numero).strip()]
+    if not coincidencias:
+        raise ValueError("Primero debes cargar un Word.")
+    indice, ultima = max(coincidencias, key=lambda par: int(par[1][3]))
+    actual = ultima[7]
+    if actual == etapa_nueva:
+        raise ValueError("Esta versión ya se encuentra en esa etapa. Actualiza la pantalla para ver el estado vigente.")
+    admin = puede_gestionar_borradores()
+    tte = puede_realizar_revision_final()
+    auxiliar = puede_editar_responsable(oficio.get("Responsable", "")) and not (admin or tte)
+    permitido = (
+        (actual == ETAPA_BORRADOR and etapa_nueva == ETAPA_ENVIADO and (admin or auxiliar)) or
+        (actual in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)
+         and etapa_nueva == ETAPA_TTE and admin) or
+        (actual == ETAPA_TTE and etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_FIRMA) and tte) or
+        (actual == ETAPA_FIRMA and etapa_nueva in (ETAPA_RETORNO_FIRMA, ETAPA_ARCHIVADO) and admin)
+    )
+    if not permitido:
+        raise PermissionError("La transición no está permitida para tu usuario o la etapa actual.")
+    if etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) and not detalle.strip():
+        raise ValueError("Describe las correcciones solicitadas.")
+    hoja.update_cell(indice, 8, etapa_nueva)
+    _invalidar_cache_documental(borradores=True)
+    try:
+        _registrar_evento_borrador(folio, numero, int(ultima[3]), etapa_nueva, detalle)
+    except Exception as error:
+        st.warning(f"Se actualizó la etapa, pero no se pudo escribir en la bitácora: {error}")
+
+
+def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
+    """Actualización restringida del flujo; no permite modificar otros campos.
+
+    Reutiliza la validación de fila y el batch existente, pero habilita a la Tte.
+    exclusivamente para cambiar el estatus según su decisión documental.
+    """
+    permitidas = {"Estatus", "Fecha de entrega", "Firmado"}
+    if not cambios or not set(cambios).issubset(permitidas):
+        raise ValueError("Se intentó modificar un campo ajeno al proceso de firma.")
+    if autorizacion_tte:
+        exigir_permiso_revision_final()
+        if set(cambios) != {"Estatus"} or cambios["Estatus"] not in ("En firma", "En correcciones"):
+            raise PermissionError("La Tte. solo puede autorizar la firma o solicitar correcciones.")
+    else:
+        exigir_permiso_borradores()
+    # La comprobación de acceso ocurre en el servidor, no en el formulario.
+    _verificar_expediente_documental(folio, numero)
+    hoja = conectar_google_sheets()
+    valores = hoja.get_all_values()
+    if not valores:
+        raise ValueError("La hoja OFICIOS está vacía.")
+    encabezados = [str(c).strip() for c in valores[0]]
+    obligatorias = {"Folio", "No. de oficio", "Responsable"} | set(cambios)
+    faltantes = obligatorias - set(encabezados)
+    if faltantes:
+        raise ValueError("Faltan columnas en OFICIOS: " + ", ".join(sorted(faltantes)))
+    def campo(fila, nombre):
+        i = encabezados.index(nombre)
+        return str(fila[i]).strip() if i < len(fila) else ""
+    coincidencias = [(i, fila) for i, fila in enumerate(valores[1:], start=2)
+                    if campo(fila, "Folio") == str(folio).strip()
+                    and campo(fila, "No. de oficio") == str(numero).strip()]
+    if len(coincidencias) != 1:
+        raise ValueError("El oficio no se encontró de forma única en OFICIOS.")
+    fila_num, actual = coincidencias[0]
+    if not autorizacion_tte:
+        # Los revisores gestionan el documento, no cambian el responsable.
+        if not puede_gestionar_borradores():
+            raise PermissionError("Solo John o Alejandra pueden registrar la firma.")
+    from gspread.utils import rowcol_to_a1
+    actualizaciones = []
+    for nombre, valor in cambios.items():
+        if campo(actual, nombre) != str(valor).strip():
+            actualizaciones.append({"range": rowcol_to_a1(fila_num, encabezados.index(nombre) + 1),
+                                    "values": [[str(valor)]]})
+    if actualizaciones:
+        hoja.batch_update(actualizaciones, value_input_option="RAW")
+    _invalidar_cache_documental(oficios=True)
+    # Verificación con lectura fresca: no mostrar éxito si Sheets no persistió.
+    verificado = hoja.row_values(fila_num)
+    if any((verificado[encabezados.index(k)].strip()
+            if len(verificado) > encabezados.index(k) else "") != str(v).strip()
+           for k, v in cambios.items()):
+        raise RuntimeError("Google Sheets no confirmó la actualización; verifica el oficio y reintenta.")
+
+
+def _registrar_resultado_firma(folio, numero, resultado, nombre="", url="", fecha=None, observaciones=""):
+    """Guarda el resultado en OFICIOS antes de cerrar la etapa en BORRADORES."""
+    from urllib.parse import urlparse
+    exigir_permiso_borradores()
+    _verificar_expediente_documental(folio, numero)
+    versiones = _borradores_expediente(folio, numero)
+    if not versiones or str(versiones[-1].get("Etapa", "")) != ETAPA_FIRMA:
+        raise ValueError("El expediente ya no está en proceso de firma. Actualiza la pantalla.")
+    if resultado == "Regresó firmado":
+        nombre, url = str(nombre).strip(), str(url).strip()
+        partes = urlparse(url)
+        if not nombre:
+            raise ValueError("Es obligatorio indicar el nombre del documento firmado.")
+        if partes.scheme != "https" or (partes.hostname or "").lower() not in (
+                "drive.google.com", "docs.google.com"):
+            raise ValueError("Introduce una liga https válida de Google Drive.")
+        if fecha is None:
+            raise ValueError("Selecciona la fecha de recepción del documento firmado.")
+        documentos = json.dumps([{"nombre": nombre, "url": url}], ensure_ascii=False)
+        _actualizar_oficio_flujo(folio, numero, {
+            "Estatus": "Firmado", "Fecha de entrega": fecha.isoformat(),
+            "Firmado": documentos,
+        })
+        detalle = f"Firmado recibido: {nombre} | Drive: {url} | Fecha: {fecha.isoformat()}"
+        if str(observaciones).strip():
+            detalle += " | " + str(observaciones).strip()
+        _cambiar_etapa_borrador(folio, numero, ETAPA_ARCHIVADO, detalle)
+    elif resultado == "Regresó con correcciones":
+        if not str(observaciones).strip():
+            raise ValueError("Describe las correcciones solicitadas.")
+        _actualizar_oficio_flujo(folio, numero, {"Estatus": "En correcciones"})
+        _cambiar_etapa_borrador(folio, numero, ETAPA_RETORNO_FIRMA, observaciones.strip())
+    else:
+        raise ValueError("Resultado de firma no reconocido.")
+
+
+def _descargar_docx_drive(drive_id):
+    """Descarga privada con OAuth; no necesita hacer público el archivo."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", str(drive_id)):
+        raise ValueError("ID de archivo no válido.")
+    respuesta = _drive_sesion().get(
+        f"https://www.googleapis.com/drive/v3/files/{drive_id}",
+        params={"alt": "media", "supportsAllDrives": "true"}, timeout=90)
+    if not respuesta.ok:
+        raise RuntimeError(f"No se pudo descargar el Word (HTTP {respuesta.status_code}).")
+    return respuesta.content
+
+
+def _mensaje_error_sheets(error):
+    mensaje = str(error)
+    if "429" in mensaje or "RATE_LIMIT_EXCEEDED" in mensaje or "RESOURCE_EXHAUSTED" in mensaje:
+        return ("Google Sheets alcanzó temporalmente su límite de consultas. "
+                "Espera aproximadamente un minuto y vuelve a abrir el expediente "
+                "para comprobar la etapa antes de intentar enviarlo de nuevo.")
+    return mensaje
+
+
+def _mostrar_observaciones_revisor(folio, numero, etapa):
+    """Muestra las indicaciones conservadas en EVENTOS_BORRADORES."""
+    import html
+    if not puede_gestionar_borradores() or etapa not in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA):
+        return
+    try:
+        eventos = _eventos_expediente(folio, numero)
+        evento = next((e for e in reversed(eventos)
+                       if str(e.get("Accion", "")).strip() == etapa), None)
+    except Exception as error:
+        st.warning(f"No se pudieron consultar las observaciones: {_mensaje_error_sheets(error)}")
+        return
+    if evento is None:
+        st.warning("El expediente fue devuelto, pero no se encontraron observaciones en la bitácora.")
+        return
+    titulo = ("Correcciones solicitadas por la Tte. Alondra"
+              if etapa == ETAPA_CORRECCIONES else "Correcciones solicitadas tras el trámite de firma")
+    detalle = html.escape(str(evento.get("Detalle", "")).strip()).replace("\\n", "<br>")
+    autor = html.escape(str(evento.get("Usuario", "")) or "Revisor")
+    fecha = html.escape(str(evento.get("Fecha", "")))
+    st.markdown(
+        '<div class="revision-feedback">'
+        '<div class="revision-feedback-eyebrow">✎ ACCIÓN REQUERIDA · DEVOLUCIÓN</div>'
+        f'<div class="revision-feedback-title">{html.escape(titulo)}</div>'
+        f'<div class="revision-feedback-text">{detalle or "Sin observaciones registradas."}</div>'
+        f'<div class="revision-feedback-footer">Registrado por {autor} · {fecha}</div>'
+        '<div class="revision-feedback-hint">Descarga el Word, realiza los ajustes y carga una nueva versión. '
+        'Después podrás enviarla nuevamente a revisión.</div></div>',
+        unsafe_allow_html=True
+    )
+
+
+def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
+    """Centro documental: versión vigente, procedencia, acciones y trazabilidad."""
+    import html
+    try:
+        versiones = _borradores_expediente(folio, numero)
+    except Exception as error:
+        st.error(f"No fue posible consultar los borradores: {error}")
+        return
+    ultimo = versiones[-1] if versiones else None
+    etapa = str(ultimo.get("Etapa", "")) if ultimo else "Sin borrador"
+    if not compacto:
+        st.markdown("""<div class="doc-center-head"><span class="doc-center-kicker">EXPEDIENTE DIGITAL · WORD</span>
+          <div class="doc-center-title">Centro de revisión documental</div>
+          <div class="doc-center-sub">Versión vigente · Historial · Acciones</div></div>""",
+          unsafe_allow_html=True)
+        # Indicadores compactos: las etapas largas no deben convertirse en
+        # métricas enormes ni truncarse en pantallas pequeñas.
+        estados_cortos = {
+            ETAPA_BORRADOR: "Borrador listo",
+            ETAPA_ENVIADO: "Revisión inicial",
+            ETAPA_TTE: "En revisión",
+            ETAPA_CORRECCIONES: "Requiere ajustes",
+            ETAPA_FIRMA: "En firma",
+            ETAPA_RETORNO_FIRMA: "Ajustes de firma",
+            ETAPA_ARCHIVADO: "Archivado",
+        }
+        etapa_resumida = estados_cortos.get(etapa, etapa)
+        # Cerrar la cuadrícula mediante un único fragmento HTML evita que
+        # Streamlit divida su estructura entre bloques independientes.
+        st.markdown(
+            '<div class="doc-summary-grid">'
+            f'<div class="doc-summary-item"><span>VERSIÓN ACTUAL</span><strong>{"V" + format(int(ultimo["Version"]), "02d") if ultimo else "—"}</strong></div>'
+            f'<div class="doc-summary-item"><span>VERSIONES</span><strong>{len(versiones)}</strong></div>'
+            f'<div class="doc-summary-item doc-summary-status"><span>ESTADO ACTUAL</span><strong title="{html.escape(etapa, quote=True)}">{html.escape(etapa_resumida)}</strong></div>'
+            '</div>', unsafe_allow_html=True,
+        )
+    else:
+        st.caption(f"Versión V{int(ultimo['Version']):02d} · {len(versiones)} archivo(s) conservado(s)")
+    _mostrar_observaciones_revisor(folio, numero, etapa)
+    if ultimo:
+        st.markdown(f"**📄 {html.escape(str(ultimo.get('Nombre', 'Documento Word')))}**")
+        st.caption(f"Registrado por: {ultimo.get('Usuario', '')} · {ultimo.get('Fecha registro', '')}")
+        ver, descargar = st.columns(2)
+        with ver:
+            st.link_button("Consultar en Google Drive ↗", str(ultimo.get("URL", "")), use_container_width=True)
+        with descargar:
+            if st.button("Preparar descarga para Word ↓", key=f"doc_preparar_{folio}_{numero}", use_container_width=True):
+                try:
+                    with st.spinner("Descargando desde Google Drive..."):
+                        st.session_state[f"doc_bytes_{folio}_{numero}"] = _descargar_docx_drive(ultimo["Drive ID"])
+                        st.session_state[f"doc_id_{folio}_{numero}"] = ultimo["Drive ID"]
+                except Exception as error:
+                    st.error(str(error))
+            if (st.session_state.get(f"doc_id_{folio}_{numero}") == ultimo["Drive ID"]
+                    and f"doc_bytes_{folio}_{numero}" in st.session_state):
+                st.download_button("Descargar .docx", st.session_state[f"doc_bytes_{folio}_{numero}"],
+                                   file_name=str(ultimo["Nombre"]),
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                   key=f"doc_descargar_{folio}_{numero}", use_container_width=True)
+        with st.expander(f"Historial completo de versiones · {len(versiones)}/15", expanded=False):
+            try:
+                movimientos = _eventos_expediente(folio, numero)
+            except Exception as error:
+                movimientos = []
+                st.warning(f"No se pudo consultar la bitácora: {_mensaje_error_sheets(error)}")
+            for version in reversed(versiones):
+                n = int(version.get("Version") or 0)
+                st.markdown(f"**V{n:02d} · {html.escape(str(version.get('Nombre', 'Word')))}**")
+                st.caption(f"Cargada: {version.get('Fecha registro', '—')} · "
+                           f"Por: {version.get('Usuario', '—')} · "
+                           f"Etapa registrada: {version.get('Etapa', '—')}")
+                enlace = str(version.get("URL", ""))
+                if enlace.startswith("https://"):
+                    st.link_button(f"Consultar Word V{n:02d} en Drive ↗", enlace,
+                                   key=f"hist_drive_{folio}_{numero}_{n}")
+                relacionados = [e for e in movimientos if int(e.get("Version") or 0) == n]
+                for e in relacionados:
+                    st.caption(f"{e.get('Fecha', '—')} · {e.get('Usuario', '—')} · "
+                               f"{e.get('Accion', '—')}: {e.get('Detalle', '')}")
+                st.divider()
+    else:
+        st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
+
+    try:
+        eventos = _eventos_expediente(folio, numero) if ultimo else []
+    except Exception as error:
+        eventos = []
+        st.caption(f"Bitácora temporalmente no disponible: {error}")
+    if eventos:
+        with st.expander(f"Bitácora de movimientos · {len(eventos)} eventos"):
+            for evento in reversed(eventos):
+                st.markdown(f"**{html.escape(str(evento['Accion']))}** · "
+                            f"V{int(evento['Version']):02d} · {html.escape(str(evento['Usuario']))}")
+                st.caption(f"{evento['Fecha']} · {evento.get('Detalle', '')}")
+
+    admin = puede_gestionar_borradores()
+    tte = puede_realizar_revision_final()
+    auxiliar = puede_editar_responsable(responsable) and not (admin or tte)
+    puede_subir = ((not ultimo and (admin or auxiliar)) or
+                   (ultimo and admin and etapa in (ETAPA_BORRADOR, ETAPA_ENVIADO,
+                                                    ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)))
+    if puede_subir:
+        with st.expander("＋ Cargar primera versión" if not ultimo else "＋ Cargar nueva versión corregida", expanded=not ultimo):
+            with st.form(key=f"doc_carga_{folio}_{numero}"):
+                archivo = st.file_uploader("Documento Word editable (.docx)", type=["docx"],
+                                           key=f"doc_archivo_{folio}_{numero}")
+                procedencia = st.selectbox("¿Cómo se recibió o elaboró el documento?",
+                                           ["Elaboración propia", "Memoria USB", "Correo electrónico",
+                                            "Entregado por auxiliar", "Otro medio"],
+                                           key=f"doc_procedencia_{folio}_{numero}")
+                personas = ["No especificado", "Magali Rivera", "Ricardo Godínez", "Cecilia Santos",
+                            "Jesús Rodriguez", "Alejandra Cardoso", "John Bautista", "Otro"]
+                persona_elegida = st.selectbox("¿Quién lo elaboró o entregó?", personas,
+                                              key=f"doc_origen_lista_{folio}_{numero}")
+                origen = (st.text_input("Especifica el nombre", key=f"doc_origen_otro_{folio}_{numero}")
+                          if persona_elegida == "Otro" else persona_elegida)
+                guardar = st.form_submit_button("Guardar Word y conservar versión", use_container_width=True)
+            if guardar:
+                if archivo is None:
+                    st.warning("Selecciona un archivo .docx.")
+                else:
+                    try:
+                        with st.spinner("Guardando nueva versión en Drive y Sheets..."):
+                            _registrar_borrador(folio, numero, responsable, archivo, procedencia, origen)
+                        st.success("Versión registrada sin sobrescribir archivos anteriores.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(str(error))
+
+    if not ultimo:
+        return
+    # CSS contextual: el estilo se monta junto al botón, después de las reglas
+    # globales del tablero; se aplica solo a las dos acciones de envío.
+    st.markdown("""
+    <style>
+    div[class*="st-key-doc_reenviar_"] [data-testid="stBaseButton-primary"],
+    div[class*="st-key-doc_tte_"] [data-testid="stBaseButton-primary"],
+    div[class*="st-key-doc_reenviar_"] button[kind="primary"],
+    div[class*="st-key-doc_tte_"] button[kind="primary"] {
+        background:linear-gradient(110deg,#444648,#535350) !important;
+        background-color:#484A49 !important;
+        color:#fff !important;
+        border:1px solid #C49B59 !important;
+        border-left:4px solid #D5AF70 !important;
+        border-radius:8px !important;
+        box-shadow:0 3px 10px rgba(35,34,32,.16) !important;
+        font-weight:650 !important;
+    }
+    div[class*="st-key-doc_reenviar_"] button:hover,
+    div[class*="st-key-doc_tte_"] button:hover {
+        background:#5B5A55 !important;
+        color:#fff !important;
+        border-color:#E3BC79 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("**Siguiente acción**")
+    if etapa == ETAPA_BORRADOR:
+        if admin:
+            if st.button("Enviar versión actual a la Tte. Alondra →", key=f"doc_tte_{folio}_{numero}",
+                         type="primary", use_container_width=True):
+                try:
+                    _cambiar_etapa_borrador(folio, numero, ETAPA_TTE)
+                    _actualizar_oficio_flujo(folio, numero, {"Estatus": "En revisión"})
+                    st.rerun()
+                except Exception as error:
+                    st.error(str(error))
+        elif auxiliar:
+            if st.button("Entregar borrador a John y Alejandra →", key=f"doc_entregar_{folio}_{numero}",
+                         type="primary", use_container_width=True):
+                try:
+                    _cambiar_etapa_borrador(folio, numero, ETAPA_ENVIADO)
+                    st.rerun()
+                except Exception as error:
+                    st.error(_mensaje_error_sheets(error))
+    elif etapa in (ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) and admin:
+        st.info("John y Alejandra pueden cargar una versión corregida o enviar la actual a la Tte.")
+        if st.button("Enviar versión actual a la Tte. Alondra →", key=f"doc_reenviar_{folio}_{numero}",
+                     type="primary", use_container_width=True):
+            try:
+                _cambiar_etapa_borrador(folio, numero, ETAPA_TTE)
+                st.rerun()
+            except Exception as error:
+                st.error(_mensaje_error_sheets(error))
+    elif etapa == ETAPA_TTE and tte:
+        with st.form(key=f"doc_revision_tte_{folio}_{numero}"):
+            decision = st.radio("Resultado de la revisión", ["Autorizar para firma", "Solicitar correcciones"],
+                                horizontal=True)
+            comentario = st.text_area("Observaciones de revisión", placeholder="Indica los ajustes requeridos")
+            enviar = st.form_submit_button("Registrar decisión", type="primary", use_container_width=True)
+        if enviar:
+            try:
+                nueva = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
+                _actualizar_oficio_flujo(folio, numero, {
+                    "Estatus": "En firma" if nueva == ETAPA_FIRMA else "En correcciones"
+                }, autorizacion_tte=True)
+                _cambiar_etapa_borrador(folio, numero, nueva, comentario)
+                st.rerun()
+            except Exception as error:
+                st.error(str(error))
+    elif etapa == ETAPA_FIRMA and admin:
+        st.caption("Registra el resultado de la firma externa; se actualizará OFICIOS y el historial.")
+        # El selector fuera del formulario permite mostrar los campos necesarios inmediatamente.
+        resultado = st.radio("Resultado de firma externa",
+                            ["Regresó firmado", "Regresó con correcciones"],
+                            key=f"doc_resultado_firma_{folio}_{numero}")
+        with st.form(key=f"doc_firma_{folio}_{numero}"):
+            if resultado == "Regresó firmado":
+                st.markdown("**Documento firmado recibido**")
+                nombre_firmado = st.text_input("Nombre del documento firmado *",
+                                              placeholder="Ej. Oficio 21845 firmado")
+                enlace_firmado = st.text_input("Liga de Google Drive *",
+                                              placeholder="https://drive.google.com/file/d/...")
+                fecha_firmado = st.date_input("Fecha de recepción *", value=datetime.now().date(),
+                                              format="DD/MM/YYYY")
+            else:
+                nombre_firmado, enlace_firmado, fecha_firmado = "", "", None
+            comentario = st.text_area("Observaciones" +
+                                      (" *" if resultado == "Regresó con correcciones" else " (opcional)"))
+            enviar = st.form_submit_button("Guardar y actualizar tabla principal",
+                                           type="primary", use_container_width=True)
+        if enviar:
+            try:
+                with st.spinner("Guardando firma y actualizando Google Sheets..."):
+                    _registrar_resultado_firma(folio, numero, resultado, nombre_firmado,
+                                               enlace_firmado, fecha_firmado, comentario)
+                st.success("Resultado registrado en OFICIOS y en el expediente documental.")
+                st.rerun()
+            except Exception as error:
+                st.error(_mensaje_error_sheets(error))
+                st.info("Si el registro quedó parcialmente guardado, vuelve a abrir el expediente "
+                        "y comprueba el estado antes de reintentar.")
+    elif etapa == ETAPA_ARCHIVADO:
+        st.success("Expediente documental cerrado. Todas las versiones Word permanecen resguardadas.")
+        try:
+            oficio_firmado = _verificar_expediente_documental(folio, numero)
+            for documento in leer_documentos(oficio_firmado.get("Firmado", "")):
+                st.link_button("Ver documento firmado: " + documento["nombre"], documento["url"],
+                               use_container_width=True)
+        except Exception as error:
+            st.warning("No se pudo consultar el enlace del documento firmado: " + str(error))
+    else:
+        st.info("Esperando la siguiente revisión. El historial sigue disponible para consulta.")
+
+
 # =========================================================
 # FUNCIONES DE BÚSQUEDA Y NORMALIZACIÓN
 # =========================================================
@@ -295,8 +1164,7 @@ def normalizar_texto(texto):
 
 
 def buscar_oficios(consulta):
-    hoja = conectar_google_sheets()
-    registros = hoja.get_all_records()
+    registros = _leer_registros_oficios()
 
     consulta = normalizar_texto(consulta)
 
@@ -331,10 +1199,10 @@ def buscar_oficios(consulta):
 @st.cache_data(ttl=60, show_spinner=False)
 def obtener_oficios():
     try:
-        hoja = conectar_google_sheets()
-        registros = hoja.get_all_records()
+        registros = _leer_registros_oficios()
         return pd.DataFrame(registros)
-    except Exception:
+    except Exception as error:
+        st.warning(f"No se pudo consultar Google Sheets: {error}")
         return pd.DataFrame()
 
 
@@ -345,7 +1213,98 @@ def guardar_oficio(datos):
         datos,
         value_input_option="USER_ENTERED"
     )
-    obtener_oficios.clear()
+    _invalidar_cache_documental(oficios=True)
+
+
+def _eliminar_oficio_confirmado(folio, numero):
+    """Elimina un expediente de las tres hojas tras dejar constancia de auditoría.
+
+    Los archivos en Drive NO se borran; así se evita perder documentos originales.
+    """
+    exigir_sesion()
+    if not es_administrador():
+        raise PermissionError("Solo las cuentas con rol administrador o propietario pueden eliminar oficios.")
+    hojas = {
+        "OFICIOS": conectar_google_sheets(),
+        "BORRADORES": _hoja_borradores(),
+        "EVENTOS_BORRADORES": _hoja_eventos_borradores(),
+    }
+    filas_borrar = {}
+    for nombre, hoja in hojas.items():
+        datos = hoja.get_all_values()
+        if not datos or "Folio" not in datos[0] or "No. de oficio" not in datos[0]:
+            raise ValueError(f"Estructura inesperada en {nombre}; no se eliminó nada.")
+        i_f, i_n = datos[0].index("Folio"), datos[0].index("No. de oficio")
+        filas_borrar[nombre] = [i for i, fila in enumerate(datos[1:], 2)
+            if i_f < len(fila) and i_n < len(fila)
+            and fila[i_f].strip() == str(folio).strip()
+            and fila[i_n].strip() == str(numero).strip()]
+    if len(filas_borrar["OFICIOS"]) != 1:
+        raise ValueError("El oficio no existe o no tiene una identidad única. No se eliminó nada.")
+    libro = hojas["OFICIOS"].spreadsheet
+    columnas = ["Folio", "No. de oficio", "Usuario", "Fecha", "Versiones", "Eventos", "Nota"]
+    try:
+        auditoria = libro.worksheet("OFICIOS_ELIMINADOS")
+    except gspread.WorksheetNotFound:
+        auditoria = libro.add_worksheet(title="OFICIOS_ELIMINADOS", rows=1000, cols=7)
+        auditoria.append_row(columnas, value_input_option="RAW")
+    if auditoria.row_values(1) != columnas:
+        raise ValueError("La hoja de auditoría tiene encabezados distintos. No se eliminó nada.")
+    auditoria.append_row([str(folio), str(numero), identificador_sesion(),
+        datetime.now().astimezone().isoformat(timespec="seconds"),
+        len(filas_borrar["BORRADORES"]), len(filas_borrar["EVENTOS_BORRADORES"]),
+        "Eliminado de Sheets; archivos de Google Drive conservados"], value_input_option="RAW")
+    # Eliminar de abajo arriba; si hay fallo, la auditoría permite reconstruir el incidente.
+    for nombre in ("EVENTOS_BORRADORES", "BORRADORES", "OFICIOS"):
+        for indice in sorted(filas_borrar[nombre], reverse=True):
+            hojas[nombre].delete_rows(indice)
+    _invalidar_cache_documental(borradores=True, eventos=True, oficios=True)
+    # Comprobación de consistencia: ningún panel debe recuperar el expediente.
+    for nombre, hoja in hojas.items():
+        datos_restantes = hoja.get_all_values()
+        if not datos_restantes:
+            continue
+        cabecera = datos_restantes[0]
+        i_f, i_n = cabecera.index("Folio"), cabecera.index("No. de oficio")
+        if any(len(fila) > max(i_f, i_n) and
+               fila[i_f].strip() == str(folio).strip() and
+               fila[i_n].strip() == str(numero).strip()
+               for fila in datos_restantes[1:]):
+            raise RuntimeError(f"La eliminación quedó incompleta en {nombre}. "
+                               "Revisa las hojas antes de reintentar.")
+
+
+def _panel_eliminar_oficio(folio, numero, *, origen):
+    """Confirmación doble reutilizable en tabla y ficha de búsqueda."""
+    if not es_administrador():
+        return
+    folio, numero = str(folio).strip(), str(numero).strip()
+    clave = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{origen}_{folio}_{numero}")
+    with st.container(key=f"zona_eliminar_{clave}"):
+        st.warning("⚠️ **Eliminar oficio**: esta acción quitará el registro de OFICIOS, "
+                   "sus versiones y su bitácora de Google Sheets. Los documentos en "
+                   "Google Drive se conservarán. **No se puede deshacer desde la aplicación.**")
+        st.markdown(f"**Oficio seleccionado:** {numero} · **Folio:** {folio}")
+        confirmacion = st.checkbox(
+            "Confirmo que deseo eliminar definitivamente este oficio y sus registros.",
+            key=f"confirmar_eliminacion_{clave}")
+        texto_confirmacion = st.text_input(
+            "Para confirmar, escribe exactamente el número de oficio",
+            key=f"texto_eliminacion_{clave}", placeholder=numero)
+        confirmacion_valida = confirmacion and texto_confirmacion.strip() == numero
+        if st.button("Eliminar oficio definitivamente", key=f"ejecutar_eliminacion_{clave}",
+                     type="secondary", disabled=not confirmacion_valida, use_container_width=True):
+            try:
+                with st.spinner("Registrando auditoría y eliminando el oficio..."):
+                    _eliminar_oficio_confirmado(folio, numero)
+                st.session_state.oficios_marcados = set()
+                st.session_state.pdf_reporte_generado = None
+                st.session_state.epoch_editor = st.session_state.get("epoch_editor", 0) + 1
+                st.session_state.exp_identidad = None
+                st.success("Oficio eliminado. Los documentos de Drive se conservaron.")
+                st.rerun()
+            except Exception as error:
+                st.error("No se pudo completar la eliminación: " + _mensaje_error_sheets(error))
 
 
 def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valor):
@@ -376,7 +1335,6 @@ def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valo
     col_responsable = cabeceras.index("Responsable")
     responsable_actual = fila_actual[col_responsable] if col_responsable < len(fila_actual) else ""
     exigir_permiso_edicion(responsable_actual)
-    # Un auxiliar no puede transferir un oficio a otra persona.
     if columna == "Responsable" and not es_administrador():
         if normalizar_texto(nuevo_valor) != normalizar_texto(responsable_actual):
             raise PermissionError("Solo los administradores pueden reasignar oficios.")
@@ -388,7 +1346,7 @@ def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valo
             if valor == str(nuevo_valor).strip():
                 raise ValueError(f"Ya existe otro oficio con ese valor en {columna}.")
     hoja.update_cell(fila_objetivo, col_destino + 1, nuevo_valor)
-    obtener_oficios.clear()
+    _invalidar_cache_documental(oficios=True)
 
 
 def actualizar_estatus_y_entrega(folio_original, numero_original, nuevo_estatus, fecha_entrega):
@@ -434,7 +1392,47 @@ def actualizar_estatus_y_entrega(folio_original, numero_original, nuevo_estatus,
         {"range": celda_estatus, "values": [[nuevo_estatus]]},
         {"range": celda_entrega, "values": [[fecha_entrega if nuevo_estatus == "Firmado" else ""]]},
     ], value_input_option="USER_ENTERED")
-    obtener_oficios.clear()
+    _invalidar_cache_documental(oficios=True)
+
+
+def guardar_edicion_pendiente(folio, numero, cambios):
+    """Actualiza los campos de un oficio en OFICIOS con una única solicitud batch."""
+    hoja = conectar_google_sheets()
+    valores = hoja.get_all_values()
+    if not valores:
+        raise ValueError("La hoja OFICIOS está vacía.")
+    cabeceras = [str(c).strip() for c in valores[0]]
+    requeridas = {"Folio", "No. de oficio", "Responsable"} | set(cambios)
+    faltantes = requeridas.difference(cabeceras)
+    if faltantes:
+        raise ValueError("Faltan columnas en OFICIOS: " + ", ".join(sorted(faltantes)))
+    encontrados = []
+    for i, fila in enumerate(valores[1:], start=2):
+        f = fila[cabeceras.index("Folio")].strip() if len(fila) > cabeceras.index("Folio") else ""
+        n = fila[cabeceras.index("No. de oficio")].strip() if len(fila) > cabeceras.index("No. de oficio") else ""
+        if f == str(folio).strip() and n == str(numero).strip():
+            encontrados.append(i)
+    if len(encontrados) != 1:
+        raise ValueError("No se pudo identificar un único oficio para actualizar.")
+    fila_num = encontrados[0]
+    fila_actual = valores[fila_num - 1]
+    idx_responsable = cabeceras.index("Responsable")
+    responsable = fila_actual[idx_responsable] if idx_responsable < len(fila_actual) else ""
+    exigir_permiso_edicion(responsable)
+    from gspread.utils import rowcol_to_a1
+    actualizaciones = []
+    for columna, nuevo in cambios.items():
+        indice = cabeceras.index(columna)
+        actual = fila_actual[indice] if indice < len(fila_actual) else ""
+        if str(actual).strip() != str(nuevo).strip():
+            actualizaciones.append({
+                "range": rowcol_to_a1(fila_num, indice + 1),
+                "values": [[str(nuevo)]],
+            })
+    if actualizaciones:
+        hoja.batch_update(actualizaciones, value_input_option="USER_ENTERED")
+        _invalidar_cache_documental(oficios=True)
+    return len(actualizaciones)
 
 
 ESTATUS_OFICIOS = [
@@ -451,7 +1449,7 @@ ESTATUS_OFICIOS = [
 # =========================================================
 
 def generar_pdf_oficios(registros):
-    """Reporte imprimible: fechas, observaciones y firmas según los responsables[cite: 7]."""
+    """Reporte imprimible: fechas, observaciones y firmas según los responsables."""
     buffer = BytesIO()
     ruta_logo = Path(__file__).parent / "assets" / "logo_diseno_geometrico.png"
     ancho, alto = landscape(letter)
@@ -1262,6 +2260,648 @@ def mostrar_documentos(oficio):
                 )
 
 
+def _panel_revision_tte(registro):
+    """Vista ligera exclusiva para la Tte.; conserva el flujo de Sheets/Drive."""
+    import html
+
+    folio = str(registro.get("Folio", "")).strip()
+    numero = str(registro.get("No. de oficio", "")).strip()
+    version = int(registro.get("Version") or 0)
+    nombre = str(registro.get("Nombre", "Documento Word"))
+    usuario = str(registro.get("Usuario", ""))
+    url = str(registro.get("URL", ""))
+    drive_id = str(registro.get("Drive ID", ""))
+    clave = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{folio}_{numero}")
+
+    # Acabado institucional para la Tte.: títulos centrados y enmarcados.
+    # Esta hoja se inserta después del CSS general del tablero.
+    st.markdown("""
+    <style>
+    div[class*="st-key-tte_expediente_"] {
+        background:linear-gradient(145deg,#e6e7e7,#dadddf) !important;
+        border:1px solid #b9bdc0 !important;
+        border-left:4px solid #c39a56 !important;
+        border-radius:13px !important;
+        box-shadow:0 6px 20px rgba(39,40,39,.12) !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {
+        background:#484A49 !important;color:#fff !important;
+        border:1px solid #c49b59 !important;
+        border-left:4px solid #d5af70 !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button:hover {
+        background:#5b5a55 !important;color:#fff !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    with st.container(key=f"tte_expediente_{clave}", border=True):
+        # Encabezado del expediente: se conserva el diseño original, sin centrarlo.
+        st.markdown(
+            '<div class="tte-file-top">'
+            '<span class="tte-file-label">EXPEDIENTE PARA AUTORIZACIÓN</span>'
+            '<span class="tte-file-chip">● Requiere su decisión</span>'
+            '</div>', unsafe_allow_html=True
+        )
+        a, b = st.columns([4, 1], vertical_alignment="center")
+        with a:
+            st.markdown(f'<div class="tte-file-title">{html.escape(numero)}</div>'
+                        f'<div class="tte-file-meta">Folio {html.escape(folio)} · '
+                        f'Versión V{version:02d} · Enviado por {html.escape(usuario)}</div>',
+                        unsafe_allow_html=True)
+        with b:
+            st.markdown('<div class="tte-step-badge">ETAPA 2 DE 3<br><strong>Revisión final</strong></div>',
+                        unsafe_allow_html=True)
+
+        st.markdown("""<div class="tte-timeline">
+            <div class="tte-step done"><span>✓</span> Borrador recibido</div>
+            <div class="tte-step current"><span>2</span> Revisión de la Tte.</div>
+            <div class="tte-step"><span>3</span> Firma externa</div>
+        </div>""", unsafe_allow_html=True)
+
+        st.markdown(f'<div class="tte-document-line"><span>📄</span><div>'
+                    f'<strong>{html.escape(nombre)}</strong>'
+                    '<small>Archivo Word · Versión vigente para revisión</small>'
+                    '</div></div>', unsafe_allow_html=True)
+
+        ver, descargar = st.columns(2, gap="small")
+        with ver:
+            if url.startswith("https://"):
+                st.link_button("↗ Consultar en Google Drive", url, use_container_width=True)
+            else:
+                st.caption("Enlace de Drive no disponible")
+        with descargar:
+            if st.button("↓ Preparar descarga Word", key=f"tte_prepare_{clave}",
+                         use_container_width=True):
+                try:
+                    with st.spinner("Preparando documento..."):
+                        st.session_state[f"tte_bytes_{clave}"] = _descargar_docx_drive(drive_id)
+                        st.session_state[f"tte_drive_id_{clave}"] = drive_id
+                except Exception as error:
+                    st.error(f"No se pudo preparar el documento: {error}")
+            if st.session_state.get(f"tte_drive_id_{clave}") == drive_id and f"tte_bytes_{clave}" in st.session_state:
+                st.download_button("Descargar archivo .docx", st.session_state[f"tte_bytes_{clave}"],
+                                   file_name=nombre,
+                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                   key=f"tte_download_{clave}", use_container_width=True)
+
+        with st.expander("Ver versiones anteriores y bitácora"):
+            try:
+                versiones = _borradores_expediente(folio, numero)
+                for v in reversed(versiones):
+                    link = str(v.get("URL", ""))
+                    etiqueta = f"V{int(v.get('Version') or 0):02d} · {v.get('Nombre', '')}"
+                    if link.startswith("https://"):
+                        st.markdown(f"[{html.escape(etiqueta)}]({link})")
+                    else:
+                        st.write(etiqueta)
+                eventos = _eventos_expediente(folio, numero)
+                for evento in reversed(eventos):
+                    st.caption(f"V{int(evento.get('Version') or 0):02d} · {evento.get('Fecha', '')} · "
+                               f"{evento.get('Accion', '')} · {evento.get('Usuario', '')} · "
+                               f"{evento.get('Detalle', '')}")
+            except Exception as error:
+                st.caption(f"Historial temporalmente no disponible: {_mensaje_error_sheets(error)}")
+
+        st.markdown('<div class="tte-decision-title">Decisión sobre este documento</div>'
+                    '<div class="tte-decision-sub">Seleccione una opción y confirme para registrar el resultado.</div>',
+                    unsafe_allow_html=True)
+        decision = st.radio("Resultado de la revisión",
+                            ["Autorizar para firma", "Solicitar correcciones"],
+                            horizontal=True, key=f"tte_decision_{clave}",
+                            label_visibility="collapsed")
+        with st.form(key=f"tte_form_{clave}"):
+            if decision == "Solicitar correcciones":
+                comentario = st.text_area("Indique los cambios que deben realizarse *",
+                                          placeholder="Describa los ajustes concretos para John y Alejandra...",
+                                          key=f"tte_observaciones_{clave}")
+            else:
+                comentario = st.text_area("Observaciones adicionales (opcional)",
+                                          placeholder="Puede agregar alguna indicación para el trámite de firma...",
+                                          key=f"tte_observaciones_{clave}")
+            confirmado = st.checkbox(
+                "Confirmo que revisé el documento y deseo registrar esta decisión.",
+                key=f"tte_confirmar_{clave}")
+            enviar = st.form_submit_button(
+                "✓ Autorizar y enviar a firma" if decision == "Autorizar para firma"
+                else "↩ Solicitar correcciones",
+                type="primary", use_container_width=True)
+        if enviar:
+            if not confirmado:
+                st.warning("Marque la confirmación antes de registrar su decisión.")
+            elif decision == "Solicitar correcciones" and not comentario.strip():
+                st.warning("Indique las correcciones requeridas antes de continuar.")
+            else:
+                try:
+                    nueva_etapa = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
+                    with st.spinner("Registrando decisión..."):
+                        _actualizar_oficio_flujo(folio, numero, {
+                            "Estatus": "En firma" if nueva_etapa == ETAPA_FIRMA else "En correcciones"
+                        }, autorizacion_tte=True)
+                        _cambiar_etapa_borrador(folio, numero, nueva_etapa, comentario.strip())
+                    st.success("Decisión registrada correctamente.")
+                    st.rerun()
+                except Exception as error:
+                    st.error(_mensaje_error_sheets(error))
+
+
+def _bandeja_borradores_compartida():
+    """Bandeja operativa con acciones para cada revisor."""
+    st.markdown("#### Documentos que requieren atención")
+    try:
+        registros = _leer_registros_borradores()
+    except Exception as error:
+        st.error(f"No se pudo cargar la bandeja: {error}")
+        return
+    if puede_realizar_revision_final():
+        etapas = {ETAPA_TTE}
+    elif puede_gestionar_borradores():
+        etapas = {ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA, ETAPA_FIRMA}
+    else:
+        st.info("Bandeja disponible para revisores autorizados.")
+        return
+    ultimos = {}
+    for r in registros:
+        clave = (str(r.get("Folio", "")), str(r.get("No. de oficio", "")))
+        if clave not in ultimos or int(r.get("Version") or 0) > int(ultimos[clave].get("Version") or 0):
+            ultimos[clave] = r
+    recibidos = [r for r in ultimos.values() if r.get("Etapa") in etapas]
+    if puede_realizar_revision_final():
+        st.markdown('<div class="tte-queue-header"><div class="tte-queue-eyebrow">MESA DE DISEÑO GEOMÉTRICO · AUTORIZACIONES</div>'
+                    '<div class="tte-queue-heading">Centro de autorizaciones</div>'
+                    '<div class="tte-queue-description">Revise los documentos recibidos y registre su decisión en cada expediente.</div>'
+                    '</div>', unsafe_allow_html=True)
+        # Resumen superior: tres indicadores centrados en tarjetas grises.
+        # No modificar el encabezado de cada expediente.
+        st.markdown("""
+        <style>
+        .tte-summary-card {
+            background:linear-gradient(145deg,#424546,#555859);
+            border:1px solid #747674;
+            border-left:4px solid #c79d59;
+            border-radius:12px;
+            min-height:112px;
+            padding:18px 12px 15px;
+            box-shadow:0 5px 14px rgba(25,26,26,.13);
+            display:flex;flex-direction:column;align-items:center;
+            justify-content:center;text-align:center;gap:7px;
+        }
+        .tte-summary-label {
+            color:#e3e3e1 !important;font-size:13px !important;
+            font-weight:650 !important;line-height:1.3 !important;
+        }
+        .tte-summary-value {
+            color:#fff !important;font-size:27px !important;
+            line-height:1.1 !important;font-weight:800 !important;
+            overflow-wrap:anywhere;
+        }
+        .tte-summary-card--final .tte-summary-value {font-size:22px !important;}
+        @media(max-width:640px){
+            .tte-summary-card {min-height:94px;padding:12px 6px;}
+            .tte-summary-label {font-size:11px !important;}
+            .tte-summary-value {font-size:21px !important;}
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        m1, m2, m3 = st.columns(3, gap="small")
+        with m1:
+            st.markdown(f'<div class="tte-summary-card"><div class="tte-summary-label">Por revisar</div>'
+                        f'<div class="tte-summary-value">{len(recibidos):02d}</div></div>',
+                        unsafe_allow_html=True)
+        with m2:
+            st.markdown(f'<div class="tte-summary-card"><div class="tte-summary-label">Documentos recibidos</div>'
+                        f'<div class="tte-summary-value">{len(ultimos):02d}</div></div>',
+                        unsafe_allow_html=True)
+        with m3:
+            st.markdown('<div class="tte-summary-card tte-summary-card--final">'
+                        '<div class="tte-summary-label">Tipo de revisión</div>'
+                        '<div class="tte-summary-value">Final</div></div>',
+                        unsafe_allow_html=True)
+        if recibidos:
+            busqueda = st.text_input("Buscar documento", placeholder="Buscar por folio o número de oficio...",
+                                     key="tte_busqueda_revision")
+            if busqueda.strip():
+                filtro = normalizar_texto(busqueda)
+                recibidos = [r for r in recibidos if filtro in normalizar_texto(
+                    f"{r.get('Folio', '')} {r.get('No. de oficio', '')} {r.get('Nombre', '')}")]
+        if not recibidos:
+            st.success("No hay documentos pendientes de su revisión.")
+            return
+        st.caption(f"{len(recibidos)} documento(s) en la bandeja · Seleccione la decisión dentro de cada expediente.")
+        for r in recibidos:
+            _panel_revision_tte(r)
+        return
+    if not recibidos:
+        st.info("No hay documentos esperando tu intervención.")
+        return
+    # Una tarjeta por expediente; las acciones y el historial se despliegan
+    # solo al abrirlo. Así pueden verse numerosos pendientes a la vez.
+    import html
+    st.markdown(
+        '<div class="rev-list-intro"><div><span class="rev-list-kicker">BANDEJA DE SEGUIMIENTO</span>'
+        '<h4>Expedientes por atender</h4><p>Abre únicamente el documento en el que vas a trabajar.</p></div>'
+        f'<span class="rev-list-count">{len(recibidos)} pendientes</span></div>',
+        unsafe_allow_html=True,
+    )
+    filtro_revisor = st.text_input(
+        "Buscar entre mis pendientes", placeholder="Folio, número de oficio o archivo...",
+        key="revisor_buscar_pendientes",
+    )
+    if filtro_revisor.strip():
+        termino = normalizar_texto(filtro_revisor)
+        recibidos = [r for r in recibidos if termino in normalizar_texto(
+            f"{r.get('Folio', '')} {r.get('No. de oficio', '')} {r.get('Nombre', '')}")]
+    prioridad = {ETAPA_BORRADOR: 0, ETAPA_CORRECCIONES: 1, ETAPA_RETORNO_FIRMA: 2,
+                 ETAPA_ENVIADO: 2, ETAPA_FIRMA: 3}
+    recibidos.sort(key=lambda r: (prioridad.get(str(r.get("Etapa", "")), 9),
+                                  str(r.get("No. de oficio", ""))))
+    if not recibidos:
+        st.info("No se encontraron expedientes con esa búsqueda.")
+        return
+    for r in recibidos:
+        folio, numero = str(r.get("Folio", "")), str(r.get("No. de oficio", ""))
+        clave = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{folio}_{numero}")
+        etapa = str(r.get("Etapa", ""))
+        correcciones = etapa in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)
+        if etapa == ETAPA_BORRADOR:
+            etiqueta, clase = "VERSIÓN LISTA PARA ENVÍO", "revision"
+            accion = "Enviar la nueva versión a la Tte. Alondra"
+        elif correcciones:
+            etiqueta, clase = "REQUIERE CORRECCIONES", "ajustes"
+            accion = "Revisar observaciones y cargar nueva versión"
+        elif etapa == ETAPA_FIRMA:
+            etiqueta, clase = "EN TRÁMITE DE FIRMA", "firma"
+            accion = "Registrar resultado de firma"
+        else:
+            etiqueta, clase = "PENDIENTE DE ENVÍO", "revision"
+            accion = "Preparar y enviar a revisión"
+        # Encabezado compacto; no repite el título del centro documental.
+        with st.container(key=f"revisor_expediente_{clave}_{clase}", border=True):
+            st.markdown(
+                '<div class="rev-compact-head">'
+                '<div class="rev-compact-left">'
+                '<span class="rev-compact-kicker">EXPEDIENTE · CONTROL DOCUMENTAL</span>'
+                f'<div class="rev-compact-title">{html.escape(numero)}</div>'
+                f'<div class="rev-compact-meta">Folio {html.escape(folio)}'
+                f' <span class="rev-dot">·</span> V{int(r.get("Version") or 0):02d}'
+                f' <span class="rev-dot">·</span> {html.escape(str(r.get("Usuario", "")))}</div>'
+                '</div>'
+                f'<span class="rev-compact-badge {clase}">{etiqueta}</span>'
+                '</div>', unsafe_allow_html=True,
+            )
+            if correcciones:
+                # Solo una vista previa, no toda la bitácora ni el formulario.
+                try:
+                    eventos = _eventos_expediente(folio, numero)
+                    ultimo_comentario = next((e for e in reversed(eventos)
+                                              if str(e.get("Accion", "")).strip() == etapa), None)
+                    if ultimo_comentario:
+                        comentario = str(ultimo_comentario.get("Detalle", "")).strip()
+                        if comentario:
+                            resumen = comentario[:165] + ("…" if len(comentario) > 165 else "")
+                            st.markdown(
+                                '<div class="rev-compact-note"><strong>↩ Observaciones de la Tte.</strong>'
+                                f'<span>{html.escape(resumen)}</span></div>',
+                                unsafe_allow_html=True,
+                            )
+                except Exception:
+                    pass  # El detalle completo se consulta al desplegar el expediente.
+            st.markdown(f'<div class="rev-compact-next">{html.escape(accion)}</div>',
+                        unsafe_allow_html=True)
+            with st.expander("Abrir expediente · documentos y acciones  ↗", expanded=False):
+                mostrar_borradores_pendiente(
+                    folio, numero, str(r.get("Responsable", "")), compacto=True)
+
+
+def _vista_firma_externa(registros):
+    st.markdown("#### En proceso de firma")
+    st.caption("La firma ocurre fuera de la plataforma. Aquí solo consultamos los oficios enviados.")
+    firmando = registros.loc[registros["Estatus"].fillna("").astype(str).str.strip() == "En firma"]
+    if firmando.empty:
+        st.info("No hay oficios registrados actualmente en firma.")
+        return
+    for _, r in firmando.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**{r.get('No. de oficio', '')}** · Folio {r.get('Folio', '')}")
+            st.caption(f"Responsable: {r.get('Responsable', '')} · En firma externa")
+            st.write(str(r.get("Asunto", "")))
+
+
+def mostrar_mis_pendientes():
+    """Acceso rápido a los oficios activos, respetando los permisos existentes."""
+    import html
+
+    mostrar_sesion()
+    st.markdown("""
+    <div class="pend-hero">
+      <div class="pend-hero-kicker">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
+      <div class="pend-hero-title">Mis pendientes</div>
+      <div class="pend-hero-desc">Borradores, revisiones y documentos en proceso de firma</div>
+      <div class="pend-hero-line"></div>
+      <div class="pend-hero-track">TRAZO · ALINEAMIENTO · RASANTE</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    registros = obtener_oficios()
+    if registros.empty:
+        st.info("No hay registros disponibles o no se pudo consultar la hoja OFICIOS.")
+        if st.button("← Volver a Oficios en trámite", key="pendientes_volver_vacio"):
+            navegar_a("oficios")
+        return
+
+    if not {"Responsable", "Estatus"}.issubset(registros.columns):
+        st.warning("La hoja OFICIOS necesita las columnas Responsable y Estatus.")
+        return
+
+    if not es_administrador():
+        asignado = responsable_de_sesion()
+        if not asignado:
+            st.warning("Tu cuenta no tiene un responsable de oficios configurado.")
+            return
+        registros = registros.loc[
+            registros["Responsable"].fillna("").astype(str).map(normalizar_texto)
+            == normalizar_texto(asignado)
+        ].copy()
+
+    activos = {"En elaboración", "En correcciones", "En revisión", "En firma", "Recaído"}
+    pendientes = registros.loc[
+        registros["Estatus"].fillna("").astype(str).str.strip().isin(activos)
+    ].copy()
+
+    etiquetas = ["Mis oficios"]
+    if puede_gestionar_borradores() or puede_realizar_revision_final():
+        etiquetas.append("Por revisar")
+    etiquetas.append("En proceso de firma")
+    # Navegación por bandejas: controles reales, sin pestañas estrechas.
+    if "pend_bandeja" not in st.session_state or st.session_state.pend_bandeja not in etiquetas:
+        st.session_state.pend_bandeja = "Mis oficios"
+    bandeja_actual = st.session_state.pend_bandeja
+    st.markdown('<div class="pend-nav-label">BANDEJAS DE TRABAJO</div>', unsafe_allow_html=True)
+    opciones_nav = [
+        ("Mis oficios", "▣", "Expedientes a mi cargo"),
+        ("Por revisar", "◉", "Documentos por validar"),
+        ("En proceso de firma", "▤", "Seguimiento de firmas"),
+        ("Nuevo oficio", "+", "Registrar expediente"),
+    ]
+    cols_nav = st.columns(4, gap="small")
+    for i, (nombre, icono, descripcion) in enumerate(opciones_nav):
+        with cols_nav[i]:
+            if nombre not in etiquetas and nombre != "Nuevo oficio":
+                st.markdown('<div class="pend-nav-disabled">Acceso no disponible</div>', unsafe_allow_html=True)
+                continue
+            activo = nombre == bandeja_actual
+            with st.container(key=f"pend_nav_{i}_{'activo' if activo else 'normal'}"):
+                st.markdown(f'<div class="pend-nav-caption">{descripcion}</div>', unsafe_allow_html=True)
+                if st.button(f"{icono}  {nombre}", key=f"pend_nav_btn_{i}", use_container_width=True):
+                    if nombre == "Nuevo oficio":
+                        navegar_a("oficios")
+                    else:
+                        st.session_state.pend_bandeja = nombre
+                        st.session_state.pend_expediente_abierto = None
+                        st.rerun()
+    if bandeja_actual == "Mis oficios":
+        st.markdown('<div class="pend-section-label">RESUMEN DE ACTIVIDAD</div>', unsafe_allow_html=True)
+        columnas = st.columns(3, gap="medium")
+        indicadores = (
+            ("Por atender", len(pendientes), "Total activo", "#B99A65", "▤"),
+            ("En revisión", int((pendientes["Estatus"] == "En revisión").sum()),
+             "En seguimiento", "#688AA1", "◉"),
+            ("En correcciones", int((pendientes["Estatus"] == "En correcciones").sum()),
+             "Requieren ajustes", "#C17E59", "✎"),
+        )
+        for columna, (titulo, cantidad, detalle, color, icono) in zip(columnas, indicadores):
+            with columna:
+                st.markdown(
+                    f'<div class="pend-kpi" style="--accent:{color}">'
+                    f'<div class="pend-kpi-icon">{icono}</div>'
+                    f'<div class="pend-kpi-content"><div class="pend-kpi-number">{cantidad:02d}</div>'
+                    f'<div class="pend-kpi-title">{html.escape(titulo)}</div>'
+                    f'<div class="pend-kpi-desc">{html.escape(detalle)}</div></div></div>',
+                    unsafe_allow_html=True
+                )
+
+        st.markdown('<div class="pend-section-label">ACCESO DIRECTO</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="pend-list-title">Oficios que requieren atención</div>',
+            unsafe_allow_html=True
+        )
+        st.caption(f"{len(pendientes)} oficio(s) activo(s) · Abre el expediente para consultar sus detalles")
+        buscar_col, filtro_col = st.columns([3, 1], gap="small")
+        with buscar_col:
+            texto_busqueda = st.text_input("Buscar expedientes", placeholder="Folio, oficio, asunto o responsable...", key="pend_busqueda")
+        with filtro_col:
+            filtro_estado = st.selectbox("Filtrar por estado", ["Todos"] + sorted(activos), key="pend_filtro_estado")
+        if texto_busqueda.strip():
+            consulta = normalizar_texto(texto_busqueda)
+            campos = [c for c in ("Folio", "No. de oficio", "Asunto", "Responsable") if c in pendientes.columns]
+            if campos:
+                mascara = pendientes[campos].fillna("").astype(str).apply(
+                    lambda fila: any(consulta in normalizar_texto(v) for v in fila), axis=1)
+                pendientes = pendientes.loc[mascara].copy()
+        if filtro_estado != "Todos":
+            pendientes = pendientes.loc[pendientes["Estatus"] == filtro_estado].copy()
+
+        if st.session_state.pop("pend_guardado", False):
+            st.success("Cambios guardados en Google Sheets. La consulta general ya refleja los nuevos datos.")
+
+        if pendientes.empty:
+            st.success("No tienes oficios pendientes.")
+        else:
+            # Primero los documentos en correcciones; después el resto de los activos.
+            prioridad = {
+                "En correcciones": 0, "Recaído": 1, "En elaboración": 2,
+                "En revisión": 3, "En firma": 4,
+            }
+            pendientes["_prioridad"] = pendientes["Estatus"].map(prioridad).fillna(9)
+            pendientes = pendientes.sort_values("_prioridad", kind="stable")
+            for indice, (_, oficio) in enumerate(pendientes.iterrows()):
+                def campo(nombre):
+                    valor = oficio.get(nombre, "")
+                    if valor is None or (not isinstance(valor, (dict, list)) and pd.isna(valor)):
+                        return ""
+                    return str(valor).strip()
+
+                folio = campo("Folio")
+                numero = campo("No. de oficio")
+                asunto = campo("Asunto") or "Sin asunto registrado"
+                responsable = campo("Responsable") or "Sin responsable"
+                fecha = campo("Fecha de recepción") or "Sin fecha"
+                estatus = campo("Estatus")
+                estilo = {
+                    "En correcciones": "correcciones", "En revisión": "revision",
+                    "En elaboración": "elaboracion", "En firma": "firma",
+                    "Recaído": "recaido",
+                }.get(estatus, "normal")
+
+                with st.container(border=True, key=f"pend_ficha_{indice}"):
+                    col_info, col_accion = st.columns([5, 1.25], gap="medium", vertical_alignment="center")
+                    with col_info:
+                        st.markdown(
+                            '<div class="pend-oficio">'
+                            '<div class="pend-oficio-top">'
+                            f'<strong>Folio {html.escape(folio or "Sin folio")}</strong>'
+                            f'<span class="pend-estado {estilo}">{html.escape(estatus)}</span>'
+                            '</div>'
+                            f'<div class="pend-numero">{html.escape(numero)}</div>'
+                            f'<div class="pend-asunto">{html.escape(asunto)}</div>'
+                            '<div class="pend-meta">'
+                            f'<span>Responsable: {html.escape(responsable)}</span>'
+                            f'<span>Recepción: {html.escape(fecha)}</span>'
+                            '</div></div>',
+                            unsafe_allow_html=True
+                        )
+                    with col_accion:
+                        identidad = (folio, numero)
+                        abierto = st.session_state.get("pend_expediente_abierto") == identidad
+                        etiqueta = "Cerrar expediente" if abierto else "Abrir expediente →"
+                        if st.button(etiqueta, key=f"pend_abrir_{indice}",
+                                     use_container_width=True, type="primary"):
+                            st.session_state.pend_expediente_abierto = None if abierto else identidad
+                            st.rerun()
+
+                    if st.session_state.get("pend_expediente_abierto") == identidad:
+                        autorizado = puede_editar_responsable(responsable)
+                        if not autorizado:
+                            st.info("Tienes acceso de consulta, pero no permiso para editar este oficio.")
+                        else:
+                            # Se conserva el encabezado del oficio; solo cambia el panel editable.
+                            with st.container(border=True, key="pend_editor"):
+                                st.markdown(
+                                    '<div class="pend-editor-header">'
+                                    '<span class="pend-editor-kicker">ADMINISTRACIÓN DOCUMENTAL</span>'
+                                    '<div class="pend-editor-title">Editar oficio</div>'
+                                    '<div class="pend-editor-sub">Actualización y seguimiento del expediente</div>'
+                                    '</div>', unsafe_allow_html=True
+                                )
+                                st.markdown('<div class="pend-editor-section">01 &nbsp; Datos principales</div>',
+                                            unsafe_allow_html=True)
+                                # Selector fuera del formulario para que Firmado despliegue campos al instante.
+                                opciones = ESTATUS_OFICIOS.copy()
+                                if estatus not in opciones:
+                                    opciones.insert(0, estatus)
+                                clave_estado = f"pend_estado_{folio}_{numero}"
+                                if clave_estado not in st.session_state:
+                                    st.session_state[clave_estado] = estatus
+                                nuevo_estado = st.selectbox("Estatus", opciones, key=clave_estado)
+
+                                documentos_actuales = leer_documentos(oficio.get("Firmado", ""))
+                                firmado_actual = documentos_actuales[0] if documentos_actuales else {"nombre": "", "url": ""}
+                                fecha_guardada = campo("Fecha de entrega")
+                                fecha_inicial = None
+                                for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                                    try:
+                                        fecha_inicial = datetime.strptime(fecha_guardada, formato).date()
+                                        break
+                                    except ValueError:
+                                        pass
+
+                                with st.form(key=f"pend_form_{indice}"):
+                                    nuevo_asunto = st.text_area("Asunto", value=campo("Asunto"), height=90)
+                                    nuevo_proyecto = st.text_input("Proyecto", value=campo("Proyecto"))
+                                    st.markdown('<div class="pend-editor-section">02 &nbsp; Seguimiento del trámite</div>',
+                                                unsafe_allow_html=True)
+                                    if nuevo_estado == "Firmado":
+                                        st.markdown('<div class="pend-editor-sign">▣ &nbsp; Oficio firmado</div>',
+                                                    unsafe_allow_html=True)
+                                        col_nombre, col_url = st.columns([1, 1.6])
+                                        with col_nombre:
+                                            nombre_firmado = st.text_input(
+                                                "Nombre del documento", value=firmado_actual["nombre"],
+                                                placeholder="Ej. Oficio firmado 21845"
+                                            )
+                                        with col_url:
+                                            enlace_firmado = st.text_input(
+                                                "Enlace de Drive", value=firmado_actual["url"],
+                                                placeholder="https://drive.google.com/..."
+                                            )
+                                        fecha_entrega = st.date_input(
+                                            "Fecha de entrega", value=fecha_inicial, format="DD/MM/YYYY"
+                                        )
+                                    else:
+                                        nombre_firmado = firmado_actual["nombre"]
+                                        enlace_firmado = firmado_actual["url"]
+                                        fecha_entrega = fecha_inicial
+                                        st.caption("El nombre, enlace y fecha de entrega se habilitan al seleccionar Firmado.")
+                                    nuevas_observaciones = st.text_area(
+                                        "Observaciones", value=campo("Observaciones"), height=90
+                                    )
+                                    st.markdown('<div class="pend-editor-divider"></div>', unsafe_allow_html=True)
+                                    guardar = st.form_submit_button(
+                                        "Guardar cambios en la base general", type="primary",
+                                        use_container_width=True
+                                    )
+
+                                if guardar:
+                                    error_validacion = None
+                                    if nuevo_estado == "Firmado":
+                                        if not nombre_firmado.strip():
+                                            error_validacion = "Indica el nombre del documento firmado."
+                                        elif not enlace_firmado.strip().startswith(("https://", "http://")):
+                                            error_validacion = "Introduce un enlace válido del documento firmado (https://...)."
+                                        elif fecha_entrega is None:
+                                            error_validacion = "Indica la fecha de entrega del oficio firmado."
+                                    if error_validacion:
+                                        st.error(error_validacion)
+                                    else:
+                                        cambios = {
+                                            "Estatus": nuevo_estado,
+                                            "Asunto": nuevo_asunto.strip(),
+                                            "Proyecto": nuevo_proyecto.strip(),
+                                            "Observaciones": nuevas_observaciones.strip(),
+                                            "Fecha de entrega": (
+                                                fecha_entrega.isoformat() if nuevo_estado == "Firmado" else ""
+                                            ),
+                                        }
+                                        if nuevo_estado == "Firmado":
+                                            cambios["Firmado"] = json.dumps(
+                                                [{"nombre": nombre_firmado.strip(),
+                                                  "url": enlace_firmado.strip()}], ensure_ascii=False
+                                            )
+                                        try:
+                                            with st.spinner("Actualizando el expediente en Google Sheets..."):
+                                                guardar_edicion_pendiente(folio, numero, cambios)
+                                            st.session_state.pend_guardado = True
+                                            st.rerun()
+                                        except Exception as error:
+                                            st.error(f"No fue posible completar el guardado: {error}")
+                        # Borradores: solo usuarios con acceso al oficio.
+                        if autorizado:
+                            with st.container(border=True):
+                                mostrar_borradores_pendiente(folio, numero, responsable)
+                        # Mostrar documentos existentes después del formulario.
+                        mostrar_documentos(oficio)
+
+        # Actividad real desde la bitácora; la ausencia de eventos no bloquea la bandeja.
+        if puede_gestionar_borradores() or puede_realizar_revision_final():
+            with st.expander("◷  Actividad documental reciente", expanded=False):
+                try:
+                    eventos_recientes = _leer_registros_eventos()
+                    eventos_recientes = sorted(eventos_recientes,
+                        key=lambda e: str(e.get("Fecha", "")), reverse=True)[:8]
+                    if not eventos_recientes:
+                        st.caption("Todavía no hay movimientos registrados.")
+                    for evento in eventos_recientes:
+                        st.markdown(f"**{html.escape(str(evento.get('Accion', 'Movimiento')))}** · "
+                                    f"Folio {html.escape(str(evento.get('Folio', '')))}")
+                        st.caption(f"{evento.get('Fecha', '')} · {evento.get('Usuario', '')} · "
+                                   f"{evento.get('Detalle', '')}")
+                except Exception as error:
+                    st.caption(f"Actividad no disponible por el momento: {error}")
+        col_vuelta, col_todos = st.columns([1, 1], gap="medium")
+        with col_vuelta:
+            if st.button("← Menú principal", key="pendientes_menu"):
+                navegar_a("home")
+        with col_todos:
+            if st.button("Ver todos los oficios →", key="pendientes_todos",
+                         use_container_width=True):
+                navegar_a("oficios")
+
+    if bandeja_actual == "Por revisar" and "Por revisar" in etiquetas:
+        _bandeja_borradores_compartida()
+    if bandeja_actual == "En proceso de firma":
+        _vista_firma_externa(registros)
+
+
 # =========================================================
 # CARGA DE IMÁGENES
 # =========================================================
@@ -1411,27 +3051,6 @@ div[data-testid="stTextArea"] textarea:focus,
 div[data-testid="stDateInput"] input:focus {
     border-color: #B49A62 !important;
     box-shadow: 0 0 0 1px #B49A62 !important;
-}
-
-/* Botones invisibles únicamente del menú principal */
-.st-key-btn_oficios div[data-testid="stButton"],
-.st-key-btn_diseno div[data-testid="stButton"] {
-    width: 100%;
-    margin-top: -145px;
-    position: relative;
-    z-index: 10;
-}
-
-.st-key-btn_oficios button,
-.st-key-btn_diseno button {
-    width: 100% !important;
-    height: 145px !important;
-    background: transparent !important;
-    border: none !important;
-    border-radius: 0 !important;
-    box-shadow: none !important;
-    padding: 0 !important;
-    opacity: 0;
 }
 
 @media (max-width: 900px) {
@@ -1616,277 +3235,1410 @@ div[data-testid="stHorizontalBlock"] {
 
 
 # =========================================================
+# MENÚ LATERAL COMPARTIDO: OFICIOS / MIS PENDIENTES
+# =========================================================
+# Mantener la misma estructura de widgets y las mismas claves entre
+# pantallas evita desmontajes innecesarios durante la navegación.
+if st.session_state.menu_activo in ("oficios", "pendientes"):
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"] {
+        border-right: 1px solid #d8dfe4 !important;
+        background: rgba(248, 250, 251, .97) !important;
+    }
+    [data-testid="stSidebar"] .stButton button {
+        background: #283e50 !important;
+        color: #fff !important;
+        border: 0 !important;
+        border-radius: 7px !important;
+        min-height: 43px !important;
+        font-weight: 600 !important;
+    }
+    [data-testid="stSidebar"] .stButton button:hover {
+        background: #40576b !important;
+        color: #fff !important;
+    }
+    .cd-sidebar-title {
+        color: #283e50;
+        text-align: center;
+        font-size: 17px;
+        font-weight: 750;
+        margin: 7px 0 3px;
+    }
+    .cd-sidebar-subtitle {
+        color: #687782;
+        text-align: center;
+        font-size: 12px;
+        margin: 0 0 21px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    with st.sidebar:
+        ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
+        if ruta_logo.is_file():
+            # Widget nativo en vez de inyectar <img> con una cadena base64.
+            _, columna_logo, _ = st.columns([1, 2, 1])
+            with columna_logo:
+                st.image(str(ruta_logo), use_container_width=True)
+        st.markdown(
+            '<div class="cd-sidebar-title">CONTROL DOCUMENTAL</div>'
+            '<div class="cd-sidebar-subtitle">Mesa de Diseño Geométrico</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("⌂ Menú principal", key="nav_compartida_inicio", use_container_width=True):
+            navegar_a("home")
+        if st.button("▤ Mis pendientes", key="nav_compartida_pendientes", use_container_width=True):
+            if st.session_state.menu_activo != "pendientes":
+                navegar_a("pendientes")
+        st.divider()
+
+# Fondo de trabajo: conserva el plano ferroviario visible detrás de las tarjetas.
+# Los módulos mantienen sus propias imágenes y la navegación principal no cambia.
+
+# =========================================================
 # HOME
 # =========================================================
 
 if st.session_state.menu_activo == "home":
     aplicar_fondo()
-
-    # -----------------------------------------------------
-    # SESIÓN DEL USUARIO
-    # -----------------------------------------------------
     mostrar_sesion()
 
-    # -----------------------------------------------------
-    # CABECERA
-    # -----------------------------------------------------
+    def imagen_menu_base64(nombre):
+        ruta = Path(__file__).parent / "assets" / nombre
+        if ruta.is_file():
+            return "data:image/png;base64," + base64.b64encode(ruta.read_bytes()).decode("ascii")
+        return ""
 
-    components.html(
-        f"""
+    imagen_oficios = imagen_menu_base64("menu_oficios.png")
+    imagen_ingenieria = imagen_menu_base64("menu_ingenieria.png")
+    if not imagen_oficios or not imagen_ingenieria:
+        faltantes = [
+            nombre for nombre, valor in (
+                ("menu_oficios.png", imagen_oficios),
+                ("menu_ingenieria.png", imagen_ingenieria),
+            ) if not valor
+        ]
+        st.warning("Faltan imágenes en la carpeta assets: " + ", ".join(faltantes))
+
+    st.html(
+        """
         <style>
-            body {{
-                margin: 0;
-                padding: 0;
-                background: transparent;
-                overflow: hidden;
-                font-family: Arial, Helvetica, sans-serif;
-            }}
-            .encabezado {{
-                width: 100%;
-                text-align: center;
-            }}
-            .icono-documento {{
-                width: 82px;
-                height: 82px;
-                object-fit: contain;
-                margin-bottom: 12px;
-            }}
-            .titulo-control {{
-                color: #102030;
-                font-size: 64px;
-                font-weight: 900;
-                line-height: 0.9;
-                letter-spacing: 1px;
-            }}
-            .titulo-documental {{
-                color: #102030;
-                font-size: 43px;
-                font-weight: 300;
-                line-height: 1;
-                letter-spacing: 9px;
-                margin-top: 13px;
-            }}
-            .divisor {{
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                gap: 18px;
-                margin-top: 27px;
-            }}
-            .linea {{
-                width: 150px;
-                height: 2px;
-                background: #b39258;
-            }}
-            .rombo {{
-                width: 14px;
-                height: 14px;
-                background: #c99d58;
-                transform: rotate(45deg);
-            }}
-        </style>
+        .home-hero {
+            text-align: center;
+            padding: 12px 0 24px;
+            color: #10283b;
+        }
 
-        <div class="encabezado">
-            <img src="{icono_documento}" class="icono-documento">
-            <div class="titulo-control">CONTROL</div>
-            <div class="titulo-documental">DOCUMENTAL</div>
-            <div class="divisor">
-                <div class="linea"></div>
-                <div class="rombo"></div>
-                <div class="linea"></div>
-            </div>
-        </div>
+        .home-kicker {
+            font-size: 10px;
+            font-weight: 750;
+            letter-spacing: 2.5px;
+            color: #95743c;
+        }
+
+        .home-title {
+            font-size: clamp(34px, 4vw, 48px);
+            font-weight: 850;
+            letter-spacing: 2px;
+            line-height: 1.05;
+            margin: 10px 0 5px;
+        }
+
+        .home-subtitle {
+            font-size: clamp(18px, 2.5vw, 26px);
+            font-weight: 350;
+            letter-spacing: 7px;
+        }
+
+        .home-line {
+            width: 170px;
+            height: 2px;
+            background: #b39258;
+            margin: 18px auto 0;
+        }
+
+        .home-module-label {
+            font-size: 11px;
+            letter-spacing: 2px;
+            color: #536574;
+            font-weight: 750;
+            margin-bottom: 12px;
+        }
+
+        .stMainBlockContainer:has(.home-hero) {
+            max-width: 1120px !important;
+            padding-top: 1rem !important;
+        }
+
+        /* TARJETAS DEL MENÚ PRINCIPAL */
+
+        .st-key-home_oficios button,
+        .st-key-home_diseno button {
+            position: relative !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: center !important;
+            align-items: flex-start !important;
+
+            width: 100% !important;
+            height: 205px !important;
+            min-height: 205px !important;
+
+            padding: 22px 20px 22px 51% !important;
+            border: 1px solid rgba(185,154,101,0.65) !important;
+            border-radius: 12px !important;
+
+            background-color: #10283b !important;
+            background-repeat: no-repeat !important;
+            background-size: auto 100% !important;
+            background-position: left center !important; 
+
+            box-shadow: 0 10px 24px rgba(13,36,52,.17) !important;
+            text-align: left !important;
+            overflow: hidden !important;
+            white-space: normal !important;
+            transition: transform .2s, box-shadow .2s !important;
+        }
+
+        .st-key-home_diseno button {
+            background-color: #284653 !important;
+        }
+
+        /* Integración suave entre ilustración y fondo */
+
+        .st-key-home_oficios button::before,
+        .st-key-home_diseno button::before {
+            content: "";
+            position: absolute;
+            z-index: 0;
+            inset: 0;
+            pointer-events: none;
+
+            background: linear-gradient(
+                90deg,
+                rgba(7, 20, 34, 0.10) 0%,
+                rgba(12, 36, 54, 0.15) 38%,
+                rgba(12, 36, 54, 0.90) 68%,
+                rgba(12, 36, 54, 0.98) 100%
+            );
+        }
+
+        .st-key-home_diseno button::before {
+            background: linear-gradient(
+                90deg,
+                rgba(7, 20, 34, 0.08) 0%,
+                rgba(33, 67, 79, 0.15) 38%,
+                rgba(33, 67, 79, 0.90) 68%,
+                rgba(33, 67, 79, 0.98) 100%
+            );
+        }
+
+        /* Títulos */
+        .st-key-home_oficios button p,
+        .st-key-home_diseno button p {
+            position: relative !important;
+            z-index: 1 !important;
+
+            width: 100% !important;
+            margin: 0 !important;
+
+            color: #ffffff !important;
+            font-size: clamp(14px, 1.15vw, 17px) !important;
+            font-weight: 800 !important;
+            line-height: 1.35 !important;
+            text-align: left !important;
+            white-space: normal !important;
+        }
+
+        /* Descripciones */
+        .st-key-home_oficios button::after,
+        .st-key-home_diseno button::after {
+            position: relative;
+            z-index: 1;
+            display: block;
+            width: 100%;
+            margin-top: 10px;
+            font-size: 11px;
+            line-height: 1.5;
+            font-weight: 400;
+            color: #d8e2e8;
+            text-align: left;
+        }
+
+        .st-key-home_oficios button::after {
+            content: "Consulta, registro y seguimiento documental";
+        }
+
+        .st-key-home_diseno button::after {
+            content: "Fase I · Documentación técnica del proyecto";
+        }
+
+        /* Interacción */
+        .st-key-home_oficios button:hover,
+        .st-key-home_diseno button:hover {
+            transform: translateY(-3px) !important;
+            box-shadow: 0 16px 30px rgba(13,36,52,.23) !important;
+            border-color: #d3ad67 !important;
+        }
+
+        /* Pie de página */
+        .home-footer {
+            text-align: center;
+            color: #526778;
+            font-size: 12px;
+            margin-top: 30px;
+            letter-spacing: 1px;
+        }
+
+        /* Pantallas pequeñas */
+        @media (max-width: 760px) {
+            .home-hero {
+                padding: 10px 0 18px;
+            }
+
+            .st-key-home_oficios button,
+            .st-key-home_diseno button {
+                height: 180px !important;
+                min-height: 180px !important;
+                padding: 14px 12px 14px 50% !important;
+                background-size: auto 100% !important;
+            }
+
+            .st-key-home_oficios button p,
+            .st-key-home_diseno button p {
+                font-size: 13px !important;
+            }
+        }
+        </style>
+        <section class="home-hero">
+        <div class="home-kicker">MESA DE DISEÑO GEOMÉTRICO DE VÍA FÉRREA</div>
+        <div class="home-title">CONTROL</div>
+        <div class="home-subtitle">DOCUMENTAL</div>
+        <div class="home-line"></div>
+        </section>
         """,
-        height=250,
     )
 
-    # -----------------------------------------------------
-    # TARJETAS
-    # -----------------------------------------------------
-
-    col1, col2 = st.columns(2, gap="large")
-
-    # ==========================================
-    # OFICIOS EN TRÁMITE
-    # ==========================================
-
-    with col1:
-        components.html(
-            f"""
-            <style>
-                body {{
-                    margin: 0;
-                    padding: 0;
-                    background: transparent;
-                    overflow: hidden;
-                    font-family: Arial, Helvetica, sans-serif;
-                }}
-                .tarjeta {{
-                    width: 100%;
-                    height: 145px;
-                    display: flex;
-                    background: #f6f3ed;
-                    border: 1px solid #927449;
-                    box-sizing: border-box;
-                    overflow: hidden;
-                }}
-                .contenido {{
-                    width: 82%;
-                    display: flex;
-                    align-items: center;
-                    padding: 0 30px;
-                    box-sizing: border-box;
-                }}
-                .icono {{
-                    width: 105px;
-                    height: 105px;
-                    object-fit: contain;
-                    flex-shrink: 0;
-                }}
-                .separador {{
-                    width: 1px;
-                    height: 65px;
-                    background: #9e9586;
-                    margin-left: 18px;
-                    margin-right: 30px;
-                    flex-shrink: 0;
-                }}
-                .texto {{
-                    color: #102030;
-                    font-size: 20px;
-                    font-weight: 700;
-                    line-height: 1.25;
-                    letter-spacing: 0.5px;
-                    flex: 1;
-                    text-align: center;
-                }}
-                .flecha {{
-                    width: 18%;
-                    height: 100%;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    background: #102030;
-                    color: white;
-                    font-size: 38px;
-                    font-weight: 300;
-                }}
-            </style>
-
-            <div class="tarjeta">
-                <div class="contenido">
-                    <img src="{icono_oficios}" class="icono">
-                    <div class="separador"></div>
-                    <div class="texto">
-                        OFICIOS EN
-                        <br>
-                        TRÁMITE
-                    </div>
-                </div>
-                <div class="flecha">→</div>
-            </div>
-            """,
-            height=145,
+    estilos_imagenes = "<style>"
+    if imagen_oficios:
+        estilos_imagenes += (
+            '.st-key-home_oficios button {'
+            f'background-image: url("{imagen_oficios}") !important;'
+            '}'
         )
-
-        if st.button("Entrar a Oficios en Trámite", key="btn_oficios", use_container_width=True):
-            st.session_state.menu_activo = "oficios"
-            st.rerun()
-
-    # ==========================================
-    # INGENIERÍA DE DETALLE FASE I
-    # ==========================================
-
-    with col2:
-        components.html(
-            f"""
-            <style>
-                body {{
-                    margin: 0;
-                    padding: 0;
-                    background: transparent;
-                    overflow: hidden;
-                    font-family: Arial, Helvetica, sans-serif;
-                }}
-                .tarjeta {{
-                    width: 100%;
-                    height: 145px;
-                    display: flex;
-                    background: #f6f3ed;
-                    border: 1px solid #927449;
-                    box-sizing: border-box;
-                    overflow: hidden;
-                }}
-                .contenido {{
-                    width: 82%;
-                    display: flex;
-                    align-items: center;
-                    padding: 0 30px;
-                    box-sizing: border-box;
-                }}
-                .icono {{
-                    width: 105px;
-                    height: 105px;
-                    object-fit: contain;
-                    flex-shrink: 0;
-                }}
-                .icono-diseno {{
-                    transform: scale(1.25);
-                }}
-                .separador {{
-                    width: 1px;
-                    height: 65px;
-                    background: #9e9586;
-                    margin-left: 18px;
-                    margin-right: 30px;
-                    flex-shrink: 0;
-                }}
-                .texto {{
-                    color: #102030;
-                    font-size: 16px;
-                    font-weight: 700;
-                    line-height: 1.25;
-                    letter-spacing: 0.3px;
-                    flex: 1;
-                    text-align: center;
-                }}
-                .flecha {{
-                    width: 18%;
-                    height: 100%;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    background: #102030;
-                    color: white;
-                    font-size: 38px;
-                    font-weight: 300;
-                }}
-            </style>
-
-            <div class="tarjeta">
-                <div class="contenido">
-                    <img src="{icono_diseno}" class="icono icono-diseno">
-                    <div class="separador"></div>
-                    <div class="texto">
-                        INGENIERÍA DE DETALLE
-                        <br>
-                        FASE I
-                    </div>
-                </div>
-                <div class="flecha">→</div>
-            </div>
-            """,
-            height=145,
+    if imagen_ingenieria:
+        estilos_imagenes += (
+            '.st-key-home_diseno button {'
+            f'background-image: url("{imagen_ingenieria}") !important;'
+            '}'
         )
+    estilos_imagenes += "</style>"
+    st.html(estilos_imagenes)
 
-        if st.button("Entrar a Ingeniería de Detalle Fase I", key="btn_diseno", use_container_width=True):
-            st.session_state.menu_activo = "diseno"
-            st.rerun()
-
+    st.markdown(
+        '<div class="home-module-label">SELECCIONA UN MÓDULO</div>',
+        unsafe_allow_html=True,
+    )
+    col_oficios, col_diseno = st.columns([1, 1], gap="medium")
+    with col_oficios:
+        if st.button(
+            "OFICIOS EN TRÁMITE", key="home_oficios", use_container_width=True
+        ):
+            navegar_a("oficios")
+    with col_diseno:
+        if st.button(
+            "INGENIERÍA DE DETALLE", key="home_diseno", use_container_width=True
+        ):
+            navegar_a("diseno")
+    st.markdown(
+        '<div class="home-footer">TRAZO &nbsp;·&nbsp; ALINEAMIENTO &nbsp;·&nbsp; RASANTE</div>',
+        unsafe_allow_html=True,
+    )
 
 # =========================================================
 # MÓDULO OFICIOS EN TRÁMITE
 # =========================================================
+
+elif st.session_state.menu_activo == "pendientes":
+    # Fondo independiente del menú principal y de Oficios en trámite.
+    fondo_pendientes = (obtener_imagen_base64("fondo_pendientes.png")
+                        or obtener_imagen_base64("fondo_ferroviario.png"))
+    if fondo_pendientes:
+        st.markdown(
+            f"""<style>
+            [data-testid="stAppViewContainer"] {{
+                background-image: url("{fondo_pendientes}") !important;
+                background-size: cover !important;
+                background-position: center center !important;
+                background-repeat: no-repeat !important;
+                background-attachment: fixed !important;
+            }}
+            [data-testid="stHeader"] {{ background: transparent !important; }}
+            </style>""",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Fondo opcional: guarda fondo_pendientes.png o fondo_ferroviario.png en assets.")
+
+    # El menú lateral se dibuja una sola vez para ambos módulos.
+    # No volver a crear sus widgets al cambiar de pantalla.
+
+    st.markdown("""
+    <style>
+    /* Solo Mis pendientes: conserva la identidad visual institucional. */
+    .stMainBlockContainer:has(.pend-hero) {
+        max-width: 1240px !important;
+        padding-top: 2rem !important;
+        padding-bottom: 4rem !important;
+    }
+    .pend-hero {
+        position:relative; overflow:hidden; border-radius:14px;
+        padding:36px 42px 31px; min-height:190px;
+        background:linear-gradient(110deg,#142c3e 0%,#213e50 70%,#2c4a58 100%);
+        box-shadow:0 10px 28px rgba(17,39,53,.18);
+        border-left:4px solid #bd995b; color:#fff;
+    }
+    .pend-hero:after {
+        content:""; position:absolute; right:32px; top:24px;
+        width:32%; height:120px; opacity:.20;
+        background:repeating-linear-gradient(0deg,transparent 0 22px,#8cabbc 23px 24px),
+                   repeating-linear-gradient(90deg,transparent 0 54px,#8cabbc 55px 56px);
+        transform:skewX(-12deg); pointer-events:none;
+    }
+    .pend-hero-kicker {color:#d7b377;font-size:11px;font-weight:700;letter-spacing:2px}
+    .pend-hero-title {font-size:34px;font-weight:800;margin-top:14px;letter-spacing:-.6px}
+    .pend-hero-desc {font-size:14px;color:#cbd9e2;margin-top:5px}
+    .pend-hero-line {width:48px;height:3px;background:#d5ae69;margin-top:20px}
+    .pend-hero-track {position:absolute;right:30px;bottom:22px;font-size:10px;
+                      color:#b4c8d3;letter-spacing:2px}
+    .pend-section-label {text-align:center;font-size:10px;font-weight:800;
+                         color:#a27a3e;letter-spacing:2.6px;margin-top:27px}
+    .pend-list-title {text-align:center;font-size:22px;font-weight:750;
+                      color:#173246;margin:9px 0 12px}
+    .pend-kpi {background:rgba(255,255,255,.97);border-radius:12px;
+               border:1px solid #dce5e9;border-top:4px solid #b99a65;
+               padding:20px 24px;min-height:133px;
+               box-shadow:0 8px 20px rgba(15,42,59,.08)}
+    .pend-kpi-number {font-size:36px;font-weight:800;color:#173246;line-height:1.1}
+    .pend-kpi-title {font-size:14px;font-weight:750;color:#173246;margin-top:7px}
+    .pend-kpi-desc {font-size:11px;color:#6c8190;margin-top:3px}
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stVerticalBlockBorderWrapper"] {
+        background:rgba(255,255,255,.97);border-radius:13px;
+        border-color:#dce5e9;box-shadow:0 6px 16px rgba(15,42,59,.05);
+    }
+    .pend-oficio {padding:3px 0}
+    .pend-oficio-top {display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+                     color:#173246;font-size:15px}
+    .pend-numero {font-size:12px;color:#708696;margin-top:3px}
+    .pend-asunto {font-size:14px;color:#263f50;margin-top:10px;
+                  font-weight:600;line-height:1.45}
+    .pend-meta {display:flex;gap:22px;flex-wrap:wrap;margin-top:12px;
+                font-size:12px;color:#728491}
+    .pend-estado {border-radius:20px;padding:4px 11px;font-size:11px;font-weight:700;
+                  background:#edf2f5;color:#365568}
+    .pend-estado.revision {background:#e9f1f8;color:#326281}
+    .pend-estado.correcciones {background:#fff0e7;color:#a15a34}
+    .pend-estado.elaboracion {background:#f4f0e6;color:#896d35}
+    .pend-estado.firma {background:#e7f4ed;color:#2d7759}
+    .pend-estado.recaido {background:#f8e8e9;color:#9e4650}
+    /* EDICIÓN RÁPIDA: solo los campos del formulario de Mis pendientes. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] input:not([type="checkbox"]),
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] textarea,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="select"] > div {
+        background-color: #D8E5ED !important;
+        color: #19384B !important;
+        border-color: #A8BDCA !important;
+        border-radius: 7px !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] input:focus,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] textarea:focus,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="select"]:focus-within > div {
+        border-color: #C69A4C !important;
+        box-shadow: 0 0 0 1px #C69A4C !important;
+    }
+    /* Streamlit puede usar una capa interior para el campo de fecha. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="input"] > div,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="textarea"] > div {
+        background-color: #D8E5ED !important;
+        border-color: #A8BDCA !important;
+        border-radius: 7px !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="input"]:focus-within > div,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] [data-baseweb="textarea"]:focus-within > div {
+        border-color: #C69A4C !important;
+        box-shadow: 0 0 0 1px #C69A4C !important;
+    }
+    /* Conservar el aspecto de campo inactivo de fecha. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] input:disabled {
+        opacity: .65 !important;
+        -webkit-text-fill-color: #607887 !important;
+    }
+
+    /* EDICIÓN DE OFICIO: estilo del formulario Registrar nuevo oficio. */
+    .st-key-pend_editor {
+        background:#26333F !important;
+        border:1px solid #587081 !important;
+        border-radius:13px !important;
+        padding:24px 24px 28px !important;
+        box-shadow:0 12px 28px rgba(19,40,53,.18) !important;
+    }
+    .st-key-pend_editor [data-testid="stVerticalBlockBorderWrapper"] {
+        background:transparent !important;
+        border-color:transparent !important;
+        box-shadow:none !important;
+    }
+    .pend-editor-kicker {color:#D4A65A;font-size:10px;font-weight:800;letter-spacing:2px}
+    .pend-editor-title {color:#FFFFFF;font-size:23px;font-weight:800;margin-top:5px}
+    .pend-editor-sub {color:#BFD0DB;font-size:12px;margin-top:3px}
+
+
+/* Centro de autorizaciones: estilos exclusivos de la bandeja de la Tte. */
+.tte-queue-header {background:linear-gradient(110deg,#152d3f,#294b5d);color:white;
+    border-left:4px solid #c39b55;border-radius:12px;padding:24px 28px;margin:14px 0 18px;
+    box-shadow:0 8px 24px rgba(24,48,65,.12)}
+.tte-queue-eyebrow {font-size:10px;letter-spacing:2px;font-weight:800;color:#e0bb7b}
+.tte-queue-heading {font-size:26px;font-weight:800;margin:7px 0 4px;color:white}
+.tte-queue-description {font-size:13px;color:#d8e5ed}
+.tte-file-top {display:flex;justify-content:space-between;gap:10px;align-items:center;margin:0 0 8px}
+.tte-file-label {font-size:10px;font-weight:800;letter-spacing:1.6px;color:#9a7842}
+.tte-file-chip {font-size:11px;background:#fff3dc;color:#805a22;border:1px solid #eed8a7;
+    border-radius:99px;padding:5px 11px;font-weight:700}
+.tte-file-title {font-size:19px;font-weight:800;color:#18374b;overflow-wrap:anywhere}
+.tte-file-meta {font-size:12px;color:#647b8b;margin-top:4px}
+.tte-step-badge {font-size:10px;color:#58758a;text-align:right;letter-spacing:.7px}
+.tte-step-badge strong {color:#18374b;font-size:12px;letter-spacing:0}
+.tte-timeline {display:flex;gap:8px;align-items:center;margin:16px 0 19px}
+.tte-step {flex:1;display:flex;gap:7px;align-items:center;justify-content:center;
+    font-size:11px;font-weight:650;color:#7b8d9b;background:#f2f5f7;border-radius:8px;
+    padding:10px 6px;min-width:0;text-align:center}
+.tte-step span {width:22px;height:22px;border-radius:50%;display:inline-flex;
+    justify-content:center;align-items:center;background:#dce4e9;color:#476273;flex-shrink:0}
+.tte-step.done {background:#eaf3ed;color:#31664e}
+.tte-step.done span {background:#398260;color:white}
+.tte-step.current {background:#e8f0f5;color:#183f58;border:1px solid #a9c5d5}
+.tte-step.current span {background:#24475d;color:white}
+.tte-document-line {display:flex;gap:12px;align-items:center;padding:13px 15px;
+    background:#f7fafb;border:1px solid #dce6ec;border-radius:9px;margin:10px 0 12px;
+    color:#1e3d50;overflow-wrap:anywhere}
+.tte-document-line>span {font-size:25px}.tte-document-line strong {display:block;font-size:12px}
+.tte-document-line small {display:block;color:#738898;font-size:11px;margin-top:4px}
+.tte-decision-title {font-size:16px;font-weight:800;color:#17374b;margin:20px 0 3px}
+.tte-decision-sub {font-size:12px;color:#667d8b;margin-bottom:11px}
+@media(max-width:700px){.tte-timeline {flex-direction:column;align-items:stretch}
+.tte-file-top {flex-wrap:wrap}.tte-queue-heading {font-size:21px}}
+    .doc-center-head {background:#223443;border-left:4px solid #c59b4d;border-radius:9px;
+      padding:18px 22px;margin:14px 0 18px;color:#fff;}
+    .doc-center-kicker {font-size:10px;letter-spacing:2px;color:#e0bb7b;font-weight:700;}
+    .doc-center-title {font-size:22px;font-weight:750;line-height:1.3;margin-top:6px;}
+    .doc-center-sub {font-size:12px;color:#c6d4dc;margin-top:5px;}
+    .pend-editor-section {color:#FFFFFF;text-align:center;font-size:12px;font-weight:800;
+                          padding:20px 0 12px;margin-top:6px;border-bottom:1px solid #587081}
+    .pend-editor-sign {color:#EAF2F7;font-size:12px;font-weight:800;margin:10px 0 2px}
+    .pend-editor-divider {height:1px;background:#607789;margin:15px 0}
+    .st-key-pend_editor label, .st-key-pend_editor [data-testid="stWidgetLabel"] p,
+    .st-key-pend_editor [data-testid="stForm"] label p {
+        color:#EDF4F8 !important;font-weight:650 !important;
+    }
+    .st-key-pend_editor [data-testid="stForm"] {background:transparent !important;
+        border:none !important;padding:0 !important}
+    .st-key-pend_editor input:not([type="checkbox"]),
+    .st-key-pend_editor textarea,
+    .st-key-pend_editor [data-baseweb="select"] > div,
+    .st-key-pend_editor [data-baseweb="input"] > div,
+    .st-key-pend_editor [data-baseweb="textarea"] > div {
+        background:#394F5E !important;color:#F6FBFE !important;
+        border-color:#AFC2CD !important;border-radius:7px !important;
+    }
+    .st-key-pend_editor input::placeholder,.st-key-pend_editor textarea::placeholder {
+        color:#C0CED8 !important;
+    }
+    .st-key-pend_editor input:focus,.st-key-pend_editor textarea:focus,
+    .st-key-pend_editor [data-baseweb="select"]:focus-within > div {
+        border-color:#D1A35B !important;box-shadow:0 0 0 1px #D1A35B !important;
+    }
+    .st-key-pend_editor [data-testid="stFormSubmitButton"] button {
+        background:#C79D4E !important;color:#FFFFFF !important;
+        border:1px solid #C79D4E !important;font-weight:700 !important;
+    }
+    .st-key-pend_editor [data-testid="stFormSubmitButton"] button:hover {
+        background:#B78A39 !important;border-color:#B78A39 !important;
+    }
+    @media(max-width:760px){
+      .pend-hero {padding:25px 23px;min-height:165px}
+      .pend-hero-title {font-size:27px}
+      .pend-hero-track {display:none}
+    }
+    
+    /* ===============================================================
+       REDISEÑO VISUAL DE EXPEDIENTES DE LA TTE. ALONDRA
+       Se aplica exclusivamente a los contenedores tte_expediente_.
+       No modifica acciones, estados, permisos ni almacenamiento.
+       =============================================================== */
+    div[class*="st-key-tte_expediente_"] {
+        background:linear-gradient(145deg,rgba(225,235,242,.98),rgba(213,226,235,.97)) !important;
+        border:1px solid #b8cbd8 !important;
+        border-radius:16px !important;
+        padding:19px 22px 22px !important;
+        margin:13px 0 22px !important;
+        box-shadow:0 12px 29px rgba(21,49,69,.12) !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-file-top {
+        background:#1d394b !important;
+        border-top:3px solid #c39b55 !important;
+        border-radius:11px 11px 0 0 !important;
+        padding:17px 19px 7px !important;
+        margin:0 !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-file-label {
+        color:#e4bc79 !important;
+        font-size:10px !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-file-title {
+        color:#17384d !important;
+        font-size:21px !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-file-meta {
+        color:#536f82 !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-file-chip {
+        background:#fff0d2 !important;
+        border-color:#e5c486 !important;
+        color:#78531b !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-timeline {
+        background:rgba(255,255,255,.58);
+        border:1px solid #c7d7e1;
+        border-radius:12px;
+        padding:10px;
+        margin:16px 0 !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-step {
+        background:#edf3f7;
+        min-height:42px;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-step.current {
+        background:#d4e6f0 !important;
+        border-color:#8eafc2 !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-document-line {
+        background:rgba(255,255,255,.88) !important;
+        border-color:#c7d7e1 !important;
+        border-left:3px solid #b99453 !important;
+        border-radius:11px !important;
+        padding:15px 17px !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-document-line strong {
+        color:#19394e !important;
+        font-size:13px !important;
+    }
+    div[class*="st-key-tte_expediente_"] .tte-decision-title {
+        border-top:1px solid #bbcedb;
+        padding-top:18px;
+        color:#19394e !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stForm"] {
+        background:rgba(247,250,252,.92) !important;
+        border:1px solid #c3d3de !important;
+        border-radius:12px !important;
+        padding:16px 18px 18px !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stForm"] textarea,
+    div[class*="st-key-tte_expediente_"] [data-testid="stForm"] [data-baseweb="textarea"] > div {
+        background:#ffffff !important;
+        color:#17384d !important;
+        border-color:#b8cbd8 !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {
+        background:#b9924e !important;
+        border-color:#b9924e !important;
+        color:#ffffff !important;
+        font-weight:750 !important;
+        min-height:44px !important;
+        border-radius:9px !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button:hover {
+        background:#a47b37 !important;
+        border-color:#a47b37 !important;
+    }
+    div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] {
+        background:rgba(247,250,252,.7) !important;
+        border:1px solid #c4d4de !important;
+        border-radius:9px !important;
+    }
+    @media(max-width:760px) {
+        div[class*="st-key-tte_expediente_"] {padding:12px !important;}
+        div[class*="st-key-tte_expediente_"] .tte-file-top {padding:13px !important;}
+        div[class*="st-key-tte_expediente_"] .tte-timeline {padding:6px !important;}
+    }
+
+    
+    /* Bandeja compacta de John y Alejandra: papel institucional, no azul plano. */
+    div[class*="st-key-revisor_expediente_"] {
+        background:linear-gradient(125deg,rgba(255,255,255,.97),rgba(248,250,251,.96)) !important;
+        border:1px solid #d5e0e6 !important;border-left:3px solid #c29a57 !important;
+        border-radius:12px !important;padding:14px 18px 12px !important;
+        margin:9px 0 !important;box-shadow:0 5px 18px rgba(24,48,65,.075) !important;
+    }
+    .rev-list-intro {display:flex;justify-content:space-between;align-items:center;
+        gap:16px;margin:12px 0 14px;padding:0 3px}
+    .rev-list-kicker {font-size:10px;letter-spacing:1.8px;font-weight:800;color:#ad8246}
+    .rev-list-intro h4 {font-size:21px;color:#18354a;margin:4px 0 2px;font-weight:800}
+    .rev-list-intro p {font-size:12px;color:#64798a;margin:0}
+    .rev-list-count {white-space:nowrap;border:1px solid #d8e1e7;background:#fff;
+        color:#304c5e;border-radius:30px;padding:7px 12px;font-size:12px;font-weight:750}
+    .rev-compact-head {display:flex;justify-content:space-between;align-items:center;gap:16px}
+    .rev-compact-left {min-width:0}
+    .rev-compact-kicker {font-size:9px;letter-spacing:1.45px;color:#a78149;font-weight:800}
+    .rev-compact-title {font-size:18px;font-weight:800;color:#19384b;margin:3px 0;
+        overflow-wrap:anywhere;line-height:1.3}
+    .rev-compact-meta {font-size:12px;color:#617889}
+    .rev-dot {padding:0 4px;color:#b7c5cd}
+    .rev-compact-badge {display:inline-flex;align-items:center;flex-shrink:0;
+        font-size:10px;font-weight:800;letter-spacing:.35px;border-radius:20px;
+        padding:7px 11px;border:1px solid #bcd2dc;background:#eef5f8;color:#315a70}
+    .rev-compact-badge.ajustes {background:#fff5e5;border-color:#e7c68b;color:#8a5d1d}
+    .rev-compact-badge.firma {background:#edf4ef;border-color:#bdd8c6;color:#3a7052}
+    .rev-compact-note {margin-top:11px;display:flex;gap:12px;align-items:baseline;
+        padding:9px 12px;background:#fffaf0;border:1px solid #f0ddba;border-radius:8px;
+        color:#344b59;font-size:12px;line-height:1.5}
+    .rev-compact-note strong {color:#8d622b;white-space:nowrap;font-size:11px}
+    .rev-compact-note span {overflow-wrap:anywhere}
+    .rev-compact-next {color:#718493;font-size:11px;margin:9px 0 5px}
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] {
+        background:rgba(251,252,253,.9) !important;border:1px solid #dce5ea !important;
+        border-radius:8px !important;
+    }
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] summary {
+        color:#24465b !important;font-weight:650 !important;
+    }
+    @media(max-width:760px) {
+        div[class*="st-key-revisor_expediente_"] {padding:12px !important}
+        .rev-compact-head {align-items:flex-start;flex-wrap:wrap;gap:8px}
+        .rev-compact-note {display:block}
+        .rev-compact-note strong {display:block;margin-bottom:4px}
+        .rev-list-intro {flex-wrap:wrap}
+    }
+    /* Tarjetas institucionales: cada oficio es una unidad visual independiente.
+       Los selectores se limitan a la bandeja de John y Alejandra. */
+    div[class*="st-key-revisor_expediente_"][data-testid="stVerticalBlockBorderWrapper"],
+    div[class*="st-key-revisor_expediente_"] {
+        background:linear-gradient(150deg,#ffffff 0%,#f7f9fa 100%) !important;
+        border:1px solid #c5d1d9 !important;
+        border-left:4px solid #b9904d !important;
+        border-radius:15px !important;
+        box-shadow:0 8px 24px rgba(18,42,59,.12),0 1px 3px rgba(18,42,59,.05) !important;
+        padding:15px 19px 13px !important;
+        margin:13px 0 19px !important;
+        overflow:hidden;
+    }
+    div[class*="st-key-revisor_expediente_"] > div[data-testid="stVerticalBlock"] {
+        gap:.48rem !important;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-head {
+        background:linear-gradient(95deg,#edf2f5 0%,#f9fafb 100%);
+        border:1px solid #dce5e9;
+        border-radius:10px;
+        padding:11px 14px;
+        margin:0 0 3px;
+        min-height:68px;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-title {
+        font-size:19px !important;
+        color:#18364a !important;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-note {
+        margin:5px 0 2px;
+        border-left:3px solid #c6984c;
+        background:#fff9ed;
+        border-radius:7px;
+        padding:9px 13px;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-next {
+        margin:3px 2px 2px;
+        color:#4b6678;
+        font-size:11px;
+        font-weight:600;
+    }
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] {
+        background:#f0f4f6 !important;
+        border:1px solid #ccd9e1 !important;
+        border-radius:9px !important;
+        margin-top:4px !important;
+    }
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] summary {
+        color:#1c4055 !important;
+        font-weight:750 !important;
+        min-height:37px;
+    }
+    div[class*="st-key-revisor_expediente_"][class*="_ajustes"] {
+        border-left-color:#c4933f !important;
+    }
+    div[class*="st-key-revisor_expediente_"][class*="_firma"] {
+        border-left-color:#568b70 !important;
+    }
+    div[class*="st-key-revisor_expediente_"][class*="_revision"] {
+        border-left-color:#6088a0 !important;
+    }
+    @media(max-width:760px) {
+        div[class*="st-key-revisor_expediente_"] {padding:10px 11px !important;margin:10px 0 14px !important;}
+        div[class*="st-key-revisor_expediente_"] .rev-compact-head {padding:10px;}
+    }
+    .revision-feedback {
+        background:#fffaf0;border:1px solid #dfbf83;border-left:5px solid #bd8b3b;
+        border-radius:12px;padding:18px 20px;margin:15px 0 19px;
+        box-shadow:0 5px 14px rgba(89,63,21,.06);
+    }
+    .revision-feedback-eyebrow {color:#92682c;font-size:10px;font-weight:800;letter-spacing:1.3px;}
+    .revision-feedback-title {color:#233b4b;font-size:17px;font-weight:800;margin-top:7px;}
+    .revision-feedback-text {
+        background:white;border:1px solid #ead7b5;border-radius:9px;
+        padding:14px 16px;margin:14px 0 10px;color:#213c4e;
+        font-size:14px;line-height:1.65;overflow-wrap:anywhere;
+    }
+    .revision-feedback-footer {color:#667987;font-size:11px;}
+    .revision-feedback-hint {
+        margin-top:13px;border-top:1px solid #e6d3b1;padding-top:12px;
+        color:#536c7b;font-size:12px;line-height:1.5;
+    }
+
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <style>
+    /* Rediseño 2026: solo se aplica al módulo Mis pendientes. */
+    .stMainBlockContainer:has(.pend-hero) {max-width:1500px !important;padding-left:30px !important;padding-right:30px !important}
+    .stMainBlockContainer:has(.pend-hero) > div {gap:1.1rem}
+    .pend-hero {background:rgba(245,249,252,.89);color:#142e43;box-shadow:none;
+        border-left:0;border-radius:16px;padding:22px 22px 18px;min-height:135px;
+        border-bottom:3px solid #b99354}
+    .pend-hero:after {opacity:.11;right:15px;top:12px}
+    .pend-hero-kicker {color:#7c8999;font-size:11px;letter-spacing:2.1px}
+    .pend-hero-title {font-size:40px;color:#122d41;margin-top:8px}
+    .pend-hero-desc {color:#4c6274;font-size:14px}
+    .pend-hero-line {margin-top:12px}
+    .pend-hero-track {color:#617a89}
+    .pend-nav-label {font-size:10px;color:#9b7b4d;font-weight:800;letter-spacing:2px;margin:9px 0 2px}
+    div[class*="st-key-pend_nav_"] {background:rgba(255,255,255,.95);border:1px solid #dbe3ea;
+        border-radius:12px;padding:10px 12px 9px;box-shadow:0 5px 17px rgba(22,44,61,.07);min-height:90px}
+    div[class*="st-key-pend_nav_"] .pend-nav-caption {font-size:11px;color:#6c8091;margin-bottom:5px}
+    div[class*="st-key-pend_nav_"] button {height:42px !important;background:transparent !important;
+        border:0 !important;color:#19364c !important;text-align:left !important;
+        font-weight:750 !important;font-size:14px !important;box-shadow:none !important}
+    div[class*="st-key-pend_nav_"] button:hover {color:#9b722f !important;background:#f4f6f7 !important}
+    div[class*="st-key-pend_nav_"][class*="_activo"] {background:#172f42;border-color:#c19a56}
+    div[class*="st-key-pend_nav_"][class*="_activo"] button,
+    div[class*="st-key-pend_nav_"][class*="_activo"] .pend-nav-caption {color:white !important}
+    .pend-nav-disabled {border:1px dashed #c9d4dd;border-radius:10px;padding:20px 8px;color:#8193a0;font-size:12px}
+    .pend-section-label {text-align:left;margin-top:14px;margin-bottom:8px;color:#9b7b4d}
+    .pend-kpi {display:flex;align-items:center;gap:20px;min-height:116px;padding:18px 23px;
+        border:1px solid #e2e8ed;border-top:1px solid #e2e8ed;
+        background:rgba(255,255,255,.95);border-radius:13px}
+    .pend-kpi-icon {width:54px;height:54px;display:flex;align-items:center;justify-content:center;
+        border-radius:12px;background:color-mix(in srgb,var(--accent) 12%,white);color:var(--accent);
+        font-size:31px;font-weight:700;flex-shrink:0}
+    .pend-kpi-number {font-size:31px}
+    .pend-kpi-title {margin-top:2px}
+    .pend-list-title {text-align:left;margin:7px 0 4px;font-size:23px}
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stVerticalBlockBorderWrapper"] {
+        border-color:#d9e3ea;box-shadow:0 4px 14px rgba(22,43,57,.06)}
+    .pend-oficio {padding:11px 4px 12px 52px;position:relative}
+    .pend-oficio:before {content:'▤';position:absolute;left:0;top:14px;background:#edf2f7;
+        border-radius:10px;width:40px;height:45px;display:flex;align-items:center;justify-content:center;
+        color:#24445b;font-size:25px}
+    .pend-oficio-top {font-size:16px}
+    .pend-asunto {font-size:14px}
+    .pend-meta {font-size:12px;color:#60798a}
+    @media(max-width:800px) {
+      .stMainBlockContainer:has(.pend-hero) {padding-left:14px !important;padding-right:14px !important}
+      .pend-hero-title {font-size:30px}
+      .pend-hero-track {display:none}
+      .pend-kpi {padding:14px;gap:10px}
+      .pend-kpi-icon {width:36px;height:40px;font-size:23px}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    # Ajustes visuales de Mis pendientes: no modifican el flujo ni las credenciales.
+    st.markdown("""
+    <style>
+    /* Ancho real de trabajo y fondo con menor protagonismo. */
+    .stMainBlockContainer:has(.pend-hero) {
+        max-width: 1580px !important;
+        width: 96% !important;
+        padding: 1.1rem 24px 4rem !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) > div {gap: .9rem !important;}
+    [data-testid="stAppViewContainer"]:has(.pend-hero) {
+        background-color: #edf2f6 !important;
+        background-blend-mode: normal !important;
+    }
+    /* Cabecera institucional compacta. */
+    .pend-hero {
+        min-height: 125px !important;
+        padding: 23px 32px !important;
+        background: linear-gradient(112deg,rgba(255,255,255,.97),rgba(242,247,251,.94)) !important;
+        border: 1px solid #dce5ec !important;
+        border-left: 5px solid #ba9554 !important;
+        border-bottom: 1px solid #dce5ec !important;
+        border-radius: 16px !important;
+        box-shadow: 0 9px 25px rgba(20,45,63,.07) !important;
+    }
+    .pend-hero-title {font-size: 33px !important; margin-top: 6px !important;}
+    .pend-hero-kicker {color:#987642 !important;font-size:10px !important;}
+    .pend-hero-line {display:none !important;}
+    /* Bandejas: cuatro módulos uniformes con selección visible. */
+    div[class*="st-key-pend_nav_"] {
+        min-height: 95px !important;
+        background: rgba(255,255,255,.97) !important;
+        border: 1px solid #dbe5ec !important;
+        border-radius: 13px !important;
+        padding: 15px 17px !important;
+        box-shadow: 0 5px 15px rgba(25,50,67,.045) !important;
+    }
+    div[class*="st-key-pend_nav_"][class*="_activo"] {
+        background: #1e3a4e !important;
+        border-color: #c4a36b !important;
+        box-shadow: 0 8px 20px rgba(19,44,61,.16) !important;
+    }
+    div[class*="st-key-pend_nav_"] button {font-size:15px !important;}
+    div[class*="st-key-pend_nav_"] .pend-nav-caption {font-size:12px !important;}
+    /* Resumen: cifras proporcionadas y sin líneas de color superiores. */
+    .pend-kpi {
+        min-height: 100px !important;
+        padding: 15px 20px !important;
+        border: 1px solid #dfe7ed !important;
+        box-shadow: 0 5px 17px rgba(18,45,62,.05) !important;
+    }
+    .pend-kpi-number {font-size:29px !important;}
+    .pend-kpi-icon {width:47px !important;height:47px !important;font-size:25px !important;}
+    .pend-list-title {font-size:23px !important;color:#1b394c !important;}
+    /* Fichas de expediente: tarjeta ligera, separada del contenido editable. */
+    div[class*="st-key-pend_ficha_"] {
+        background: rgba(255,255,255,.97) !important;
+        border: 1px solid #dbe4eb !important;
+        border-radius: 15px !important;
+        padding: 12px 18px !important;
+        box-shadow: 0 7px 20px rgba(18,44,63,.055) !important;
+        margin-bottom: 8px !important;
+    }
+    div[class*="st-key-pend_ficha_"] .pend-oficio {padding-top: 8px !important;padding-bottom:8px !important;}
+    div[class*="st-key-pend_ficha_"] button[kind="primary"] {
+        border-radius:9px !important;background:#24445a !important;
+        border-color:#24445a !important;min-height:42px !important;
+    }
+    /* El editor deja de ser un bloque oscuro dentro del expediente. */
+    .st-key-pend_editor {
+        background:#f8fafc !important;
+        border:1px solid #d9e4eb !important;
+        border-radius:14px !important;
+        padding:23px 27px 26px !important;
+        box-shadow:none !important;
+        margin-top: 12px !important;
+    }
+    .st-key-pend_editor [data-testid="stVerticalBlockBorderWrapper"] {
+        background:transparent !important;
+        border-color:transparent !important;
+        box-shadow:none !important;
+    }
+    .pend-editor-header {padding-bottom:12px !important;border-bottom:1px solid #dce5ec !important;}
+    .pend-editor-kicker {color:#a17c42 !important;}
+    .pend-editor-title {color:#1d3a4e !important;font-size:22px !important;}
+    .pend-editor-sub {color:#62798a !important;}
+    .pend-editor-section {
+        color:#28465b !important;
+        text-align:left !important;
+        font-size:12px !important;
+        border-bottom:1px solid #dce5eb !important;
+        padding:16px 0 10px !important;
+    }
+    .pend-editor-sign {color:#29465a !important;}
+    .pend-editor-divider {background:#dce5eb !important;}
+    .st-key-pend_editor label,
+    .st-key-pend_editor [data-testid="stWidgetLabel"] p,
+    .st-key-pend_editor [data-testid="stForm"] label p {
+        color:#244358 !important;font-weight:650 !important;
+    }
+    .st-key-pend_editor input:not([type="checkbox"]),
+    .st-key-pend_editor textarea,
+    .st-key-pend_editor [data-baseweb="select"] > div,
+    .st-key-pend_editor [data-baseweb="input"] > div,
+    .st-key-pend_editor [data-baseweb="textarea"] > div {
+        background:#fff !important;color:#18374b !important;
+        border:1px solid #cbd9e3 !important;border-radius:8px !important;
+    }
+    .st-key-pend_editor input::placeholder,
+    .st-key-pend_editor textarea::placeholder {color:#7a8e9b !important;}
+    .st-key-pend_editor [data-baseweb="select"] span,
+    .st-key-pend_editor [data-baseweb="select"] input {color:#18374b !important;}
+    .st-key-pend_editor [data-testid="stFormSubmitButton"] button {
+        background:#25465b !important;color:#fff !important;
+        border:1px solid #25465b !important;border-radius:9px !important;
+        min-height:44px !important;
+    }
+    .st-key-pend_editor [data-testid="stFormSubmitButton"] button:hover {
+        background:#163448 !important;border-color:#163448 !important;
+    }
+    /* Cabecera del centro de revisión: acorde al editor claro. */
+    .doc-center-head {
+        background:linear-gradient(110deg,#213e52,#2d5164) !important;
+        border-radius:11px !important;
+        padding:15px 19px !important;
+        margin:12px 0 !important;
+    }
+    .doc-center-title {font-size:19px !important;}
+    /* Evita bordes y sombras globales aplicados a cada contenedor anidado. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stVerticalBlockBorderWrapper"] {
+        box-shadow:none;
+    }
+    @media(max-width:900px) {
+        .stMainBlockContainer:has(.pend-hero) {width:100% !important;padding:12px 13px 3rem !important;}
+        .pend-hero {padding:20px !important;}
+        .pend-hero-title {font-size:28px !important;}
+        .st-key-pend_editor {padding:16px !important;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    # Acabado visual del seguimiento: gris grafito, borde dorado y jerarquía compacta.
+    # Solo afecta a las tarjetas documentales de este módulo.
+    st.markdown("""
+    <style>
+    div[class*="st-key-revisor_expediente_"] {
+        background:linear-gradient(145deg,#e5e7e8 0%,#d9dcde 100%) !important;
+        border:1px solid #b8bdc0 !important;
+        border-left:4px solid #bd9553 !important;
+        border-radius:13px !important;
+        padding:12px 14px !important;
+        box-shadow:0 5px 17px rgba(29,34,37,.12) !important;
+        margin:10px 0 14px !important;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-head {
+        background:linear-gradient(110deg,#3c4043,#515558) !important;
+        border:1px solid #64696b !important;
+        border-left:3px solid #d2ac6a !important;
+        border-radius:9px !important;
+        padding:12px 14px !important;
+        min-height:65px !important;
+        margin-bottom:6px !important;
+    }
+    div[class*="st-key-revisor_expediente_"] .rev-compact-kicker {color:#e5bf7d !important;font-size:9px !important;letter-spacing:1.2px !important;}
+    div[class*="st-key-revisor_expediente_"] .rev-compact-title {color:#fff !important;font-size:17px !important;line-height:1.3 !important;overflow-wrap:anywhere !important;}
+    div[class*="st-key-revisor_expediente_"] .rev-compact-meta {color:#e0e2e3 !important;font-size:11px !important;}
+    div[class*="st-key-revisor_expediente_"] .rev-compact-badge {font-size:9px !important;letter-spacing:.3px !important;max-width:190px !important;white-space:normal !important;text-align:center !important;}
+    div[class*="st-key-revisor_expediente_"] .rev-compact-next {color:#51565a !important;font-size:11px !important;}
+    div[class*="st-key-revisor_expediente_"] .rev-compact-note {background:#faf3e6 !important;border:1px solid #dfc69a !important;border-left:3px solid #c39751 !important;}
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] {background:#f1f2f2 !important;border:1px solid #b9c0c4 !important;}
+    div[class*="st-key-revisor_expediente_"] [data-testid="stExpander"] summary {color:#333b40 !important;}
+    .doc-center-head {background:linear-gradient(110deg,#373b3e,#515558) !important;border-left:4px solid #c69c58 !important;border-radius:10px !important;padding:13px 17px !important;margin:10px 0 12px !important;}
+    .doc-center-kicker {color:#e3bd7e !important;font-size:9px !important;}
+    .doc-center-title {font-size:17px !important;line-height:1.25 !important;margin-top:5px !important;color:#fff !important;}
+    .doc-center-sub {font-size:11px !important;color:#e0e2e2 !important;}
+    .doc-summary-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:11px 0 13px;}
+    .doc-summary-item {background:#e7e9e9;border:1px solid #c3c8ca;border-radius:9px;padding:10px 12px;min-width:0;display:flex;flex-direction:column;gap:5px;}
+    .doc-summary-item span {color:#666c70;font-size:9px;letter-spacing:1px;font-weight:750;text-align:center;}
+    .doc-summary-item strong {color:#30383d;font-size:17px;font-weight:750;line-height:1.25;overflow-wrap:anywhere;text-align:center;}
+    .doc-summary-status strong {font-size:12px;color:#6b542f;line-height:1.35;}
+    div[class*="st-key-revisor_expediente_"] .revision-feedback {padding:12px 14px !important;margin:10px 0 !important;background:#f9f4ea !important;}
+    div[class*="st-key-revisor_expediente_"] .revision-feedback-title {font-size:14px !important;}
+    div[class*="st-key-revisor_expediente_"] .revision-feedback-text {font-size:12px !important;padding:10px 12px !important;margin:9px 0 !important;}
+    div[class*="st-key-revisor_expediente_"] .revision-feedback-hint {font-size:11px !important;margin-top:9px !important;padding-top:8px !important;}
+    @media(max-width:680px) {
+        .doc-summary-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+        .doc-summary-status {grid-column:1/-1;}
+        div[class*="st-key-revisor_expediente_"] .rev-compact-head {flex-wrap:wrap !important;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    # Acabado final: mismo lenguaje visual que Oficios en trámite.
+    # Estas reglas están deliberadamente al final para prevalecer sobre el CSS previo.
+    st.markdown("""
+    <style>
+    /* No sustituir la imagen ferroviaria del módulo: solo quitar el velo que la borraba. */
+    [data-testid="stAppViewContainer"]:has(.pend-hero) {
+        background-color:transparent !important;
+        background-blend-mode:normal !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) {
+        max-width:1240px !important;
+        width:calc(100% - 48px) !important;
+        padding:2rem 12px 4rem !important;
+    }
+    /* Cabecera azul marino idéntica en carácter al módulo principal. */
+    .pend-hero {
+        min-height:174px !important;
+        padding:33px 38px !important;
+        background:linear-gradient(112deg,#142c3e 0%,#1e394b 68%,#304f5b 100%) !important;
+        border:0 !important;
+        border-left:4px solid #c4a063 !important;
+        border-radius:12px !important;
+        box-shadow:0 8px 22px rgba(16,39,55,.13) !important;
+        color:white !important;
+    }
+    .pend-hero-kicker {color:#e2b878 !important;font-size:10px !important;letter-spacing:2px !important;}
+    .pend-hero-title {color:#fff !important;font-size:31px !important;margin-top:12px !important;}
+    .pend-hero-desc {color:#d6e3ec !important;font-size:13px !important;}
+    .pend-hero-line {display:block !important;width:39px !important;height:2px !important;
+        margin-top:19px !important;background:#d7ae69 !important;}
+    .pend-hero-track {color:#b7cbd5 !important;}
+    .pend-hero:after {opacity:.18 !important;}
+    /* Bandejas compactas: sin enormes botones incrustados en cajas. */
+    .pend-nav-label,.pend-section-label {text-align:left !important;margin-top:21px !important;}
+    div[class*="st-key-pend_nav_"] {
+        min-height:0 !important;
+        padding:9px 11px !important;
+        background:rgba(255,255,255,.97) !important;
+        border:1px solid #dbe3e9 !important;
+        border-radius:11px !important;
+        box-shadow:0 4px 13px rgba(25,50,67,.05) !important;
+    }
+    div[class*="st-key-pend_nav_"] .pend-nav-caption {
+        color:#6b7f8e !important;font-size:11px !important;margin:1px 3px 5px !important;
+    }
+    div[class*="st-key-pend_nav_"] button {
+        min-height:42px !important;height:auto !important;
+        background:#f3f6f8 !important;color:#244358 !important;
+        border:1px solid #e0e7ec !important;border-radius:7px !important;
+        font-size:13px !important;font-weight:650 !important;
+    }
+    div[class*="st-key-pend_nav_"] button p {color:inherit !important;}
+    div[class*="st-key-pend_nav_"][class*="_activo"] {
+        background:#fff !important;border-color:#c6a66b !important;
+        box-shadow:0 4px 15px rgba(27,56,73,.08) !important;
+    }
+    div[class*="st-key-pend_nav_"][class*="_activo"] .pend-nav-caption {color:#5b6e7c !important;}
+    div[class*="st-key-pend_nav_"][class*="_activo"] button {
+        background:#253f51 !important;color:#fff !important;border-color:#253f51 !important;
+    }
+    .pend-nav-disabled {padding:10px 8px !important;min-height:42px !important;}
+    /* Panorama documental: tarjetas pequeñas, proporcionales al menú principal. */
+    .pend-kpi {
+        min-height:102px !important;padding:16px 19px !important;gap:14px !important;
+        border:1px solid #dfe6eb !important;border-radius:11px !important;
+        box-shadow:0 5px 16px rgba(20,44,60,.055) !important;
+        background:rgba(255,255,255,.98) !important;
+    }
+    .pend-kpi-number {font-size:29px !important;}
+    .pend-kpi-icon {width:43px !important;height:43px !important;font-size:21px !important;}
+    .pend-list-title {text-align:left !important;font-size:20px !important;margin:8px 0 !important;}
+    /* Fichas y formularios: superficie blanca, borde dorado sutil en zona de trabajo. */
+    div[class*="st-key-pend_ficha_"] {
+        border:1px solid #dce4e9 !important;
+        background:rgba(255,255,255,.98) !important;
+        border-radius:11px !important;
+        box-shadow:0 5px 15px rgba(25,50,67,.05) !important;
+    }
+    .st-key-pend_editor {background:#fff !important;border-radius:10px !important;}
+    @media(max-width:900px) {
+        .stMainBlockContainer:has(.pend-hero) {width:100% !important;padding:1rem 12px 3rem !important;}
+        .pend-hero {min-height:150px !important;padding:24px !important;}
+        .pend-hero-title {font-size:27px !important;}
+    }
+    </style>
+    """,unsafe_allow_html=True)
+    # Corrección puntual de contraste: selectores directos que sí coinciden
+    # con los contenedores reales de Streamlit (sin depender de :has()).
+    st.markdown("""<style>
+    /* Expedientes de revisión final: quitar el azul en todos los estados. */
+    div[class*="st-key-tte_expediente_"] .tte-file-top {background:#44423d !important;border-top-color:#c69a55 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-file-label {color:#f4c781 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-file-title,
+    div[class*="st-key-tte_expediente_"] .tte-file-meta,
+    div[class*="st-key-tte_expediente_"] .tte-step-badge,
+    div[class*="st-key-tte_expediente_"] .tte-step-badge strong,
+    div[class*="st-key-tte_expediente_"] .tte-document-line strong,
+    div[class*="st-key-tte_expediente_"] .tte-decision-title {color:#302d27 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-timeline {background:#f2eee6 !important;border-color:#c9bba6 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-step {background:#e9e3d9 !important;border:1px solid #c8bca9 !important;color:#3e3a33 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-step.done {background:#e4eee5 !important;color:#22543d !important;border-color:#b4c9b8 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-step.current {background:#e9d6b6 !important;color:#4b3219 !important;border-color:#ad8247 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-step.current span {background:#765329 !important;color:#fffaf1 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-step:not(.current):not(.done) span {background:#d0c5b4 !important;color:#423a30 !important;}
+    div[class*="st-key-tte_expediente_"] .tte-document-line {background:#fffdf9 !important;border-color:#c9bba6 !important;border-left-color:#b88d50 !important;}
+    div[class*="st-key-tte_expediente_"] [data-testid="stForm"] {background:#f5f1e9 !important;border-color:#c9bba6 !important;}
+    div[class*="st-key-tte_expediente_"] textarea,
+    div[class*="st-key-tte_expediente_"] [data-baseweb="textarea"] > div {background:#fffdf9 !important;color:#292923 !important;border-color:#bcae98 !important;}
+    div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] {background:#f6f2ea !important;border-color:#c9bba6 !important;}
+    div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] summary,
+    div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] summary * {color:#302e29 !important;}
+    /* Texto oscuro en tarjetas claras; blanco sobre las oscuras. */
+    .rev-compact-head .rev-compact-title,
+    .rev-compact-head .rev-compact-meta,
+    .rev-compact-head .rev-compact-badge.ajustes {color:#fff9ed !important;}
+    .rev-compact-head .rev-compact-badge.ajustes {background:#785528 !important;border-color:#e2c48d !important;}
+    .rev-compact-note,.rev-compact-note span,.rev-compact-next {color:#38352e !important;}
+    .rev-compact-head .rev-compact-kicker {color:#efc17d !important;}
+    /* El botón activo se había quedado con texto oscuro sobre grafito. */
+    div[class*="st-key-pend_nav_"][class*="_activo"] button,
+    div[class*="st-key-pend_nav_"][class*="_activo"] button * {background:#504c43 !important;background-color:#504c43 !important;color:#fffaf0 !important;-webkit-text-fill-color:#fffaf0 !important;opacity:1 !important;}
+    div[class*="st-key-pend_nav_"][class*="_activo"] button:disabled,
+    div[class*="st-key-pend_nav_"][class*="_activo"] button:disabled * {background:#504c43 !important;color:#fffaf0 !important;-webkit-text-fill-color:#fffaf0 !important;opacity:1 !important;}
+    div[class*="st-key-pend_nav_"] .pend-nav-caption {color:#62594b !important;}
+    /* Etiqueta de correcciones: contraste alto en vez de blanco sobre marfil. */
+    .rev-compact-badge.ajustes {background:#775329 !important;border-color:#b88c4c !important;color:#fff9ed !important;}
+    .rev-compact-badge.ajustes * {color:#fff9ed !important;}
+    /* Formularios y etiquetas legibles en ambas bandejas. */
+    div[class*="st-key-tte_expediente_"] [data-testid="stWidgetLabel"],
+    div[class*="st-key-tte_expediente_"] [data-testid="stWidgetLabel"] *,
+    div[class*="st-key-tte_expediente_"] [data-testid="stCaptionContainer"],
+    div[class*="st-key-tte_expediente_"] [data-testid="stCaptionContainer"] * {color:#4d453a !important;}
+    div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {background:#4c4840 !important;color:#fffaf0 !important;border:1px solid #b98c4f !important;}
+    </style>""",unsafe_allow_html=True)
+    mostrar_mis_pendientes()
+
+    # Ajustes visuales finales de Mis pendientes y Centro de autorizaciones.
+    # Se mantienen intactos los procesos, permisos, versiones y conexiones.
+    # Los fondos se cargan desde assets/ mediante el código existente.
+    st.markdown("""
+    <style>
+    /* Encabezado principal: grafito con acento cobre, sin azul ni morado. */
+    .pend-hero {
+        background:linear-gradient(112deg,#30312f 0%,#484843 70%,#625a4e 100%) !important;
+        border-left:4px solid #c69a53 !important;
+        box-shadow:0 9px 24px rgba(38,35,29,.17) !important;
+    }
+    .pend-hero:after {opacity:.10 !important;}
+    .pend-hero-kicker {color:#edc88c !important;}
+    .pend-hero-title {color:#fffdf8 !important;}
+    .pend-hero-desc,.pend-hero-track {color:#e2ddd3 !important;}
+    .tte-queue-header {
+        background:linear-gradient(110deg,#534c3e,#75634b) !important;
+        border-left:4px solid #d7b67b !important;
+        box-shadow:0 7px 22px rgba(59,50,36,.16) !important;
+    }
+    .tte-queue-eyebrow {color:#f0d49e !important;}
+    .tte-queue-description {color:#f4ece0 !important;}
+    /* Métricas del revisor: gris piedra claro y alto contraste. */
+    .tte-summary-card {
+        background:linear-gradient(145deg,#e5e0d7,#d6d0c5) !important;
+        border:1px solid #bdb4a5 !important;
+        border-left:4px solid #ad8150 !important;
+        box-shadow:0 5px 14px rgba(50,46,39,.10) !important;
+    }
+    .tte-summary-label {color:#534a3e !important;}
+    .tte-summary-value,.tte-summary-card--final .tte-summary-value {color:#2f302d !important;}
+    /* Navegación y fichas de expedientes. */
+    div[class*="st-key-pend_nav_"] {background:#eeece8 !important;border-color:#d1cbc0 !important;}
+    div[class*="st-key-pend_nav_"] button {
+        background:#e3e0da !important;color:#383b39 !important;border-color:#cfc9bf !important;
+    }
+    div[class*="st-key-pend_nav_"][class*="_activo"] {
+        background:#e6e0d5 !important;border-color:#bc965e !important;
+    }
+    div[class*="st-key-pend_nav_"][class*="_activo"] button {
+        background:#56554d !important;color:#fff !important;border-color:#56554d !important;
+    }
+    div[class*="st-key-revisor_expediente_"],div[class*="st-key-pend_ficha_"] {
+        background:linear-gradient(140deg,#eeece8,#e4e2de) !important;
+        border:1px solid #bcbab3 !important;
+        border-left:4px solid #c79a53 !important;
+        box-shadow:0 6px 17px rgba(48,44,38,.13) !important;
+        border-radius:12px !important;
+    }
+    .rev-compact-head {background:linear-gradient(110deg,#3c3d3a,#55544f) !important;}
+    .doc-center-head {background:linear-gradient(110deg,#454641,#605e55) !important;}
+    .doc-summary-item {background:#e9e5df !important;border-color:#c9c1b5 !important;}
+    .doc-summary-item strong {color:#343531 !important;}
+    .doc-summary-status strong {color:#74572f !important;}
+    .rev-list-intro h4 {color:#343631 !important;}
+    .rev-list-count {background:#eee4d3 !important;color:#70502c !important;}
+    /* Acciones de envío y reenvío. */
+    div[class*="st-key-doc_reenviar_"] button,div[class*="st-key-doc_tte_"] button {
+        background:#514e47 !important;color:#fff !important;
+        border:1px solid #bd955b !important;border-left:4px solid #d2aa6a !important;
+    }
+    div[class*="st-key-doc_reenviar_"] button:hover,div[class*="st-key-doc_tte_"] button:hover {
+        background:#696153 !important;color:#fff !important;
+    }
+    @media(max-width:760px) {
+        .tte-summary-card {min-height:88px !important;padding:12px 6px !important;}
+        .tte-summary-value {font-size:20px !important;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+    # Paleta integral exclusiva de Mis pendientes. Se inyecta al final para
+    # sustituir estilos azules de componentes y formularios sin tocar lógica.
+    st.markdown("""
+    <style>
+    /* Solo el módulo de pendientes; los otros módulos quedan intactos. */
+    [data-testid="stAppViewContainer"]:has(.pend-hero) {
+        --pend-carbon:#41413d; --pend-carbon-hover:#5c574e;
+        --pend-stone:#e9e5de; --pend-ivory:#f7f4ee;
+        --pend-copper:#bb9255; --pend-border:#c9c0b3;
+        --pend-ink:#343630;
+    }
+    /* Encabezados y barras internas de expedientes. */
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-head,
+    .stMainBlockContainer:has(.pend-hero) .tte-file-header,
+    .stMainBlockContainer:has(.pend-hero) .doc-center-head,
+    .stMainBlockContainer:has(.pend-hero) .doc-center-title-bar {
+        background:linear-gradient(110deg,#41413d,#625c51) !important;
+        border-color:#bd955a !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-head *,
+    .stMainBlockContainer:has(.pend-hero) .doc-center-head * {color:#faf8f3 !important;}
+    /* Indicadores, etapas, etiquetas y elementos de historial. */
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-step,
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-badge,
+    .stMainBlockContainer:has(.pend-hero) .tte-step-badge,
+    .stMainBlockContainer:has(.pend-hero) .tte-file-badge,
+    .stMainBlockContainer:has(.pend-hero) .doc-summary-item,
+    .stMainBlockContainer:has(.pend-hero) .rev-list-count,
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card {
+        background:#e7e1d6 !important;border-color:#c7b9a4 !important;
+        color:#3f3c35 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-step *,
+    .stMainBlockContainer:has(.pend-hero) .tte-step-badge *,
+    .stMainBlockContainer:has(.pend-hero) .doc-summary-item *,
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card * {color:#3f3c35 !important;}
+    /* Progreso: se eliminan fondos celestes, manteniendo el verde de completado. */
+    .stMainBlockContainer:has(.pend-hero) .rev-step-active,
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-step--active,
+    .stMainBlockContainer:has(.pend-hero) .tte-progress-active,
+    .stMainBlockContainer:has(.pend-hero) .tte-progress-current,
+    .stMainBlockContainer:has(.pend-hero) [class*="step-current"],
+    .stMainBlockContainer:has(.pend-hero) [class*="step-active"] {
+        background:#e9dcc5 !important;color:#604725 !important;
+        border-color:#bd9458 !important;
+    }
+    /* Tarjetas de expedientes, archivos y zonas de observaciones. */
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-file,
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-note,
+    .stMainBlockContainer:has(.pend-hero) .tte-file-card,
+    .stMainBlockContainer:has(.pend-hero) .revision-feedback,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stExpander"] {
+        background:#f5f2ec !important;border-color:#c8beb0 !important;
+    }
+    /* Todos los botones Streamlit dentro de Mis pendientes. */
+    .stMainBlockContainer:has(.pend-hero) button[kind="primary"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stBaseButton-primary"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stFormSubmitButton"] button {
+        background:#494943 !important;background-color:#494943 !important;
+        color:#fffdf8 !important;border:1px solid #b99159 !important;
+        box-shadow:none !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) button[kind="primary"] *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stBaseButton-primary"] *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stFormSubmitButton"] button * {color:#fffdf8 !important;}
+    .stMainBlockContainer:has(.pend-hero) button[kind="secondary"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stBaseButton-secondary"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stLinkButton"] a,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stDownloadButton"] button {
+        background:#f0ece5 !important;background-color:#f0ece5 !important;
+        color:#42413a !important;border:1px solid #c5b9a8 !important;
+        box-shadow:none !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) button[kind="secondary"] *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stBaseButton-secondary"] *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stLinkButton"] a *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stDownloadButton"] button * {color:#42413a !important;}
+    .stMainBlockContainer:has(.pend-hero) button:hover,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stLinkButton"] a:hover {
+        border-color:#aa7d43 !important;filter:brightness(.95);
+    }
+    /* Controles de formulario: búsqueda, selección, radio y observaciones. */
+    .stMainBlockContainer:has(.pend-hero) [data-baseweb="input"] > div,
+    .stMainBlockContainer:has(.pend-hero) [data-baseweb="textarea"] > div,
+    .stMainBlockContainer:has(.pend-hero) [data-baseweb="select"] > div {
+        background:#f7f4ee !important;border-color:#c8beb0 !important;
+        box-shadow:none !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) input,
+    .stMainBlockContainer:has(.pend-hero) textarea,
+    .stMainBlockContainer:has(.pend-hero) [data-baseweb="select"] span {
+        color:#383a34 !important;background-color:transparent !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) input:focus,
+    .stMainBlockContainer:has(.pend-hero) textarea:focus {outline-color:#b99159 !important;}
+    .stMainBlockContainer:has(.pend-hero) [role="radio"][aria-checked="true"],
+    .stMainBlockContainer:has(.pend-hero) [role="checkbox"][aria-checked="true"] {
+        background-color:#a67c46 !important;border-color:#a67c46 !important;
+    }
+    /* Mensajes informativos sin paneles azulados. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stAlert"]:has([data-testid="stNotificationContentInfo"]),
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stAlert"]:has([data-testid="stNotificationContentWarning"]) {
+        background:#eee7da !important;color:#514632 !important;
+        border-color:#c9b58e !important;
+    }
+    /* Prioridad a los botones de navegación activos. */
+    div[class*="st-key-pend_nav_"][class*="_activo"] button,
+    div[class*="st-key-pend_nav_"][class*="_activo"] button * {
+        background:#56534b !important;color:#fff !important;
+    }
+
+    /* Ajuste final: contraste y eliminación completa de celestes en pendientes. */
+    .stMainBlockContainer:has(.pend-hero) .tte-file-title,
+    .stMainBlockContainer:has(.pend-hero) .tte-file-meta,
+    .stMainBlockContainer:has(.pend-hero) .tte-step-badge,
+    .stMainBlockContainer:has(.pend-hero) .tte-step-badge strong,
+    .stMainBlockContainer:has(.pend-hero) .tte-document-line strong,
+    .stMainBlockContainer:has(.pend-hero) .tte-decision-title,
+    .stMainBlockContainer:has(.pend-hero) .rev-list-intro h4,
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-note,
+    .stMainBlockContainer:has(.pend-hero) .rev-compact-file {color:#292b27 !important;}
+    .stMainBlockContainer:has(.pend-hero) .tte-file-top {
+        background:#45443f !important;border-top:3px solid #c59a59 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-file-top .tte-file-label {color:#f0cb8c !important;}
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] {
+        background:linear-gradient(145deg,#e7e2da,#d9d4cb) !important;
+        border:1px solid #bcb2a3 !important;border-left:4px solid #bd9050 !important;
+        box-shadow:0 9px 24px rgba(52,46,37,.13) !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-timeline {
+        background:#f3efe8 !important;border:1px solid #c8bfb0 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step {
+        background:#e7e1d7 !important;border:1px solid #cfc4b4 !important;
+        color:#393a34 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.current {
+        background:#e7d4b3 !important;border-color:#aa824b !important;color:#49341d !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.current span {
+        background:#8b6535 !important;color:#fffaf1 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-document-line {
+        background:#faf8f3 !important;border:1px solid #c8bdac !important;
+        border-left:3px solid #b58b4f !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] {
+        background:#f4f0e9 !important;border:1px solid #c8bcac !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] textarea,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] [data-baseweb="textarea"] > div {
+        background:#fffdfa !important;color:#282a26 !important;border-color:#bfb19e !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] {
+        background:#f5f1ea !important;border-color:#c8bcac !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {
+        background:#47443e !important;color:#fffaf1 !important;border:1px solid #c39a5b !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-step:not(.current):not(.done) span {
+        background:#d7cfc1 !important;color:#4b453b !important;
+    }
+    /* Legibilidad de texto general sobre fondos claros. */
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stExpander"] summary,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stExpander"] summary *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] label,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stForm"] label *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stCaptionContainer"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stCaptionContainer"] *,
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stWidgetLabel"],
+    .stMainBlockContainer:has(.pend-hero) [data-testid="stWidgetLabel"] * {
+        color:#41413b !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) input::placeholder,
+    .stMainBlockContainer:has(.pend-hero) textarea::placeholder {color:#746e64 !important;opacity:1 !important;}
+    .stMainBlockContainer:has(.pend-hero) button:disabled,
+    .stMainBlockContainer:has(.pend-hero) button:disabled * {
+        color:#56534b !important;background:#d7d0c5 !important;opacity:1 !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-file-chip {color:#65451f !important;}
+    </style>
+    """, unsafe_allow_html=True)
 
 elif st.session_state.menu_activo == "oficios":
 
@@ -1899,9 +4651,9 @@ elif st.session_state.menu_activo == "oficios":
     mostrar_sesion()
 
     # Fondo exclusivo del módulo Oficios y del menú lateral
-    fondo_oficios = cargar_imagen_base64(
-        "assets/fondo_oficios.png"
-    )
+    fondo_oficios = cargar_imagen_base64("assets/fondo_oficios.png")
+    if not fondo_oficios:
+        fondo_oficios = cargar_imagen_base64("assets/fondo_ferroviario.png")
     if fondo_oficios:
         st.markdown(
             f"""
@@ -1913,14 +4665,6 @@ elif st.session_state.menu_activo == "oficios":
                 background-repeat: no-repeat !important;
                 background-attachment: fixed !important;
             }}
-            [data-testid="stSidebar"] {{
-                background-image: url("data:image/png;base64,{fondo_oficios}") !important;
-                background-size: cover !important;
-                background-position: left center !important;
-                background-repeat: no-repeat !important;
-                border-right: 1px solid #D8D5CC !important;
-            }}
-
             [data-testid="stSidebar"] > div {{
                 background-color: transparent !important;
             }}
@@ -1947,86 +4691,7 @@ elif st.session_state.menu_activo == "oficios":
             unsafe_allow_html=True
         )
 
-    # ============================================================
-    # MENÚ LATERAL - MESA DE DISEÑO GEOMÉTRICO
-    # ============================================================
-
-    with st.sidebar:
-        st.markdown(
-            """
-            <style>
-            .logo-mesa {
-                width: 155px;
-                height: 155px;
-                margin: -15px auto 12px auto;
-                padding: 8px;
-                background-color: #FFFFFF;
-                border: 2px solid #C6AC79;
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                box-sizing: border-box;
-            }
-
-            .logo-mesa img {
-                width: 100%;
-                height: 100%;
-                object-fit: contain;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True
-        )
-
-        logo_base64 = cargar_imagen_base64(
-            "assets/logo_diseno_geometrico.png"
-        )
-        if logo_base64:
-            st.markdown(
-                f"""
-                <div class="logo-mesa">
-                    <img src="data:image/png;base64,{logo_base64}">
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        # Identificación de la mesa
-        st.markdown(
-            """
-            <div style="text-align:center;">
-                <h3 style="
-                    color:#283E50;
-                    font-size:17px;
-                    font-weight:700;
-                    margin-bottom:6px;
-                ">
-                    CONTROL DOCUMENTAL
-                </h3>
-                <p style="
-                    color:#687782;
-                    font-size:13px;
-                    margin-top:0;
-                ">
-                    Mesa de Diseño Geométrico
-                </p>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        if st.button(
-            "⌂ Menú principal",
-            key="sidebar_volver_oficios",
-            use_container_width=True
-        ):
-            st.session_state.menu_activo = "home"
-            st.rerun()
-
-        st.divider()
+    # El menú lateral común ya fue construido antes de elegir el módulo.
 
     # ============================================================
     # 1. ENCABEZADO INSTITUCIONAL — DISEÑO MODERNO
@@ -2653,7 +5318,7 @@ elif st.session_state.menu_activo == "oficios":
             st.session_state.mostrar_registro = True
             st.rerun()
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.write("")
 
 
     # =========================================================
@@ -3042,6 +5707,10 @@ elif st.session_state.menu_activo == "oficios":
         </div>
         """, unsafe_allow_html=True)
 
+        if es_administrador():
+            with st.expander("🗑 Eliminar este oficio · Confirmación obligatoria", expanded=False):
+                _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
+
         if not puede_editar_responsable(responsable_resultado):
             if es_administrador():
                 st.error("No se pudo habilitar la edición. Vuelve a iniciar sesión y verifica el rol configurado.")
@@ -3154,13 +5823,13 @@ elif st.session_state.menu_activo == "oficios":
     # ==========================================
     # SEPARADOR Y REGISTRO FUERA DEL TABLERO PRINCIPAL
     # ==========================================
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.write("")
     st.divider()
     st.markdown(
         "<p style='text-align:center;color:#667784;font-size:11px;font-weight:600;letter-spacing:2px;'>ADMINISTRACIÓN DOCUMENTAL</p>",
         unsafe_allow_html=True
     )
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.write("")
 
   # =========================================================
     # REGISTRO DE NUEVO OFICIO
@@ -3247,7 +5916,7 @@ elif st.session_state.menu_activo == "oficios":
     # =========================================================
     # TABLA GENERAL DE OFICIOS Y SELECCIÓN PARA PDF
     # =========================================================
-    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.write("")
     st.markdown(
         """
         <div style="text-align:center; margin-bottom:20px;">
@@ -3586,6 +6255,33 @@ elif st.session_state.menu_activo == "oficios":
             ].copy()
 
             st.caption(f"Registros seleccionados: {len(oficios_seleccionados)}")
+            # La acción aparece automáticamente al marcar exactamente una casilla.
+            # Se renderiza fuera de expansores para que no pase inadvertida.
+            if len(oficios_seleccionados) == 1:
+                seleccionado = oficios_seleccionados.iloc[0]
+                folio_borrar = str(seleccionado.get("Folio", "")).strip()
+                numero_borrar = str(seleccionado.get("No. de oficio", "")).strip()
+                if es_administrador():
+                    st.markdown("**Administración del oficio seleccionado**")
+                    clave_dialogo = f"abrir_borrado_{folio_borrar}_{numero_borrar}"
+                    if st.button(
+                        f"🗑 Eliminar oficio seleccionado · {numero_borrar}",
+                        key=clave_dialogo, type="secondary", use_container_width=True,
+                    ):
+                        st.session_state["eliminacion_pendiente"] = (folio_borrar, numero_borrar)
+                    if st.session_state.get("eliminacion_pendiente") == (folio_borrar, numero_borrar):
+                        _panel_eliminar_oficio(folio_borrar, numero_borrar, origen="tabla")
+                        if st.button("Cancelar eliminación", key=f"cancelar_{clave_dialogo}",
+                                     use_container_width=True):
+                            st.session_state.pop("eliminacion_pendiente", None)
+                            st.rerun()
+                else:
+                    st.info("Seleccionaste un oficio. La eliminación requiere iniciar sesión "
+                            "con una cuenta de administrador o propietario.")
+            elif len(oficios_seleccionados) > 1:
+                st.info("Selecciona solo un oficio para habilitar la eliminación.")
+            else:
+                st.session_state.pop("eliminacion_pendiente", None)
 
             col_generar, col_limpiar = st.columns([3, 1])
             with col_generar:
