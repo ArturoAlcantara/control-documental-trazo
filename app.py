@@ -430,17 +430,28 @@ def _credenciales_drive():
             datos = dict(st.secrets["drive_oauth"])
         except (KeyError, FileNotFoundError) as error:
             raise RuntimeError(
-                "Drive personal aún no está autorizado. Ejecuta configurar_drive_oauth.py "
-                "y conserva drive_oauth_token.json de forma privada."
+                "Falta configurar [drive_oauth] en los Secrets de Streamlit Cloud. "
+                "Agrega los campos token, refresh_token, token_uri, client_id y client_secret "
+                "de tu autorización OAuth privada (sin subir el JSON a GitHub). "
+                "En localhost puedes ejecutar configurar_drive_oauth.py."
             ) from error
     credenciales = OAuthCredentials.from_authorized_user_info(datos, scopes=alcance)
     if not credenciales.valid:
         if credenciales.refresh_token:
-            credenciales.refresh(GoogleAuthRequest())
+            try:
+                credenciales.refresh(GoogleAuthRequest())
+            except Exception as error:
+                raise RuntimeError(
+                    "Google Drive rechazó la renovación OAuth. Reautoriza la cuenta "
+                    "y actualiza [drive_oauth] en Streamlit Secrets (refresh_token vigente)."
+                ) from error
             if token_local.is_file():
                 token_local.write_text(credenciales.to_json(), encoding="utf-8")
         else:
-            raise RuntimeError("La autorización de Drive venció. Vuelve a ejecutar configurar_drive_oauth.py")
+            raise RuntimeError(
+                "La autorización de Drive no tiene refresh_token válido. "
+                "Vuelve a autorizar la cuenta y actualiza [drive_oauth] en Streamlit Secrets."
+            )
     return credenciales
 
 
@@ -3240,11 +3251,36 @@ div[data-testid="stHorizontalBlock"] {
 # Mantener la misma estructura de widgets y las mismas claves entre
 # pantallas evita desmontajes innecesarios durante la navegación.
 if st.session_state.menu_activo in ("oficios", "pendientes"):
+    # Imagen de la barra lateral: independiente del fondo del área principal.
+    # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
+    ruta_fondo_sidebar = next((ruta for ruta in (
+        ASSETS_DIR / "fondo_ferroviario.png",
+        ASSETS_DIR / "fondo_pendientes.png",
+        ASSETS_DIR / "fondo_oficios.png",
+    ) if ruta.is_file()), None)
+    fondo_sidebar_css = ""
+    if ruta_fondo_sidebar is not None:
+        extension = "jpeg" if ruta_fondo_sidebar.suffix.lower() in (".jpg", ".jpeg") else "png"
+        imagen_sidebar = base64.b64encode(ruta_fondo_sidebar.read_bytes()).decode("ascii")
+        fondo_sidebar_css = (
+            'background-image: linear-gradient(rgba(250,249,246,.87), '
+            'rgba(250,249,246,.91)), '
+            f'url("data:image/{extension};base64,{imagen_sidebar}") !important;'
+            'background-size: cover !important;'
+            'background-position: center center !important;'
+            'background-repeat: no-repeat !important;'
+        )
     st.markdown("""
     <style>
     [data-testid="stSidebar"] {
-        border-right: 1px solid #d8dfe4 !important;
-        background: rgba(248, 250, 251, .97) !important;
+        border-right: 1px solid #cbb88f !important;
+        background-color: #f8f7f3 !important;
+        __FONDO_SIDEBAR__
+    }
+    [data-testid="stSidebar"] > div,
+    [data-testid="stSidebar"] [data-testid="stSidebarContent"],
+    [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+        background: transparent !important;
     }
     [data-testid="stSidebar"] .stButton button {
         background: #283e50 !important;
@@ -3272,7 +3308,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes"):
         margin: 0 0 21px;
     }
     </style>
-    """, unsafe_allow_html=True)
+    """.replace("__FONDO_SIDEBAR__", fondo_sidebar_css), unsafe_allow_html=True)
     with st.sidebar:
         ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
         if ruta_logo.is_file():
