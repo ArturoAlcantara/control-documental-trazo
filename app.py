@@ -242,6 +242,8 @@ def navegar_a(destino):
 # [auth]
 # cookie_secret = "CLAVE_ALEATORIA_DE_32_CARACTERES_O_MAS"
 # Nunca incluir esta clave en GitHub.
+if not hasattr(st, "cache"):
+    st.cache = st.cache_resource
 from streamlit_cookies_manager import EncryptedCookieManager
 
 
