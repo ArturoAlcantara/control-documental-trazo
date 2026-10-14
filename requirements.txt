@@ -5,3 +5,4 @@ gspread
 google-auth
 openpyxl
 reportlab
+streamlit-cookies-manager>=0.2.0,<1.0
