@@ -2250,6 +2250,182 @@ def leer_documentos(valor):
     return documentos
 
 
+# Gestión segura de archivos vinculados (independiente del flujo de borradores).
+COLUMNAS_EVENTOS_VINCULOS = [
+    "Folio", "No. de oficio", "Categoria", "Accion", "Usuario", "Fecha",
+    "Documento anterior", "Documento nuevo",
+]
+
+@st.cache_resource(show_spinner=False)
+def _hoja_eventos_vinculos():
+    libro = conectar_google_sheets().spreadsheet
+    try:
+        hoja = libro.worksheet("EVENTOS_VINCULOS")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="EVENTOS_VINCULOS", rows=1000, cols=8)
+        hoja.append_row(COLUMNAS_EVENTOS_VINCULOS, value_input_option="RAW")
+    if hoja.row_values(1) != COLUMNAS_EVENTOS_VINCULOS:
+        raise ValueError("La estructura de EVENTOS_VINCULOS no coincide; no se realizaron cambios.")
+    return hoja
+
+
+def _permiso_vinculos(oficio):
+    return es_administrador() or puede_editar_responsable(oficio.get("Responsable", ""))
+
+
+def _documento_vinculado(nombre, url):
+    """Normaliza nombre y enlace, sin cargar archivos ni alterar Google Drive."""
+    from urllib.parse import urlparse
+    nombre = str(nombre or "").strip()
+    url = str(url or "").strip()
+    if not nombre:
+        raise ValueError("Escribe el nombre del documento.")
+    if len(nombre) > 250:
+        raise ValueError("El nombre del documento no puede superar 250 caracteres.")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+        raise ValueError("Introduce un enlace HTTPS válido de Google Drive.")
+    if (parsed.hostname or "").lower() not in ("drive.google.com", "docs.google.com"):
+        raise ValueError("El enlace debe pertenecer a Google Drive o Google Docs.")
+    return {"nombre": nombre, "url": url}
+
+
+def _modificar_vinculos(folio, numero, categoria, accion, *, indice=None,
+                        documento=None, confirmacion=False):
+    """Modifica únicamente una celda de OFICIOS; jamás borra archivos de Drive."""
+    exigir_sesion()
+    if categoria not in ("Antecedente", "Anexo", "Firmado"):
+        raise ValueError("Categoría no permitida.")
+    if accion not in ("Agregar", "Reemplazar", "Desvincular"):
+        raise ValueError("Operación no permitida.")
+    if accion == "Desvincular" and not confirmacion:
+        raise ValueError("Debes confirmar la desvinculación.")
+    hoja = conectar_google_sheets()
+    filas = hoja.get_all_values()
+    if not filas:
+        raise ValueError("La hoja OFICIOS está vacía.")
+    cab = [str(x).strip() for x in filas[0]]
+    campos = ("Folio", "No. de oficio", "Responsable", categoria)
+    if any(x not in cab for x in campos):
+        raise ValueError("Faltan columnas necesarias en OFICIOS.")
+    def valor(fila, campo):
+        i = cab.index(campo)
+        return str(fila[i]).strip() if i < len(fila) else ""
+    coincidencias = [(i, fila) for i, fila in enumerate(filas[1:], start=2)
+                     if valor(fila, "Folio") == str(folio).strip()
+                     and valor(fila, "No. de oficio") == str(numero).strip()]
+    if len(coincidencias) != 1:
+        raise ValueError("El expediente no existe o hay registros duplicados.")
+    fila_num, fila = coincidencias[0]
+    oficio = {"Responsable": valor(fila, "Responsable")}
+    if not _permiso_vinculos(oficio):
+        raise PermissionError("No tienes permiso para modificar estos documentos.")
+    actuales = leer_documentos(valor(fila, categoria))
+    anterior = None
+    if accion != "Agregar":
+        if indice is None or not (0 <= indice < len(actuales)):
+            raise ValueError("El documento seleccionado ya no está disponible. Actualiza la página.")
+        anterior = actuales[indice].copy()
+    if accion in ("Agregar", "Reemplazar"):
+        if not documento or not str(documento.get("url", "")).startswith("https://"):
+            raise ValueError("Se necesita un documento con enlace HTTPS válido.")
+        nuevo = {"nombre": str(documento.get("nombre", "")).strip() or "Documento",
+                 "url": str(documento["url"]).strip()}
+        if accion == "Agregar":
+            actuales.append(nuevo)
+        else:
+            actuales[indice] = nuevo
+    else:
+        nuevo = None
+        actuales.pop(indice)
+    # Registrar primero la intención de cambio y su estado anterior para auditoría.
+    eventos = _hoja_eventos_vinculos()
+    fecha = datetime.now().astimezone().isoformat(timespec="seconds")
+    eventos.append_row([
+        str(folio), str(numero), categoria, "INICIO " + accion,
+        identificador_sesion(), fecha,
+        json.dumps(anterior, ensure_ascii=False) if anterior else "",
+        json.dumps(nuevo, ensure_ascii=False) if nuevo else "",
+    ], value_input_option="RAW")
+    hoja.update_cell(fila_num, cab.index(categoria) + 1,
+                     json.dumps(actuales, ensure_ascii=False))
+    _invalidar_cache_documental(oficios=True)
+    verificado = hoja.cell(fila_num, cab.index(categoria) + 1).value or ""
+    if leer_documentos(verificado) != actuales:
+        raise RuntimeError("No se pudo verificar el cambio en Sheets. Revisa el expediente antes de repetir.")
+    try:
+        eventos.append_row([
+            str(folio), str(numero), categoria, accion, identificador_sesion(),
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+            json.dumps(anterior, ensure_ascii=False) if anterior else "",
+            json.dumps(nuevo, ensure_ascii=False) if nuevo else "",
+        ], value_input_option="RAW")
+    except Exception as error:
+        st.warning(f"El documento se actualizó, pero faltó cerrar el evento de auditoría: {error}")
+
+
+def _panel_gestion_vinculos(oficio, categoria, etiqueta, icono, clave):
+    """Edición de nombre y enlace como en el registro inicial del oficio."""
+    folio = str(oficio.get("Folio", "")).strip()
+    numero = str(oficio.get("No. de oficio", "")).strip()
+    documentos = leer_documentos(oficio.get(categoria, ""))
+    editable = _permiso_vinculos(oficio)
+    with st.expander(f"{icono}  {etiqueta} ({len(documentos)})"):
+        if not documentos:
+            st.caption("Sin documentos registrados.")
+        for i, doc in enumerate(documentos):
+            st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+            if editable:
+                with st.expander(f"Editar documento {i + 1}", expanded=False):
+                    modo = st.radio("Acción", ["Modificar nombre o enlace", "Desvincular"],
+                                    horizontal=True, key=f"vinc_modo_{clave}_{i}")
+                    if modo == "Modificar nombre o enlace":
+                        with st.form(f"vinc_reemplazar_{clave}_{i}"):
+                            nombre = st.text_input("Nombre del documento", value=doc["nombre"],
+                                                   key=f"vinc_nombre_rep_{clave}_{i}")
+                            enlace = st.text_input("Enlace de Google Drive", value=doc["url"],
+                                                   key=f"vinc_url_rep_{clave}_{i}")
+                            guardar = st.form_submit_button("Guardar cambios", use_container_width=True)
+                        if guardar:
+                            try:
+                                nuevo = _documento_vinculado(nombre, enlace)
+                                _modificar_vinculos(folio, numero, categoria, "Reemplazar",
+                                                   indice=i, documento=nuevo)
+                                st.success("Nombre y enlace actualizados en el expediente.")
+                                st.rerun()
+                            except Exception as error:
+                                st.error(f"No se pudo actualizar el vínculo: {error}")
+                    else:
+                        confirmar = st.checkbox(
+                            "Confirmo que quiero quitar este vínculo del expediente. "
+                            "El archivo original no se eliminará de Google Drive.",
+                            key=f"vinc_confirmar_{clave}_{i}")
+                        if st.button("Desvincular documento", key=f"vinc_eliminar_{clave}_{i}",
+                                     disabled=not confirmar):
+                            try:
+                                _modificar_vinculos(folio, numero, categoria, "Desvincular",
+                                                   indice=i, confirmacion=confirmar)
+                                st.success("Documento desvinculado; el archivo de Drive no se modificó.")
+                                st.rerun()
+                            except Exception as error:
+                                st.error(str(error))
+        if editable:
+            with st.expander("＋ Agregar documento", expanded=False):
+                with st.form(f"vinc_agregar_{clave}"):
+                    nombre = st.text_input("Nombre del documento", key=f"vinc_nombre_add_{clave}")
+                    enlace = st.text_input("Enlace de Google Drive", key=f"vinc_url_add_{clave}",
+                                           placeholder="https://drive.google.com/file/d/...")
+                    guardar = st.form_submit_button("Agregar documento", use_container_width=True)
+                if guardar:
+                    try:
+                        nuevo = _documento_vinculado(nombre, enlace)
+                        _modificar_vinculos(folio, numero, categoria, "Agregar", documento=nuevo)
+                        st.success("Documento vinculado correctamente.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"No se pudo agregar el vínculo: {error}")
+
+
 def mostrar_documentos(oficio):
     st.subheader("Expediente documental")
 
@@ -3270,17 +3446,24 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
     # Imagen de la barra lateral: independiente del fondo del área principal.
     # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
     ruta_fondo_sidebar = next((ruta for ruta in (
+        *(ASSETS_DIR / f"fondo_sidebar{ext}" for ext in
+          (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")),
         ASSETS_DIR / "fondo_ferroviario.png",
         ASSETS_DIR / "fondo_pendientes.png",
         ASSETS_DIR / "fondo_oficios.png",
     ) if ruta.is_file()), None)
     fondo_sidebar_css = ""
     if ruta_fondo_sidebar is not None:
-        extension = "jpeg" if ruta_fondo_sidebar.suffix.lower() in (".jpg", ".jpeg") else "png"
+        extension = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png",
+                     ".webp": "webp"}[ruta_fondo_sidebar.suffix.lower()]
         imagen_sidebar = base64.b64encode(ruta_fondo_sidebar.read_bytes()).decode("ascii")
+        # La imagen personalizada ya es clara: evitar que una capa opaca la oculte.
+        es_personalizado = ruta_fondo_sidebar.stem.lower() == "fondo_sidebar"
+        opacidad = ".20" if es_personalizado else ".87"
+        opacidad_final = ".25" if es_personalizado else ".91"
         fondo_sidebar_css = (
-            'background-image: linear-gradient(rgba(250,249,246,.87), '
-            'rgba(250,249,246,.91)), '
+            f'background-image: linear-gradient(rgba(250,249,246,{opacidad}), '
+            f'rgba(250,249,246,{opacidad_final})), '
             f'url("data:image/{extension};base64,{imagen_sidebar}") !important;'
             'background-size: cover !important;'
             'background-position: center center !important;'
@@ -3298,17 +3481,41 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
     [data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
         background: transparent !important;
     }
+    /* Navegación institucional: grafito cálido, acento dorado y estados claros. */
     [data-testid="stSidebar"] .stButton button {
-        background: #283e50 !important;
-        color: #fff !important;
-        border: 0 !important;
-        border-radius: 7px !important;
-        min-height: 43px !important;
-        font-weight: 600 !important;
+        background: linear-gradient(120deg,#363B39,#404540) !important;
+        color: #F7F5F0 !important;
+        border: 1px solid #51544D !important;
+        border-left: 3px solid #9D865C !important;
+        border-radius: 10px !important;
+        min-height: 48px !important;
+        font-weight: 650 !important;
+        font-size: 14px !important;
+        letter-spacing: .12px !important;
+        box-shadow: 0 3px 9px rgba(39,38,32,.13) !important;
+        transition: background .17s ease, transform .17s ease, box-shadow .17s ease !important;
     }
     [data-testid="stSidebar"] .stButton button:hover {
-        background: #40576b !important;
-        color: #fff !important;
+        background: linear-gradient(120deg,#4C5148,#55594F) !important;
+        color: #FFFDF7 !important;
+        border-color: #B99A65 !important;
+        border-left-color: #D2B47A !important;
+        box-shadow: 0 5px 13px rgba(39,38,32,.20) !important;
+        transform: translateY(-1px);
+    }
+    [data-testid="stSidebar"] .stButton button:focus-visible {
+        outline: 2px solid #B99A65 !important;
+        outline-offset: 2px !important;
+    }
+    [data-testid="stSidebar"] .stButton button p,
+    [data-testid="stSidebar"] .stButton button span {
+        color: #F7F5F0 !important;
+    }
+    /* Se marca la sección activa, sin alterar los callbacks. */
+    __ACTIVE_NAV_CSS__
+    [data-testid="stSidebar"] [data-testid="stImage"] {
+        display:flex !important;
+        justify-content:center !important;
     }
     .cd-sidebar-title {
         color: #283e50;
@@ -3324,12 +3531,20 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
         margin: 0 0 21px;
     }
     </style>
-    """.replace("__FONDO_SIDEBAR__", fondo_sidebar_css), unsafe_allow_html=True)
+    """.replace("__FONDO_SIDEBAR__", fondo_sidebar_css).replace(
+        "__ACTIVE_NAV_CSS__",
+        '[data-testid="stSidebar"] [class*="st-key-nav_compartida_' +
+        {"oficios": "inicio", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados"}.get(
+            st.session_state.menu_activo, "inicio") +
+        '"] button {background:linear-gradient(120deg,#4A4C44,#55574D) !important;'
+        'border:1px solid #B99A65 !important;border-left:4px solid #D2B47A !important;'
+        'box-shadow:0 4px 12px rgba(48,44,35,.18) !important;}'
+    ), unsafe_allow_html=True)
     with st.sidebar:
         ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
         if ruta_logo.is_file():
             # Widget nativo en vez de inyectar <img> con una cadena base64.
-            _, columna_logo, _ = st.columns([1, 4, 1])
+            _, columna_logo, _ = st.columns([0.35, 5.3, 0.35])
             with columna_logo:
                 st.image(str(ruta_logo), use_container_width=True)
         st.markdown(
@@ -3424,29 +3639,297 @@ def _modulo_lateral_documentos(tipo):
     aplicar_fondo()
     mostrar_sesion()
     if tipo != "urgentes":
-        st.title("Firmados")
-        st.caption("Oficios firmados · documento final, antecedentes y anexos")
+        # Fondo propio del módulo: se carga desde assets, sin afectar el sidebar.
+        candidatos = [ASSETS_DIR / f"fondo_firmados{ext}"
+                      for ext in (".png", ".jpg", ".jpeg", ".webp",
+                                  ".PNG", ".JPG", ".JPEG", ".WEBP")]
+        fondo = next((p for p in candidatos if p.is_file()), None)
+        if fondo:
+            mime = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".webp": "image/webp"}[fondo.suffix.lower()]
+            imagen = base64.b64encode(fondo.read_bytes()).decode("ascii")
+            fondo_css = (
+                'background-image:linear-gradient(rgba(240,244,241,.17),rgba(240,244,241,.25)),'
+                f'url("data:{mime};base64,{imagen}") !important;'
+                'background-size:cover !important;'
+                'background-position:center center !important;'
+                'background-repeat:no-repeat !important;'
+                'background-attachment:fixed !important;'
+            )
+        else:
+            fondo_css = 'background:#edf0ed !important;'
+            st.caption("Fondo opcional: agrega assets/fondo_firmados.png a tu proyecto y reinicia Streamlit.")
+
+        st.markdown("""
+        <style>
+        [data-testid="stAppViewContainer"]:has(.firm-hero) { __FONDO__ }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stMain"],
+        [data-testid="stAppViewContainer"]:has(.firm-hero) > .main {
+            background:transparent !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stHeader"] {
+            background:transparent !important;
+        }
+        .firm-hero {
+            background:linear-gradient(115deg,#34413f,#43534e);
+            border:1px solid #a88e62;border-left:5px solid #b99b67;
+            border-radius:15px;padding:27px 30px;margin:8px 0 26px;
+            box-shadow:0 10px 25px rgba(33,48,42,.16);
+        }
+        .firm-hero .eyebrow {
+            font-size:11px;letter-spacing:2px;font-weight:750;color:#e5d2a9;
+        }
+        [data-testid="stAppViewContainer"] .firm-hero h1 {
+            color:#fffaf0 !important;font-size:37px;line-height:1.2;
+            margin:9px 0 5px;font-weight:800;
+        }
+        [data-testid="stAppViewContainer"] .firm-hero p {
+            color:#e4eae4 !important;font-size:14px;margin:0;
+        }
+        .firm-label {
+            color:#415b50 !important;font-weight:800;letter-spacing:1.9px;
+            font-size:12px;margin:20px 0 11px;
+        }
+        .firm-kpi {
+            background:rgba(220,227,223,.97);
+            border:1px solid #b7c7bd;border-left:4px solid #7e9a87;
+            border-radius:12px;padding:18px 20px;min-height:124px;
+            box-shadow:0 6px 17px rgba(39,58,49,.10);
+        }
+        .firm-kpi .number {color:#243d35 !important;font-size:34px;font-weight:800;line-height:1.15;}
+        .firm-kpi .title {color:#243d35 !important;font-size:14px;font-weight:750;margin-top:4px;}
+        .firm-kpi .desc {color:#586e61 !important;font-size:12px;margin-top:4px;}
+        .firm-caption {color:#42584e;font-size:13px;margin:8px 0 16px;}
+        .firm-original-ref {
+            background:rgba(245,247,244,.95);border:1px solid #b7c7bd;
+            border-radius:9px;padding:13px 12px;color:#243d35;
+            font-size:13px;font-weight:600;overflow-wrap:anywhere;
+        }
+        .firm-empty {
+            background:rgba(239,244,240,.96);border:1px dashed #b7c7bd;
+            padding:35px 20px;text-align:center;border-radius:13px;color:#344a3e;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stExpander"] {
+            background:rgba(237,243,238,.96) !important;
+            border:1px solid #b9c9bf !important;border-radius:12px !important;
+            box-shadow:0 4px 12px rgba(39,58,49,.07) !important;
+            overflow:hidden;margin-bottom:7px;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stExpander"] summary {
+            color:#253f35 !important;font-weight:650 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stTextInput"] input,
+        [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+            background:#f5f7f4 !important;border:1px solid #b9c8bf !important;
+            color:#243d35 !important;border-radius:9px !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) .stLinkButton a {
+            background:#f7f9f6 !important;color:#284339 !important;
+            border:1px solid #b7c7bd !important;border-radius:9px !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) .stLinkButton a:hover {
+            border-color:#779481 !important;background:#e4eee6 !important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero)
+        [class*="st-key-firm_limpiar"] button {
+            background:#34413f !important;color:#fff !important;
+            border:1px solid #a88e62 !important;border-radius:9px !important;
+        }
+        /* Ornamentación técnica propia del archivo de firmados */
+        .firm-hero {position:relative;overflow:hidden;isolation:isolate;}
+        .firm-hero > .eyebrow,.firm-hero > h1,.firm-hero > p {position:relative;z-index:2;max-width:67%;}
+        .firm-hero .firm-ornament {position:absolute;right:22px;top:15px;width:33%;height:calc(100% - 30px);opacity:.84;pointer-events:none;z-index:1;}
+        .firm-hero .firm-signature {position:absolute;right:31px;bottom:15px;font-size:9px;letter-spacing:2.1px;color:#d7c597;font-weight:700;z-index:2;}
+        @media(max-width:800px){.firm-hero .firm-ornament{opacity:.25;width:45%;right:0}.firm-hero > .eyebrow,.firm-hero > h1,.firm-hero > p{max-width:92%}.firm-hero .firm-signature{display:none}}
+        </style>
+        <div class="firm-hero">
+          <div class="eyebrow">MESA DE DISEÑO GEOMÉTRICO · ARCHIVO DOCUMENTAL</div>
+          <h1>Firmados</h1>
+          <p>Consulta de expedientes finalizados · oficios, antecedentes y anexos</p>
+          <svg class="firm-ornament" viewBox="0 0 360 155" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <g fill="none" stroke="#b5cbb9" stroke-width=".7" opacity=".33">
+              <path d="M25 28H345M25 52H345M25 76H345M25 100H345M25 124H345"/>
+              <path d="M55 15V137M100 15V137M145 15V137M190 15V137M235 15V137M280 15V137M325 15V137"/>
+            </g>
+            <path d="M42 113H321" stroke="#cdb583" stroke-width="1.3" fill="none" opacity=".7"/>
+            <path d="M42 113V26" stroke="#cdb583" stroke-width="1.3" fill="none" opacity=".7"/>
+            <path d="M62 98L123 73L182 86L260 39L308 46" stroke="#d9c18f" stroke-width="2.6" fill="none" stroke-linejoin="round"/>
+            <g fill="#344842" stroke="#d9c18f" stroke-width="1.5"><circle cx="123" cy="73" r="4"/><circle cx="182" cy="86" r="4"/></g>
+            <circle cx="260" cy="39" r="13" fill="#668a75" stroke="#d9c18f" stroke-width="1.5"/>
+            <path d="M254 39L259 44L267 34" stroke="#f5f8f4" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="firm-signature">REGISTRO · VALIDACIÓN · ARCHIVO</span>
+        </div>
+        """.replace("__FONDO__", fondo_css), unsafe_allow_html=True)
+
         try:
             registros = _leer_registros_oficios()
         except Exception as error:
             st.error(f"No se pudo consultar el registro: {_mensaje_error_sheets(error)}")
             return
-        lista = [r for r in registros if normalizar_texto(r.get("Estatus", "")) == "firmado"]
-        st.metric("Oficios firmados", len(lista))
-        if not lista:
-            st.info("No hay oficios en esta sección todavía.")
-            return
-        consulta = st.text_input("Buscar por folio, número o asunto", key="buscar_firmados")
+        lista = [r for r in registros
+                 if normalizar_texto(r.get("Estatus", "")) == "firmado"]
+
+        def _fecha_firma(registro):
+            """Fecha registrada al firmar: admite AAAA-MM-DD y DD/MM/AAAA."""
+            valor = str(registro.get("Fecha de entrega", "") or "").strip()
+            if not valor:
+                return None
+            for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d",
+                            "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+                try:
+                    return datetime.strptime(valor, formato).date()
+                except ValueError:
+                    continue
+            fecha = pd.to_datetime(valor, errors="coerce", dayfirst=True)
+            return None if pd.isna(fecha) else fecha.date()
+
+        hoy = datetime.now().date()
+        este_mes = sum((_fecha_firma(r) is not None
+                        and _fecha_firma(r).year == hoy.year
+                        and _fecha_firma(r).month == hoy.month) for r in lista)
+        con_anexos = sum(bool(leer_documentos(r.get("Anexo", ""))) for r in lista)
+        st.markdown('<div class="firm-label">RESUMEN DE DOCUMENTACIÓN FIRMADA</div>',
+                    unsafe_allow_html=True)
+        kpis = (
+            (len(lista), "Oficios firmados", "Expedientes finalizados"),
+            (este_mes, "Firmados este mes", "Según fecha de entrega registrada"),
+            (con_anexos, "Con anexos", "Expedientes con documentación adicional"),
+        )
+        for columna, (numero, titulo, detalle) in zip(st.columns(3, gap="large"), kpis):
+            with columna:
+                st.markdown(
+                    f'<div class="firm-kpi"><div class="number">{numero:02d}</div>'
+                    f'<div class="title">{html.escape(titulo)}</div>'
+                    f'<div class="desc">{html.escape(detalle)}</div></div>',
+                    unsafe_allow_html=True)
+
+        st.markdown('<div class="firm-label">CONSULTA DE EXPEDIENTES</div>',
+                    unsafe_allow_html=True)
+        def _limpiar_filtros_firmados():
+            # Los callbacks se ejecutan antes de instanciar los widgets del rerun.
+            st.session_state["buscar_firmados"] = ""
+            st.session_state["firm_orden"] = "Más recientes"
+
+        buscar_col, orden_col, limpiar_col = st.columns([5, 2.2, 1.5], gap="small")
+        with buscar_col:
+            consulta = st.text_input("Buscar por folio, número o asunto",
+                                    placeholder="Folio, número de oficio o asunto...",
+                                    key="buscar_firmados")
+        with orden_col:
+            orden = st.selectbox("Ordenar", ["Más recientes", "Más antiguos", "Número de oficio"],
+                                 key="firm_orden")
+        with limpiar_col:
+            st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
+            st.button("Limpiar filtros", key="firm_limpiar", use_container_width=True,
+                      on_click=_limpiar_filtros_firmados)
+
         if consulta.strip():
-            lista = [r for r in lista if normalizar_texto(consulta) in normalizar_texto(
-                " ".join(str(r.get(k, "")) for k in ("Folio", "No. de oficio", "Asunto")))]
+            q = normalizar_texto(consulta)
+            lista = [r for r in lista if q in normalizar_texto(
+                " ".join(str(r.get(k, "")) for k in
+                         ("Folio", "No. de oficio", "Asunto", "Responsable")) + " " + " ".join(
+                d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
+        if orden == "Número de oficio":
+            lista.sort(key=lambda r: normalizar_texto(r.get("No. de oficio", "")))
+        elif orden == "Más recientes":
+            # Fechas válidas primero: del día más nuevo al más antiguo.
+            lista.sort(key=lambda r: (_fecha_firma(r) is not None,
+                                      _fecha_firma(r) or datetime.min.date()), reverse=True)
+        else:
+            # Fechas válidas primero: del día más antiguo al más nuevo.
+            lista.sort(key=lambda r: (_fecha_firma(r) is None,
+                                      _fecha_firma(r) or datetime.max.date()))
+
+        st.markdown('<div class="firm-label">ARCHIVO DE OFICIOS FIRMADOS</div>',
+                    unsafe_allow_html=True)
+        st.markdown(f'<div class="firm-caption">{len(lista)} expediente(s) · '
+                    'Selecciona uno para consultar su documentación vinculada</div>',
+                    unsafe_allow_html=True)
+        if not lista:
+            st.markdown('<div class="firm-empty">No se encontraron expedientes firmados '
+                        'con los filtros seleccionados.</div>', unsafe_allow_html=True)
+            return
+
         for oficio in lista:
             folio = str(oficio.get("Folio", "")).strip()
             numero = str(oficio.get("No. de oficio", "")).strip()
-            with st.expander(f"{numero or folio} · {str(oficio.get('Asunto', 'Sin asunto'))[:90]}"):
-                st.markdown(f"**Folio:** {folio}  |  **Responsable:** {oficio.get('Responsable', '—')}")
-                st.caption(f"Recepción: {oficio.get('Fecha de recepción', '—')} · Estatus: {oficio.get('Estatus', '—')}")
-                _documentos_seccion(oficio)
+            asunto = str(oficio.get("Asunto", "") or "Sin asunto").strip()
+            documentos_firmados = leer_documentos(oficio.get("Firmado", ""))
+            # El título es el nombre registrado al recibir el documento firmado,
+            # no el número ni el asunto del oficio original.
+            nombre_firmado = (documentos_firmados[0]["nombre"]
+                              if documentos_firmados else f"Documento firmado · Folio {folio}")
+            titulo = f"▣  {nombre_firmado}"
+            if len(documentos_firmados) > 1:
+                titulo += f" (+{len(documentos_firmados) - 1})"
+            with st.expander(titulo, expanded=False):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown(f"**Folio:** {html.escape(folio)}")
+                    st.markdown(f"**Responsable:** {html.escape(str(oficio.get('Responsable', '—')))}")
+                with col_b:
+                    fecha = _fecha_firma(oficio)
+                    st.markdown(f"**Fecha de firma/entrega:** {fecha.strftime('%d/%m/%Y') if fecha else 'No registrada'}")
+                    st.markdown("**Estatus:** Firmado")
+                # La edición de fecha se realiza aquí, en el expediente firmado.
+                # Se usa la misma función validada que guarda estatus y fecha en OFICIOS.
+                if puede_editar_responsable(oficio.get("Responsable", "")):
+                    with st.expander("✎ Editar fecha de entrega", expanded=False):
+                        with st.form(key=f"firm_fecha_form_{folio}_{numero}"):
+                            fecha_actual = _fecha_firma(oficio)
+                            fecha_nueva = st.date_input(
+                                "Fecha de firma / entrega",
+                                value=fecha_actual,
+                                format="DD/MM/YYYY",
+                                key=f"firm_fecha_input_{folio}_{numero}",
+                            )
+                            st.caption("Se actualizará la fecha de entrega del oficio en Google Sheets.")
+                            guardar_fecha = st.form_submit_button(
+                                "Guardar fecha", use_container_width=True)
+                        if guardar_fecha:
+                            if fecha_nueva is None:
+                                st.warning("Selecciona una fecha de entrega válida.")
+                            else:
+                                try:
+                                    actualizar_estatus_y_entrega(
+                                        folio, numero, "Firmado", fecha_nueva.isoformat())
+                                    st.success("Fecha actualizada correctamente.")
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"No se pudo actualizar la fecha: {error}")
+                st.markdown(f"**Asunto del oficio original:** {html.escape(asunto)}")
+
+                # El documento firmado conserva su acceso a Drive, separado de
+                # la referencia sin enlace al oficio con el que se abrió el expediente.
+                if documentos_firmados:
+                    st.markdown("**Documento firmado**")
+                    for documento in documentos_firmados:
+                        st.link_button(
+                            f"Consultar en Google Drive ↗ · {documento['nombre']}",
+                            documento["url"], use_container_width=True)
+
+                st.markdown("**Documentación vinculada**")
+                columnas = st.columns(3, gap="small")
+                with columnas[0]:
+                    st.markdown("**Oficio original**")
+                    st.markdown(
+                        '<div class="firm-original-ref">'
+                        f'{html.escape(numero or "Número no registrado")}'
+                        '</div>', unsafe_allow_html=True)
+                    st.caption("Referencia del expediente · sin enlace")
+                for col, etiqueta, campo in (
+                    (columnas[1], "Antecedentes", "Antecedente"),
+                    (columnas[2], "Anexos", "Anexo"),
+                ):
+                    with col:
+                        docs = leer_documentos(oficio.get(campo, ""))
+                        with st.expander(f"{etiqueta} ({len(docs)})", expanded=bool(docs)):
+                            if not docs:
+                                st.caption("Sin documentos vinculados.")
+                            for doc in docs:
+                                st.link_button(doc["nombre"], doc["url"],
+                                               use_container_width=True)
         return
 
     # Módulo Urgentes: comparte la estética de Mis pendientes.
@@ -3626,11 +4109,30 @@ def _modulo_lateral_documentos(tipo):
                     border-radius:30px;padding:3px 11px;font-size:11px;font-weight:700}}
     .urg-empty {{text-align:center;background:#f7f4ee;border:1px dashed #d5cbbd;
                  border-radius:14px;padding:44px 20px;color:#263d4b;margin-top:16px}}
+    /* Ornamentación de alineamiento exclusiva de Urgentes */
+    .urg-hero {{position:relative;overflow:hidden;isolation:isolate;}}
+    .urg-hero > .eyebrow,.urg-hero > h1,.urg-hero > p {{position:relative;z-index:2;max-width:67%;}}
+    .urg-hero .urg-ornament {{position:absolute;right:23px;top:12px;width:33%;height:calc(100% - 25px);opacity:.83;pointer-events:none;z-index:1;}}
+    .urg-hero .urg-signature {{position:absolute;right:30px;bottom:15px;font-size:9px;letter-spacing:2px;color:#ddc18e;font-weight:700;z-index:2;}}
+    @media(max-width:800px){{.urg-hero .urg-ornament{{opacity:.22;width:45%;right:0}}.urg-hero > .eyebrow,.urg-hero > h1,.urg-hero > p{{max-width:92%}}.urg-hero .urg-signature{{display:none}}}}
     </style>
     <div class="urg-hero">
       <div class="eyebrow">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
       <h1>Urgentes</h1>
       <p>Oficios prioritarios · días transcurridos desde la recepción</p>
+      <svg class="urg-ornament" viewBox="0 0 360 155" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <g stroke="#b6ab92" stroke-width=".8" fill="none" opacity=".26">
+          <path d="M22 29H346M22 62H346M22 95H346M22 128H346"/>
+          <path d="M54 13L26 141M105 13L77 141M156 13L128 141M207 13L179 141M258 13L230 141M309 13L281 141"/>
+        </g>
+        <path d="M20 120C93 116 113 43 194 44S294 85 344 35" fill="none" stroke="#d7b477" stroke-width="2.8"/>
+        <path d="M20 130C93 126 113 53 194 54S294 95 344 45" fill="none" stroke="#e2d2b4" stroke-width="1.5" opacity=".7"/>
+        <path d="M20 110C93 106 113 33 194 34S294 75 344 25" fill="none" stroke="#c1a477" stroke-width="1" stroke-dasharray="5 6" opacity=".65"/>
+        <circle cx="194" cy="44" r="6" fill="#45423b" stroke="#d7b477" stroke-width="2"/>
+        <path d="M194 25V35M194 53V63M175 44H185M203 44H213" stroke="#d7b477" stroke-width="1.2"/>
+        <circle cx="290" cy="70" r="3" fill="#d7b477"/>
+      </svg>
+      <span class="urg-signature">PRIORIDAD · SEGUIMIENTO · CONTROL</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3706,7 +4208,8 @@ def _modulo_lateral_documentos(tipo):
         buscado = normalizar_texto(consulta)
         filtrados = [r for r in filtrados if buscado in normalizar_texto(
             " ".join(str(r.get(k, "")) for k in
-                     ("Folio", "No. de oficio", "Asunto", "Responsable")))]
+                     ("Folio", "No. de oficio", "Asunto", "Responsable")) + " " + " ".join(
+                d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
     if estado != "Todos":
         filtrados = [r for r in filtrados if str(r.get("Estatus", "")).strip() == estado]
     st.markdown('<div class="urg-label">OFICIOS URGENTES</div>', unsafe_allow_html=True)
@@ -5149,16 +5652,24 @@ elif st.session_state.menu_activo == "oficios":
             }}
 
             [data-testid="stSidebar"] .stButton button {{
-                background-color: #283E50 !important;
-                color: white !important;
-                border: none !important;
-                border-radius: 6px !important;
-                font-weight: 500;
+                background: linear-gradient(120deg,#363B39,#404540) !important;
+                color: #F7F5F0 !important;
+                border: 1px solid #51544D !important;
+                border-left: 3px solid #9D865C !important;
+                border-radius: 10px !important;
+                min-height: 48px !important;
+                font-weight: 650 !important;
             }}
 
             [data-testid="stSidebar"] .stButton button:hover {{
-                background-color: #40576B !important;
-                color: white !important;
+                background: #4C5148 !important;
+                border-color: #B99A65 !important;
+                color: #FFFDF7 !important;
+            }}
+            [data-testid="stSidebar"] [class*="st-key-nav_compartida_inicio"] button {{
+                background:linear-gradient(120deg,#4A4C44,#55574D) !important;
+                border:1px solid #B99A65 !important;
+                border-left:4px solid #D2B47A !important;
             }}
             </style>
             """,
@@ -6233,43 +6744,17 @@ elif st.session_state.menu_activo == "oficios":
             unsafe_allow_html=True
         )
 
-        col_doc1, col_doc2, col_doc3 = st.columns(3)
-
+        col_doc1, col_doc2, col_doc3 = st.columns(3, gap="small")
+        clave_expediente = re.sub(r"[^a-zA-Z0-9_]", "_", f"{folio_resultado}_{numero_resultado}")
         with col_doc1:
-            with st.expander(f"▤  Antecedentes ({len(antecedentes_resultado)})"):
-                if antecedentes_resultado:
-                    for indice, documento in enumerate(antecedentes_resultado, start=1):
-                        st.link_button(
-                            documento["nombre"],
-                            documento["url"],
-                            use_container_width=True,
-                        )
-                else:
-                    st.caption("Sin antecedentes registrados")
-
+            _panel_gestion_vinculos(oficio_encontrado, "Antecedente", "Antecedentes",
+                                   "▤", f"{clave_expediente}_antecedente")
         with col_doc2:
-            with st.expander(f"◇  Anexos ({len(anexos_resultado)})"):
-                if anexos_resultado:
-                    for indice, documento in enumerate(anexos_resultado, start=1):
-                        st.link_button(
-                            documento["nombre"],
-                            documento["url"],
-                            use_container_width=True,
-                        )
-                else:
-                    st.caption("Sin anexos registrados")
-
+            _panel_gestion_vinculos(oficio_encontrado, "Anexo", "Anexos",
+                                   "◇", f"{clave_expediente}_anexo")
         with col_doc3:
-            with st.expander(f"▣  Oficio firmado ({len(firmado_resultado)})"):
-                if firmado_resultado:
-                    for indice, documento in enumerate(firmado_resultado, start=1):
-                        st.link_button(
-                            documento["nombre"],
-                            documento["url"],
-                            use_container_width=True,
-                        )
-                else:
-                    st.caption("Sin oficio firmado registrado")
+            _panel_gestion_vinculos(oficio_encontrado, "Firmado", "Oficio firmado",
+                                   "▣", f"{clave_expediente}_firmado")
 
     elif consulta.strip():
         st.warning(
