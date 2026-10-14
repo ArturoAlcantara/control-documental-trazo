@@ -4,6 +4,9 @@ import json
 import os
 import time
 import random
+import hashlib
+import hmac
+import secrets
 import requests
 from pathlib import Path
 import textwrap
@@ -233,6 +236,78 @@ def navegar_a(destino):
 
 
 # =========================================================
+# SESIÓN PERSISTENTE (12 HORAS, COOKIE CIFRADA)
+# =========================================================
+# Requiere streamlit-cookies-manager y una clave privada estable en Secrets:
+# [auth]
+# cookie_secret = "CLAVE_ALEATORIA_DE_32_CARACTERES_O_MAS"
+# Nunca incluir esta clave en GitHub.
+from streamlit_cookies_manager import EncryptedCookieManager
+
+
+def _clave_sesion():
+    try:
+        clave = str(st.secrets["auth"]["cookie_secret"])
+    except (KeyError, FileNotFoundError, TypeError):
+        raise RuntimeError(
+            'Configura [auth] cookie_secret en .streamlit/secrets.toml y '
+            'en los Secrets de Streamlit Cloud para habilitar la sesión persistente.'
+        )
+    if len(clave) < 32:
+        raise RuntimeError('La clave [auth].cookie_secret debe tener al menos 32 caracteres.')
+    return clave
+
+
+_clave_privada_sesion = _clave_sesion()
+_cookies_sesion = EncryptedCookieManager(
+    prefix="control_trazo_v1_", password=_clave_privada_sesion
+)
+if not _cookies_sesion.ready():
+    st.stop()
+
+
+def _firma_token(usuario, vence, clave):
+    datos = f"{usuario}|{vence}".encode("utf-8")
+    return hmac.new(clave.encode("utf-8"), datos, hashlib.sha256).hexdigest()
+
+
+def _crear_token(usuario):
+    # Se invalida al cambiar la contraseña del usuario en Secrets.
+    datos = st.secrets["usuarios"][usuario]
+    clave = _clave_privada_sesion + str(datos["password"])
+    vence = int(time.time()) + 12 * 60 * 60
+    return f"{usuario}|{vence}|{_firma_token(usuario, vence, clave)}"
+
+
+def _recuperar_sesion():
+    if st.session_state.get("autenticado"):
+        return
+    token = str(_cookies_sesion.get("sesion", ""))
+    try:
+        usuario, vence_str, firma = token.split("|", 2)
+        vence = int(vence_str)
+        if not usuario or not (int(time.time()) < vence <= int(time.time()) + 12 * 3600):
+            return
+        datos = st.secrets["usuarios"][usuario]
+        clave = _clave_privada_sesion + str(datos["password"])
+        if not hmac.compare_digest(firma, _firma_token(usuario, vence, clave)):
+            return
+        rol = str(datos.get("rol", "auxiliar")).strip().lower()
+        if rol not in ROLES_VALIDOS:
+            return
+        st.session_state.autenticado = True
+        st.session_state.usuario_id = usuario
+        st.session_state.usuario_actual = datos["nombre"]
+        st.session_state.rol = rol
+        st.session_state.cargo_institucional = str(datos.get("cargo", ""))
+        st.session_state.responsable_oficios = str(datos.get("responsable", "")).strip()
+    except (ValueError, KeyError, TypeError):
+        return
+
+
+_recuperar_sesion()
+
+# =========================================================
 # AUTENTICACIÓN
 # =========================================================
 
@@ -290,6 +365,8 @@ def mostrar_login():
                     st.session_state.cargo_institucional = str(datos_usuario.get("cargo", ""))
                     st.session_state.responsable_oficios = str(datos_usuario.get("responsable", "")).strip()
                     st.session_state.menu_activo = "home"
+                    _cookies_sesion["sesion"] = _crear_token(identificador)
+                    _cookies_sesion.save()
                     st.rerun()
                 else:
                     st.error("Usuario o contraseña incorrectos.")
@@ -310,6 +387,9 @@ def mostrar_sesion():
             key=f"cerrar_sesion_{st.session_state.menu_activo}",
             use_container_width=True
         ):
+            # Invalidar primero la cookie para impedir reingreso automático.
+            _cookies_sesion["sesion"] = ""
+            _cookies_sesion.save()
             st.session_state.autenticado = False
             st.session_state.usuario_actual = None
             st.session_state.usuario_id = None
@@ -6254,7 +6334,7 @@ elif st.session_state.menu_activo == "oficios":
                 <div>
                     <div class="consulta-titulo">Consulta de expedientes</div>
                     <div class="consulta-subtitulo">
-                        Localiza un oficio por folio, número de oficio o asunto
+                        Localiza un expediente por folio, número, asunto o nombre del oficio firmado
                     </div>
                 </div>
             </div>
@@ -6277,7 +6357,7 @@ elif st.session_state.menu_activo == "oficios":
 
         consulta = st.text_input(
             "Buscar oficio",
-            placeholder="Folio, número de oficio o palabras del asunto...",
+            placeholder="Folio, número, asunto o nombre del oficio firmado...",
             label_visibility="collapsed",
             key="consulta_oficio"
         )
@@ -6313,28 +6393,38 @@ elif st.session_state.menu_activo == "oficios":
     oficio_encontrado = None
 
     if consulta.strip() and not df_oficios.empty:
-        consulta_normalizada = consulta.strip().lower()
+        consulta_normalizada = normalizar_texto(consulta)
+        coincidencias = []
 
         for _, fila in df_oficios.iterrows():
-            folio_busqueda = str(
-                fila.get("Folio", "")
-            ).strip().lower()
+            # El nombre se obtiene de la columna Firmado, que contiene
+            # los vínculos registrados como {"nombre": ..., "url": ...}.
+            # No se busca en el enlace: el usuario introduce el nombre visible.
+            nombres_firmados = [
+                normalizar_texto(documento.get("nombre", ""))
+                for documento in leer_documentos(fila.get("Firmado", ""))
+            ]
+            campos = [
+                normalizar_texto(fila.get("Folio", "")),
+                normalizar_texto(fila.get("No. de oficio", "")),
+                normalizar_texto(fila.get("Asunto", "")),
+                *nombres_firmados,
+            ]
+            if any(consulta_normalizada in campo for campo in campos):
+                # Priorizar coincidencias exactas para no abrir otro expediente
+                # cuando un nombre o número es parte de otro.
+                exacta = any(consulta_normalizada == campo for campo in campos)
+                coincidencias.append((exacta, fila))
 
-            numero_busqueda = str(
-                fila.get("No. de oficio", "")
-            ).strip().lower()
-
-            asunto_busqueda = str(
-                fila.get("Asunto", "")
-            ).strip().lower()
-
-            if (
-                consulta_normalizada in folio_busqueda
-                or consulta_normalizada in numero_busqueda
-                or consulta_normalizada in asunto_busqueda
-            ):
-                oficio_encontrado = fila
-                break
+        if coincidencias:
+            coincidencias.sort(key=lambda elemento: not elemento[0])
+            oficio_encontrado = coincidencias[0][1]
+            if len(coincidencias) > 1:
+                st.caption(
+                    f"Se encontraron {len(coincidencias)} expedientes coincidentes. "
+                    "Se muestra primero la coincidencia más precisa; "
+                    "agrega más palabras para afinar la búsqueda."
+                )
 
     # =========================================================
     # MOSTRAR EXPEDIENTE ÚNICAMENTE SI EXISTE
