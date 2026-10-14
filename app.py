@@ -1,8 +1,10 @@
 import base64
+import html
 import json
 import os
 import time
 import random
+import requests
 from pathlib import Path
 import textwrap
 import unicodedata
@@ -223,7 +225,7 @@ def exigir_sesion():
 
 def navegar_a(destino):
     """Cambia de módulo y actualiza la interfaz sin perder la sesión."""
-    destinos = {"home", "oficios", "diseno", "pendientes"}
+    destinos = {"home", "oficios", "diseno", "pendientes", "urgentes", "firmados"}
     if destino not in destinos:
         raise ValueError("Módulo de navegación no reconocido.")
     st.session_state.menu_activo = destino
@@ -374,16 +376,28 @@ def conectar_google_sheets():
         )
 
     def solicitud_con_reintentos(*args, **kwargs):
-        for intento in range(4):
+        """Reintentos limitados solo para lecturas seguras.
+
+        Nunca se reintentan escrituras ante fallos de red: el servidor pudo
+        haberlas aplicado aunque el cliente no recibiera la respuesta.
+        """
+        # No pasar timeout a gspread.Client.request: algunas versiones no lo admiten.
+        # Los reintentos de lectura siguen funcionando ante errores de red.
+        metodo = str(kwargs.get("method", args[0] if args else "GET")).upper()
+        es_lectura = metodo == "GET"
+        max_intentos = 3 if es_lectura else 1
+        for intento in range(max_intentos):
             try:
                 return solicitud_original(*args, **kwargs)
             except gspread.exceptions.APIError as error:
                 codigo = getattr(getattr(error, "response", None), "status_code", None)
-                # Reintentar errores de cuota; las escrituras con errores 5xx
-                # no se repiten automáticamente para evitar duplicados.
-                if codigo != 429 or intento == 3:
+                recuperable = codigo in (429, 500, 502, 503, 504)
+                if not recuperable or intento == max_intentos - 1:
                     raise
-                time.sleep(min(2 ** intento + random.uniform(0, 0.6), 9))
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if intento == max_intentos - 1:
+                    raise
+            time.sleep(min(1.5 * (2 ** intento) + random.uniform(0, 0.5), 5))
 
     transporte.request = solicitud_con_reintentos
 
@@ -877,6 +891,10 @@ def _descargar_docx_drive(drive_id):
 
 def _mensaje_error_sheets(error):
     mensaje = str(error)
+    if ("Read timed out" in mensaje or "ConnectTimeout" in mensaje
+            or "ConnectionError" in mensaje or "timed out" in mensaje.lower()):
+        return ("La consulta a Google Sheets tardó demasiado. No se han borrado "
+                "los registros. Comprueba tu conexión y vuelve a intentar en unos instantes.")
     if "429" in mensaje or "RATE_LIMIT_EXCEEDED" in mensaje or "RESOURCE_EXHAUSTED" in mensaje:
         return ("Google Sheets alcanzó temporalmente su límite de consultas. "
                 "Espera aproximadamente un minuto y vuelve a abrir el expediente "
@@ -1213,7 +1231,7 @@ def obtener_oficios():
         registros = _leer_registros_oficios()
         return pd.DataFrame(registros)
     except Exception as error:
-        st.warning(f"No se pudo consultar Google Sheets: {error}")
+        st.warning(f"No se pudo consultar Google Sheets: {_mensaje_error_sheets(error)}")
         return pd.DataFrame()
 
 
@@ -2616,8 +2634,6 @@ def mostrar_mis_pendientes():
     registros = obtener_oficios()
     if registros.empty:
         st.info("No hay registros disponibles o no se pudo consultar la hoja OFICIOS.")
-        if st.button("← Volver a Oficios en trámite", key="pendientes_volver_vacio"):
-            navegar_a("oficios")
         return
 
     if not {"Responsable", "Estatus"}.issubset(registros.columns):
@@ -3250,7 +3266,7 @@ div[data-testid="stHorizontalBlock"] {
 # =========================================================
 # Mantener la misma estructura de widgets y las mismas claves entre
 # pantallas evita desmontajes innecesarios durante la navegación.
-if st.session_state.menu_activo in ("oficios", "pendientes"):
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados"):
     # Imagen de la barra lateral: independiente del fondo del área principal.
     # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
     ruta_fondo_sidebar = next((ruta for ruta in (
@@ -3313,7 +3329,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes"):
         ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
         if ruta_logo.is_file():
             # Widget nativo en vez de inyectar <img> con una cadena base64.
-            _, columna_logo, _ = st.columns([1, 2, 1])
+            _, columna_logo, _ = st.columns([1, 4, 1])
             with columna_logo:
                 st.image(str(ruta_logo), use_container_width=True)
         st.markdown(
@@ -3326,10 +3342,413 @@ if st.session_state.menu_activo in ("oficios", "pendientes"):
         if st.button("▤ Mis pendientes", key="nav_compartida_pendientes", use_container_width=True):
             if st.session_state.menu_activo != "pendientes":
                 navegar_a("pendientes")
+        if st.button("⚠ Urgentes", key="nav_compartida_urgentes", use_container_width=True):
+            if st.session_state.menu_activo != "urgentes":
+                navegar_a("urgentes")
+        if st.button("▣ Firmados", key="nav_compartida_firmados", use_container_width=True):
+            if st.session_state.menu_activo != "firmados":
+                navegar_a("firmados")
         st.divider()
 
 # Fondo de trabajo: conserva el plano ferroviario visible detrás de las tarjetas.
 # Los módulos mantienen sus propias imágenes y la navegación principal no cambia.
+
+
+# =========================================================
+# MÓDULOS LATERALES: URGENTES Y FIRMADOS
+# =========================================================
+@st.cache_resource(show_spinner=False)
+def _hoja_urgencias():
+    libro = conectar_google_sheets().spreadsheet
+    columnas = ["Folio", "No. de oficio", "Urgente", "Actualizado por", "Fecha actualización"]
+    try:
+        hoja = libro.worksheet("URGENCIAS")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="URGENCIAS", rows=1000, cols=5)
+        hoja.append_row(columnas, value_input_option="RAW")
+    if hoja.row_values(1) != columnas:
+        raise ValueError("La hoja URGENCIAS tiene encabezados inesperados; no se modificaron datos.")
+    return hoja
+
+
+def _marcas_urgentes():
+    return {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()):
+            str(r.get("Urgente", "")).strip().lower() == "si"
+            for r in _hoja_urgencias().get_all_records()}
+
+
+def _actualizar_urgencia(folio, numero, activar):
+    if not es_administrador():
+        raise PermissionError("Solo administradores pueden modificar la prioridad de un oficio.")
+    hoja = _hoja_urgencias()
+    filas = hoja.get_all_values()
+    coincidencias = [i for i, fila in enumerate(filas[1:], 2)
+                    if len(fila) >= 2 and fila[0].strip() == str(folio).strip()
+                    and fila[1].strip() == str(numero).strip()]
+    datos = [str(folio), str(numero), "SI" if activar else "NO",
+             identificador_sesion(), datetime.now().astimezone().isoformat(timespec="seconds")]
+    if len(coincidencias) > 1:
+        raise ValueError("Hay marcas duplicadas para este oficio. Corrige URGENCIAS antes de continuar.")
+    if coincidencias:
+        hoja.update(f"A{coincidencias[0]}:E{coincidencias[0]}", [datos], value_input_option="RAW")
+    else:
+        hoja.append_row(datos, value_input_option="RAW")
+
+
+def _dias_desde_recepcion(valor):
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+    try:
+        fecha = pd.to_datetime(texto, dayfirst=True, errors="coerce")
+        if pd.isna(fecha):
+            return None
+        return max(0, (datetime.now().date() - fecha.date()).days)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _documentos_seccion(oficio):
+    grupos = (("Oficio firmado", "Firmado"), ("Oficio original / antecedentes", "Antecedente"),
+              ("Anexos", "Anexo"))
+    for titulo, campo in grupos:
+        docs = leer_documentos(oficio.get(campo, ""))
+        with st.expander(f"{titulo} ({len(docs)})", expanded=(campo == "Firmado")):
+            if not docs:
+                st.caption("Sin documentos vinculados en el registro.")
+            for doc in docs:
+                st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+
+
+def _modulo_lateral_documentos(tipo):
+    aplicar_fondo()
+    mostrar_sesion()
+    if tipo != "urgentes":
+        st.title("Firmados")
+        st.caption("Oficios firmados · documento final, antecedentes y anexos")
+        try:
+            registros = _leer_registros_oficios()
+        except Exception as error:
+            st.error(f"No se pudo consultar el registro: {_mensaje_error_sheets(error)}")
+            return
+        lista = [r for r in registros if normalizar_texto(r.get("Estatus", "")) == "firmado"]
+        st.metric("Oficios firmados", len(lista))
+        if not lista:
+            st.info("No hay oficios en esta sección todavía.")
+            return
+        consulta = st.text_input("Buscar por folio, número o asunto", key="buscar_firmados")
+        if consulta.strip():
+            lista = [r for r in lista if normalizar_texto(consulta) in normalizar_texto(
+                " ".join(str(r.get(k, "")) for k in ("Folio", "No. de oficio", "Asunto")))]
+        for oficio in lista:
+            folio = str(oficio.get("Folio", "")).strip()
+            numero = str(oficio.get("No. de oficio", "")).strip()
+            with st.expander(f"{numero or folio} · {str(oficio.get('Asunto', 'Sin asunto'))[:90]}"):
+                st.markdown(f"**Folio:** {folio}  |  **Responsable:** {oficio.get('Responsable', '—')}")
+                st.caption(f"Recepción: {oficio.get('Fecha de recepción', '—')} · Estatus: {oficio.get('Estatus', '—')}")
+                _documentos_seccion(oficio)
+        return
+
+    # Módulo Urgentes: comparte la estética de Mis pendientes.
+    # La imagen es opcional; sin ella se conserva el fondo actual.
+    # Acepta PNG/JPG/JPEG/WEBP y variantes habituales de nombre.
+    candidatos = [
+        ASSETS_DIR / f"fondo_urgentes{ext}"
+        for ext in (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")
+    ]
+    fondo_urgentes = next((ruta for ruta in candidatos if ruta.is_file()), None)
+    css_fondo = ""
+    if fondo_urgentes:
+        tipos = {".png": "image/png", ".jpg": "image/jpeg",
+                 ".jpeg": "image/jpeg", ".webp": "image/webp"}
+        mime = tipos[fondo_urgentes.suffix.lower()]
+        img = base64.b64encode(fondo_urgentes.read_bytes()).decode("ascii")
+        css_fondo = (
+            'background-image:linear-gradient(rgba(248,246,241,.24),rgba(248,246,241,.32)),'
+            f'url("data:{mime};base64,{img}") !important;'
+            'background-size:cover !important;'
+            'background-position:center center !important;'
+            'background-repeat:no-repeat !important;'
+            'background-attachment:fixed !important;'
+        )
+    else:
+        css_fondo = (
+            'background:linear-gradient(135deg,#f5f1e9,#e9e5dd) !important;'
+        )
+    st.markdown(f"""
+    <style>
+    [data-testid="stAppViewContainer"]:has(.urg-hero) {{
+        {css_fondo}
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero) > .main,
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stMain"] {{
+        background:transparent !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stHeader"] {{
+        background:transparent !important;
+    }}
+    .urg-hero {{
+        background:linear-gradient(115deg,#353431,#494742);
+        border:1px solid #b89a67;border-left:5px solid #b89a67;
+        border-radius:15px;padding:25px 30px;margin:8px 0 24px;
+        box-shadow:0 10px 24px rgba(36,33,29,.14);
+        color:#f8f5ef;
+    }}
+    /* Controles elegantes, limitados exclusivamente a Urgentes. */
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgencia_guardar"] button,
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urg_retirar_"] button {{
+        background:linear-gradient(125deg,#41403b,#302f2c) !important;
+        border:1px solid #ae925f !important;
+        border-left:4px solid #c3a16a !important;
+        color:#fff !important;
+        border-radius:10px !important;
+        box-shadow:0 4px 12px rgba(38,42,43,.16) !important;
+        font-weight:700 !important;
+        padding:10px 18px !important;
+        transition:transform .16s ease,box-shadow .16s ease,background .16s ease !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgencia_guardar"] button:hover,
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urg_retirar_"] button:hover {{
+        background:#5a5142 !important;
+        transform:translateY(-1px);
+        box-shadow:0 7px 17px rgba(38,42,43,.22) !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgentes_limpiar"] button {{
+        background:rgba(250,248,243,.96) !important;
+        color:#3e3b35 !important;
+        border:1px solid #c9bbab !important;
+        border-radius:10px !important;
+        font-weight:650 !important;
+        box-shadow:0 3px 10px rgba(51,46,39,.07) !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgentes_limpiar"] button:hover {{
+        border-color:#aa8b58 !important;
+        color:#87683a !important;
+        background:#fffdf8 !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [data-testid="stExpander"] {{
+        border:1px solid #d8cebd !important;
+        border-radius:12px !important;
+        background:rgba(249,247,242,.94) !important;
+        box-shadow:0 3px 12px rgba(61,52,40,.055);
+        overflow:hidden;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [data-testid="stExpander"] summary {{
+        color:#2d3e47 !important;
+        font-weight:650 !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [data-testid="stTextInput"] input,
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [data-testid="stSelectbox"] [data-baseweb="select"] {{
+        border-radius:9px !important;
+        background:rgba(250,247,241,.98) !important;
+    }}
+    /* Selector de oficios: sin azul, a juego con la paleta grafito-marfil. */
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgencia_seleccion"] [data-baseweb="select"] > div {{
+        background:#f6f2ea !important;
+        border:1px solid #c8b9a2 !important;
+        border-radius:9px !important;
+        color:#34332f !important;
+        box-shadow:none !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgencia_seleccion"] [data-baseweb="select"] * {{
+        color:#34332f !important;
+        -webkit-text-fill-color:#34332f !important;
+    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urgencia_guardar"] button p,
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    [class*="st-key-urg_retirar_"] button p {{
+        color:#fffaf0 !important;
+        -webkit-text-fill-color:#fffaf0 !important;
+    }}
+    /* Corrección de contraste: los estilos globales no deben oscurecer el banner. */
+    [data-testid="stAppViewContainer"] .urg-hero h1,
+    [data-testid="stAppViewContainer"] .urg-hero h1 * {{
+        color:#fffaf1 !important;
+        -webkit-text-fill-color:#fffaf1 !important;
+        text-shadow:0 1px 2px rgba(0,0,0,.16);
+    }}
+    [data-testid="stAppViewContainer"] .urg-hero p,
+    [data-testid="stAppViewContainer"] .urg-hero p * {{
+        color:#f0e8dc !important;
+        -webkit-text-fill-color:#f0e8dc !important;
+    }}
+    [data-testid="stAppViewContainer"] .urg-hero .eyebrow {{
+        color:#e4c58e !important;
+        -webkit-text-fill-color:#e4c58e !important;
+    }}
+    [data-testid="stAppViewContainer"] .urg-label {{
+        color:#634b2d !important;
+        font-weight:800 !important;
+        text-shadow:0 1px 0 rgba(255,255,255,.75);
+    }}
+    [data-testid="stAppViewContainer"] .urg-kpi .number,
+    [data-testid="stAppViewContainer"] .urg-kpi .title {{
+        color:#193242 !important;
+        -webkit-text-fill-color:#193242 !important;
+    }}
+    [data-testid="stAppViewContainer"] .urg-kpi .desc {{
+        color:#5e5a52 !important;
+        -webkit-text-fill-color:#5e5a52 !important;
+    }}
+    [data-testid="stAppViewContainer"] .urg-kpi {{
+        box-shadow:0 7px 19px rgba(51,45,35,.10) !important;
+    }}
+    .urg-hero .eyebrow {{font-size:11px;letter-spacing:2px;color:#e1c28d;font-weight:750}}
+    .urg-hero h1 {{font-size:37px;color:#fff;margin:8px 0 4px;line-height:1.15}}
+    .urg-hero p {{font-size:14px;color:#e7e2d8;margin:0}}
+    .urg-label {{color:#80653b;font-weight:750;letter-spacing:2px;
+                  font-size:12px;margin:17px 0 10px}}
+    .urg-kpi {{background:#f7f4ee;border:1px solid #ddd4c7;border-left:4px solid #b99a65;
+               border-radius:12px;padding:17px 20px;min-height:119px;
+               box-shadow:0 5px 14px rgba(61,52,40,.08)}}
+    .urg-kpi .number {{font-size:33px;font-weight:800;color:#20394a;line-height:1.12}}
+    .urg-kpi .title {{font-size:14px;font-weight:750;color:#20394a;margin-top:3px}}
+    .urg-kpi .desc {{font-size:12px;color:#777269;margin-top:4px}}
+    .urg-doc {{background:#f7f4ee;border:1px solid #ded7ca;border-left:4px solid #b99a65;
+               border-radius:10px;padding:15px 19px;margin:10px 0 4px;
+               box-shadow:0 3px 10px rgba(61,52,40,.07)}}
+    .urg-doc strong {{color:#21394a}}
+    .urg-doc .meta {{color:#696b69;font-size:13px;line-height:1.8}}
+    .urg-doc .tag {{display:inline-block;background:#f4dfae;color:#705222;
+                    border-radius:30px;padding:3px 11px;font-size:11px;font-weight:700}}
+    .urg-empty {{text-align:center;background:#f7f4ee;border:1px dashed #d5cbbd;
+                 border-radius:14px;padding:44px 20px;color:#263d4b;margin-top:16px}}
+    </style>
+    <div class="urg-hero">
+      <div class="eyebrow">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
+      <h1>Urgentes</h1>
+      <p>Oficios prioritarios · días transcurridos desde la recepción</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    try:
+        registros = _leer_registros_oficios()
+        marcas = _marcas_urgentes()
+    except Exception as error:
+        st.error(f"No se pudo consultar el registro: {_mensaje_error_sheets(error)}")
+        return
+
+    lista = [r for r in registros if marcas.get((
+        str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()), False)]
+    lista.sort(key=lambda r: _dias_desde_recepcion(r.get("Fecha de recepción")) or -1,
+               reverse=True)
+    antiguedades = [_dias_desde_recepcion(r.get("Fecha de recepción")) for r in lista]
+    antiguedades = [d for d in antiguedades if d is not None]
+    # Sin inferir un plazo de vencimiento que no exista en los datos.
+    sin_fecha = sum(_dias_desde_recepcion(r.get("Fecha de recepción")) is None for r in lista)
+    st.markdown('<div class="urg-label">RESUMEN DE URGENCIAS</div>', unsafe_allow_html=True)
+    kpis = (
+        (len(lista), "Oficios urgentes", "Requieren atención prioritaria"),
+        (max(antiguedades, default=0), "Mayor antigüedad", "Días desde la recepción"),
+        (sin_fecha, "Sin fecha registrada", "Requieren verificar su recepción"),
+    )
+    for columna, (numero, titulo, detalle) in zip(st.columns(3, gap="large"), kpis):
+        with columna:
+            st.markdown(
+                f'<div class="urg-kpi"><div class="number">{numero:02d}</div>'
+                f'<div class="title">{html.escape(titulo)}</div>'
+                f'<div class="desc">{html.escape(detalle)}</div></div>',
+                unsafe_allow_html=True)
+
+    # Separación deliberada entre las tarjetas KPI y el panel de gestión.
+    st.markdown('<div style="height:22px" aria-hidden="true"></div>', unsafe_allow_html=True)
+
+    if es_administrador():
+        with st.expander("Marcar o retirar urgencia", expanded=False):
+            opciones = {f"{r.get('Folio', '')} · {r.get('No. de oficio', '')} · {str(r.get('Asunto', ''))[:75]}": r
+                        for r in registros}
+            if opciones:
+                seleccion = st.selectbox("Selecciona un oficio", list(opciones), key="urgencia_seleccion")
+                oficio = opciones[seleccion]
+                folio = str(oficio.get("Folio", "")).strip()
+                numero = str(oficio.get("No. de oficio", "")).strip()
+                marcado = marcas.get((folio, numero), False)
+                st.caption("Estado actual: " + ("Urgente" if marcado else "Sin prioridad urgente"))
+                if st.button("Quitar urgencia" if marcado else "Marcar como urgente",
+                             key="urgencia_guardar"):
+                    try:
+                        _actualizar_urgencia(folio, numero, not marcado)
+                        st.rerun()
+                    except Exception as error:
+                        st.error(str(error))
+
+    st.markdown('<div class="urg-label">CONSULTA DE OFICIOS URGENTES</div>',
+                unsafe_allow_html=True)
+    col_buscar, col_estado, col_limpiar = st.columns([5, 2, 1.4], gap="small")
+    with col_buscar:
+        consulta = st.text_input("Buscar", placeholder="Folio, número de oficio, asunto o responsable...",
+                                 key="buscar_urgentes")
+    estados = sorted({str(r.get("Estatus", "")).strip() for r in lista
+                      if str(r.get("Estatus", "")).strip()})
+    with col_estado:
+        estado = st.selectbox("Filtrar por estado", ["Todos"] + estados, key="urgentes_estado")
+    with col_limpiar:
+        st.write("")
+        if st.button("Limpiar filtros", key="urgentes_limpiar", use_container_width=True):
+            st.session_state["buscar_urgentes"] = ""
+            st.session_state["urgentes_estado"] = "Todos"
+            st.rerun()
+    filtrados = lista
+    if consulta.strip():
+        buscado = normalizar_texto(consulta)
+        filtrados = [r for r in filtrados if buscado in normalizar_texto(
+            " ".join(str(r.get(k, "")) for k in
+                     ("Folio", "No. de oficio", "Asunto", "Responsable")))]
+    if estado != "Todos":
+        filtrados = [r for r in filtrados if str(r.get("Estatus", "")).strip() == estado]
+    st.markdown('<div class="urg-label">OFICIOS URGENTES</div>', unsafe_allow_html=True)
+    st.caption(f"{len(filtrados)} oficio(s) · Ordenados por mayor antigüedad")
+    if not filtrados:
+        mensaje = ("No hay oficios marcados como urgentes todavía."
+                   if not lista else "No se encontraron oficios con estos filtros.")
+        st.markdown(
+            f'<div class="urg-empty"><div style="font-size:28px">▤</div>'
+            f'<strong>{html.escape(mensaje)}</strong><p>Los expedientes prioritarios aparecerán aquí.</p></div>',
+            unsafe_allow_html=True)
+        return
+    for indice, oficio in enumerate(filtrados):
+        folio = str(oficio.get("Folio", "")).strip()
+        numero = str(oficio.get("No. de oficio", "")).strip()
+        dias = _dias_desde_recepcion(oficio.get("Fecha de recepción", ""))
+        fecha = str(oficio.get("Fecha de recepción", "")).strip() or "No registrada"
+        estatus = str(oficio.get("Estatus", "")).strip() or "Sin estado"
+        asunto = str(oficio.get("Asunto", "")).strip() or "Sin asunto"
+        responsable = str(oficio.get("Responsable", "")).strip() or "No asignado"
+        st.markdown(
+            '<div class="urg-doc">'
+            f'<strong>Folio {html.escape(folio or "—")}</strong> &nbsp; '
+            f'<span class="tag">Urgente</span><br>'
+            f'<span class="meta">{html.escape(numero)} · {html.escape(asunto[:110])}</span><br>'
+            f'<span class="meta">Recepción: {html.escape(fecha)} &nbsp; | &nbsp; '
+            f'Días transcurridos: <strong>{dias if dias is not None else "—"}</strong>'
+            f' &nbsp; | &nbsp; Estado: {html.escape(estatus)}'
+            f' &nbsp; | &nbsp; Responsable: {html.escape(responsable)}</span>'
+            '</div>', unsafe_allow_html=True)
+        with st.expander(f"Abrir expediente · {numero or folio}", expanded=False):
+            st.markdown(f"**Asunto:** {asunto}")
+            st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
+            _documentos_seccion(oficio)
+            if es_administrador():
+                if st.button("Retirar urgencia", key=f"urg_retirar_{indice}_{folio}"):
+                    try:
+                        _actualizar_urgencia(folio, numero, False)
+                        st.rerun()
+                    except Exception as error:
+                        st.error(str(error))
+
 
 # =========================================================
 # HOME
@@ -4673,6 +5092,25 @@ elif st.session_state.menu_activo == "pendientes":
         color:#56534b !important;background:#d7d0c5 !important;opacity:1 !important;
     }
     .stMainBlockContainer:has(.pend-hero) .tte-file-chip {color:#65451f !important;}
+    /* RESUMEN DE ACTIVIDAD — tarjetas marfil con acento institucional discreto. */
+    .stMainBlockContainer:has(.pend-hero) .pend-kpi {
+        background:rgba(247,244,238,.97) !important;
+        border:1px solid #d9d0c3 !important;
+        border-left:3px solid var(--accent,#bd9a64) !important;
+        border-radius:12px !important;
+        box-shadow:0 5px 16px rgba(61,52,40,.085) !important;
+        min-height:102px !important;
+        padding:16px 19px !important;
+        gap:14px !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-kpi-icon {
+        background:color-mix(in srgb,var(--accent,#bd9a64) 12%,#f7f4ee) !important;
+        color:var(--accent,#bd9a64) !important;
+        border-radius:11px !important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-kpi-number,
+    .stMainBlockContainer:has(.pend-hero) .pend-kpi-title {color:#243b48 !important;}
+    .stMainBlockContainer:has(.pend-hero) .pend-kpi-desc {color:#6f6b62 !important;}
     </style>
     """, unsafe_allow_html=True)
 
@@ -6362,6 +6800,12 @@ elif st.session_state.menu_activo == "oficios":
 # =========================================================
 # MÓDULO INGENIERÍA DE DETALLE FASE I
 # =========================================================
+
+elif st.session_state.menu_activo == "urgentes":
+    _modulo_lateral_documentos("urgentes")
+
+elif st.session_state.menu_activo == "firmados":
+    _modulo_lateral_documentos("firmados")
 
 elif st.session_state.menu_activo == "diseno":
     if st.button("← Volver al Menú Principal", key="volver_diseno"):
