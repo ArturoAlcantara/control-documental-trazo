@@ -367,6 +367,7 @@ def mostrar_login():
                     st.session_state.cargo_institucional = str(datos_usuario.get("cargo", ""))
                     st.session_state.responsable_oficios = str(datos_usuario.get("responsable", "")).strip()
                     st.session_state.menu_activo = "home"
+                    st.session_state.pop("pend_bandeja", None)
                     _cookies_sesion["sesion"] = _crear_token(identificador)
                     _cookies_sesion.save()
                     st.rerun()
@@ -399,6 +400,7 @@ def mostrar_sesion():
             st.session_state.cargo_institucional = ""
             st.session_state.responsable_oficios = ""
             st.session_state.menu_activo = "home"
+            st.session_state.pop("pend_bandeja", None)
             st.rerun()
 
 
@@ -857,7 +859,9 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
     )
     if not permitido:
         raise PermissionError("La transición no está permitida para tu usuario o la etapa actual.")
-    if etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) and not detalle.strip():
+    # Las observaciones son opcionales en la devolución de la Tte.;
+    # el resto de transiciones conserva su comportamiento previo.
+    if etapa_nueva == ETAPA_RETORNO_FIRMA and not detalle.strip():
         raise ValueError("Describe las correcciones solicitadas.")
     hoja.update_cell(indice, 8, etapa_nueva)
     _invalidar_cache_documental(borradores=True)
@@ -971,6 +975,86 @@ def _descargar_docx_drive(drive_id):
     return respuesta.content
 
 
+def _adjuntar_word_corregido_tte(folio, numero, archivo):
+    """Guarda el Word opcional de la Tte. sin reemplazar la versión del equipo."""
+    exigir_permiso_revision_final()
+    _verificar_expediente_documental(folio, numero)
+    versiones = _borradores_expediente(folio, numero)
+    if not versiones or str(versiones[-1].get("Etapa", "")) != ETAPA_TTE:
+        raise ValueError("El oficio ya no está en revisión de la Tte.")
+    version = int(versiones[-1].get("Version") or 0)
+    # El cargador existente genera un archivo nuevo en Drive, sin sobrescribir.
+    subido = _subir_borrador_drive(archivo, folio, numero, version)
+    detalle = json.dumps({"nombre": subido["nombre"], "url": subido["url"],
+                          "drive_id": subido["id"]}, ensure_ascii=False)
+    try:
+        _registrar_evento_borrador(folio, numero, version,
+                                   "Word corregido por la Tte.", detalle)
+    except Exception as error:
+        raise RuntimeError(
+            "El Word se guardó en Drive, pero falló su registro en la bitácora. "
+            f"Recupéralo aquí: {subido['url']}. {error}"
+        ) from error
+    return subido
+
+
+def _word_tte_devolucion(folio, numero, etapa):
+    """Consulta y descarga el Word devuelto por la Tte. en la ronda actual."""
+    if etapa != ETAPA_CORRECCIONES:
+        return
+    try:
+        eventos = _eventos_expediente(folio, numero)
+        ultima_devolucion = next(
+            (i for i in range(len(eventos) - 1, -1, -1)
+             if str(eventos[i].get("Accion", "")).strip() == ETAPA_CORRECCIONES),
+            None,
+        )
+        if ultima_devolucion is None:
+            return
+        inicio = next(
+            (i for i in range(ultima_devolucion - 1, -1, -1)
+             if str(eventos[i].get("Accion", "")).strip()
+             in (ETAPA_TTE, ETAPA_CORRECCIONES)), -1,
+        )
+        adjuntos = [
+            e for e in eventos[inicio + 1:ultima_devolucion]
+            if str(e.get("Accion", "")).strip() == "Word corregido por la Tte."
+        ]
+        if not adjuntos:
+            return
+        dato = json.loads(str(adjuntos[-1].get("Detalle", "")))
+        url = str(dato.get("url", ""))
+        drive_id = str(dato.get("drive_id", ""))
+        nombre = str(dato.get("nombre", "Word_corregido_Tte.docx"))
+        st.info("La Tte. devolvió un Word con modificaciones. Puedes consultarlo o descargarlo.")
+        col_drive, col_descarga = st.columns(2)
+        with col_drive:
+            if url.startswith("https://drive.google.com/"):
+                st.link_button("↗ Consultar Word de la Tte. en Drive", url,
+                               use_container_width=True)
+        with col_descarga:
+            if st.button("↓ Preparar descarga Word de la Tte.",
+                         key=f"tte_word_preparar_{folio}_{numero}",
+                         use_container_width=True):
+                try:
+                    st.session_state[f"tte_word_bytes_{folio}_{numero}"] = _descargar_docx_drive(drive_id)
+                    st.session_state[f"tte_word_id_{folio}_{numero}"] = drive_id
+                except Exception as error:
+                    st.error(f"No se pudo descargar el Word: {_mensaje_error_sheets(error)}")
+            if (st.session_state.get(f"tte_word_id_{folio}_{numero}") == drive_id
+                    and f"tte_word_bytes_{folio}_{numero}" in st.session_state):
+                st.download_button(
+                    "Descargar archivo .docx",
+                    data=st.session_state[f"tte_word_bytes_{folio}_{numero}"],
+                    file_name=nombre,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"tte_word_descargar_{folio}_{numero}",
+                    use_container_width=True,
+                )
+    except Exception as error:
+        st.warning(f"No se pudo consultar el Word devuelto por la Tte.: {_mensaje_error_sheets(error)}")
+
+
 def _mensaje_error_sheets(error):
     mensaje = str(error)
     if ("Read timed out" in mensaje or "ConnectTimeout" in mensaje
@@ -1055,6 +1139,7 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
     else:
         st.caption(f"Versión V{int(ultimo['Version']):02d} · {len(versiones)} archivo(s) conservado(s)")
     _mostrar_observaciones_revisor(folio, numero, etapa)
+    _word_tte_devolucion(folio, numero, etapa)
     if ultimo:
         st.markdown(f"**📄 {html.escape(str(ultimo.get('Nombre', 'Documento Word')))}**")
         st.caption(f"Registrado por: {ultimo.get('Usuario', '')} · {ultimo.get('Fecha registro', '')}")
@@ -1197,6 +1282,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                      type="primary", use_container_width=True):
             try:
                 _cambiar_etapa_borrador(folio, numero, ETAPA_TTE)
+                # Sincronizar OFICIOS con BORRADORES para todas las rutas de envío.
+                _actualizar_oficio_flujo(folio, numero, {"Estatus": "En revisión"})
                 st.rerun()
             except Exception as error:
                 st.error(_mensaje_error_sheets(error))
@@ -1204,11 +1291,21 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
         with st.form(key=f"doc_revision_tte_{folio}_{numero}"):
             decision = st.radio("Resultado de la revisión", ["Autorizar para firma", "Solicitar correcciones"],
                                 horizontal=True)
-            comentario = st.text_area("Observaciones de revisión", placeholder="Indica los ajustes requeridos")
+            comentario = st.text_area("Observaciones de revisión (opcional)",
+                                      placeholder="Puedes dejar indicaciones o continuar sin comentarios")
+            archivo_tte = (st.file_uploader("Word modificado por la Tte. (opcional)",
+                                          type=["docx"],
+                                          key=f"tte_archivo_opcional_{folio}_{numero}")
+                           if decision == "Solicitar correcciones" else None)
             enviar = st.form_submit_button("Registrar decisión", type="primary", use_container_width=True)
         if enviar:
             try:
                 nueva = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
+                # Registrar primero el adjunto para evitar que quede inaccesible
+                # si el expediente cambia de etapa durante la operación.
+                if nueva == ETAPA_CORRECCIONES and archivo_tte is not None:
+                    with st.spinner("Guardando Word corregido en Drive..."):
+                        _adjuntar_word_corregido_tte(folio, numero, archivo_tte)
                 _actualizar_oficio_flujo(folio, numero, {
                     "Estatus": "En firma" if nueva == ETAPA_FIRMA else "En correcciones"
                 }, autorizacion_tte=True)
@@ -1643,6 +1740,11 @@ def generar_pdf_oficios(registros):
                 continue
         return cadena
 
+    def nombre_pdf_responsable(valor):
+        original = texto(valor)
+        nombres = {"karina": "Karina Vazquez", "alex": "Alexis Santiago"}
+        return nombres.get(normalizar_texto(original), original)
+
     elementos = [
         Paragraph("RELACIÓN INSTITUCIONAL DE OFICIOS EN TRÁMITE", estilo_titulo),
         Spacer(1, 5),
@@ -1664,7 +1766,7 @@ def generar_pdf_oficios(registros):
             celda(fila.get("No. de oficio", "")),
             celda(fila.get("Asunto", "")),
             celda(fila.get("Proyecto", "")),
-            celda(fila.get("Responsable", "")),
+            celda(nombre_pdf_responsable(fila.get("Responsable", ""))),
             celda(estatus),
             celda(fecha_legible(fila.get("Fecha de recepción", ""))),
             celda(fecha_entrega),
@@ -1692,6 +1794,8 @@ def generar_pdf_oficios(registros):
         "alejandra": "Alejandra Cardoso",
         "john": "John Bautista",
         "magali": "Magali Rivera",
+        "karina": "Karina Vazquez",
+        "alex": "Alexis Santiago",
     }
     responsables = {
         normalizar_texto(v)
@@ -2659,9 +2763,14 @@ def _panel_revision_tte(registro):
                             label_visibility="collapsed")
         with st.form(key=f"tte_form_{clave}"):
             if decision == "Solicitar correcciones":
-                comentario = st.text_area("Indique los cambios que deben realizarse *",
-                                          placeholder="Describa los ajustes concretos para John y Alejandra...",
-                                          key=f"tte_observaciones_{clave}")
+                archivo_tte = st.file_uploader(
+                    "Word con modificaciones de la Tte. (opcional)",
+                    type=["docx"], key=f"tte_word_devolucion_{clave}",
+                    help="John y Alejandra podrán abrirlo en Drive y descargarlo en Word.")
+                comentario = st.text_area(
+                    "Comentarios u observaciones (opcional)",
+                    placeholder="Puedes escribir observaciones o dejar este campo vacío.",
+                    key=f"tte_observaciones_{clave}")
             else:
                 comentario = st.text_area("Observaciones adicionales (opcional)",
                                           placeholder="Puede agregar alguna indicación para el trámite de firma...",
@@ -2676,12 +2785,14 @@ def _panel_revision_tte(registro):
         if enviar:
             if not confirmado:
                 st.warning("Marque la confirmación antes de registrar su decisión.")
-            elif decision == "Solicitar correcciones" and not comentario.strip():
-                st.warning("Indique las correcciones requeridas antes de continuar.")
             else:
                 try:
                     nueva_etapa = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
                     with st.spinner("Registrando decisión..."):
+                        # Guardar primero el adjunto opcional para que quede asociado
+                        # a la devolución vigente en EVENTOS_BORRADORES.
+                        if nueva_etapa == ETAPA_CORRECCIONES and archivo_tte is not None:
+                            _adjuntar_word_corregido_tte(folio, numero, archivo_tte)
                         _actualizar_oficio_flujo(folio, numero, {
                             "Estatus": "En firma" if nueva_etapa == ETAPA_FIRMA else "En correcciones"
                         }, autorizacion_tte=True)
@@ -2913,13 +3024,48 @@ def mostrar_mis_pendientes():
         registros["Estatus"].fillna("").astype(str).str.strip().isin(activos)
     ].copy()
 
-    etiquetas = ["Mis oficios"]
+    # Las bandejas representan quién debe actuar, no solo el estatus general.
+    # Un Word enviado a revisión final corresponde a la bandeja de la Tte.,
+    # no a «Mis oficios». BORRADORES es la fuente de verdad de la etapa.
+    try:
+        registros_word = _leer_registros_borradores()
+        ultimas_etapas = {}
+        for registro_word in registros_word:
+            clave_word = (str(registro_word.get("Folio", "")).strip(),
+                          str(registro_word.get("No. de oficio", "")).strip())
+            try:
+                version_word = int(registro_word.get("Version") or 0)
+            except (ValueError, TypeError):
+                version_word = 0
+            anterior = ultimas_etapas.get(clave_word)
+            if anterior is None or version_word >= anterior[0]:
+                ultimas_etapas[clave_word] = (version_word, str(registro_word.get("Etapa", "")).strip())
+        if {"Folio", "No. de oficio"}.issubset(pendientes.columns):
+            en_revision_tte = pendientes.apply(
+                lambda fila: ultimas_etapas.get(
+                    (str(fila["Folio"]).strip(), str(fila["No. de oficio"]).strip()),
+                    (0, ""))[1] == ETAPA_TTE, axis=1)
+            pendientes = pendientes.loc[~en_revision_tte].copy()
+            # En la cuenta de la Tte. «Mis oficios» no es una segunda
+            # bandeja de revisión: los documentos pendientes de su decisión
+            # se consultan exclusivamente desde «Por revisar».
+            if puede_realizar_revision_final():
+                pendientes = pendientes.iloc[0:0].copy()
+    except Exception as error:
+        # No ocultar expedientes si Google Sheets no pudo cargar BORRADORES.
+        st.warning(f"No se pudo sincronizar la clasificación de bandejas: {_mensaje_error_sheets(error)}")
+
+    etiquetas = [] if puede_realizar_revision_final() else ["Mis oficios"]
     if puede_gestionar_borradores() or puede_realizar_revision_final():
         etiquetas.append("Por revisar")
     etiquetas.append("En proceso de firma")
     # Navegación por bandejas: controles reales, sin pestañas estrechas.
+    # Alondra abre directamente su bandeja de autorizaciones.
+    # El resto conserva «Mis oficios» como pantalla inicial.
     if "pend_bandeja" not in st.session_state or st.session_state.pend_bandeja not in etiquetas:
-        st.session_state.pend_bandeja = "Mis oficios"
+        st.session_state.pend_bandeja = (
+            "Por revisar" if puede_realizar_revision_final() else "Mis oficios"
+        )
     bandeja_actual = st.session_state.pend_bandeja
     st.markdown('<div class="pend-nav-label">BANDEJAS DE TRABAJO</div>', unsafe_allow_html=True)
     opciones_nav = [
