@@ -3839,11 +3839,15 @@ def _actualizar_urgencia(folio, numero, activar):
 
 
 def _dias_desde_recepcion(valor):
+    """Días naturales desde recepción; ISO AAAA-MM-DD se interpreta sin invertir mes/día."""
     texto = str(valor or "").strip()
     if not texto:
         return None
     try:
-        fecha = pd.to_datetime(texto, dayfirst=True, errors="coerce")
+        if re.match(r"^\d{4}-\d{1,2}-\d{1,2}(?:$|[T\s])", texto):
+            fecha = pd.to_datetime(texto, yearfirst=True, errors="coerce")
+        else:
+            fecha = pd.to_datetime(texto, dayfirst=True, errors="coerce")
         if pd.isna(fecha):
             return None
         return max(0, (datetime.now().date() - fecha.date()).days)
@@ -4371,19 +4375,52 @@ def _modulo_lateral_documentos(tipo):
         st.error(f"No se pudo consultar el registro: {_mensaje_error_sheets(error)}")
         return
 
-    lista = [r for r in registros if marcas.get((
-        str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()), False)]
-    lista.sort(key=lambda r: _dias_desde_recepcion(r.get("Fecha de recepción")) or -1,
-               reverse=True)
-    antiguedades = [_dias_desde_recepcion(r.get("Fecha de recepción")) for r in lista]
+    # Regla institucional: días naturales completos; urgente al superar 5 días.
+    # Los registros finalizados no generan alertas nuevas ni aparecen en esta bandeja.
+    UMBRAL_URGENCIA_DIAS = 5
+    ESTADOS_TERMINADOS = {"firmado", "firmados", "cerrado", "cerrados", "archivado", "archivados",
+                          "concluido", "concluidos", "cancelado", "cancelados"}
+
+    def _finalizado_urgencia(registro):
+        estado_normalizado = normalizar_texto(str(registro.get("Estatus", ""))).strip()
+        return estado_normalizado in ESTADOS_TERMINADOS
+
+    def _prioridad_urgencia(registro):
+        clave = (str(registro.get("Folio", "")).strip(), str(registro.get("No. de oficio", "")).strip())
+        dias = _dias_desde_recepcion(registro.get("Fecha de recepción"))
+        manual = marcas.get(clave, False)
+        automatico = dias is not None and dias > UMBRAL_URGENCIA_DIAS
+        return {"dias": dias, "manual": manual, "automatico": automatico,
+                "urgente": (manual or automatico) and not _finalizado_urgencia(registro)}
+
+    lista = [r for r in registros if _prioridad_urgencia(r)["urgente"]]
+    lista.sort(key=lambda r: (_prioridad_urgencia(r)["dias"] is not None,
+                              _prioridad_urgencia(r)["dias"] or -1), reverse=True)
+    antiguedades = [_prioridad_urgencia(r)["dias"] for r in lista]
     antiguedades = [d for d in antiguedades if d is not None]
-    # Sin inferir un plazo de vencimiento que no exista en los datos.
-    sin_fecha = sum(_dias_desde_recepcion(r.get("Fecha de recepción")) is None for r in lista)
-    st.markdown('<div class="urg-label">RESUMEN DE URGENCIAS</div>', unsafe_allow_html=True)
+    automaticos = sum(_prioridad_urgencia(r)["automatico"] for r in lista)
+    manuales = sum(_prioridad_urgencia(r)["manual"] and not _prioridad_urgencia(r)["automatico"] for r in lista)
+    proximos = sum(4 <= d <= 5 for r in registros if not _finalizado_urgencia(r)
+                  if (d := _dias_desde_recepcion(r.get("Fecha de recepción"))) is not None)
+    # Criterio accesible pero visualmente secundario: no desplaza el tablero.
+    st.caption("Criterio: urgente desde el día 6 natural · próximo a urgente: días 4 y 5 · prioridad manual disponible.")
+    with st.expander("Consultar criterio de prioridad", expanded=False):
+        st.markdown(
+            "Los oficios **activos** se consideran urgentes automáticamente cuando "
+            "han transcurrido **más de 5 días naturales** desde su recepción. "
+            "Los días 4 y 5 se muestran como próximos a urgente. "
+            "Se pueden marcar casos especiales de forma manual."
+        )
+        st.caption(
+            "Los oficios firmados, cerrados, archivados, concluidos o cancelados "
+            "no aparecen en esta bandeja. La prioridad se calcula al consultar "
+            "la página y no altera el estatus registrado en Google Sheets."
+        )
+    st.markdown('<div class="urg-label">RESUMEN DE PRIORIDADES</div>', unsafe_allow_html=True)
     kpis = (
-        (len(lista), "Oficios urgentes", "Requieren atención prioritaria"),
-        (max(antiguedades, default=0), "Mayor antigüedad", "Días desde la recepción"),
-        (sin_fecha, "Sin fecha registrada", "Requieren verificar su recepción"),
+        (len(lista), "Urgentes activos", "Automáticos y manuales"),
+        (automaticos, "Urgencia automática", "Desde el día 6 natural"),
+        (proximos, "Próximos a urgente", "Entre 4 y 5 días"),
     )
     for columna, (numero, titulo, detalle) in zip(st.columns(3, gap="large"), kpis):
         with columna:
@@ -4392,22 +4429,26 @@ def _modulo_lateral_documentos(tipo):
                 f'<div class="title">{html.escape(titulo)}</div>'
                 f'<div class="desc">{html.escape(detalle)}</div></div>',
                 unsafe_allow_html=True)
-
-    # Separación deliberada entre las tarjetas KPI y el panel de gestión.
-    st.markdown('<div style="height:22px" aria-hidden="true"></div>', unsafe_allow_html=True)
+    st.caption(f"Mayor antigüedad: {max(antiguedades)} días · Prioridades manuales adicionales: {manuales}"
+               if antiguedades else f"Prioridades manuales adicionales: {manuales}")
+    st.markdown('<div style="height:14px" aria-hidden="true"></div>', unsafe_allow_html=True)
 
     if es_administrador():
-        with st.expander("Marcar o retirar urgencia", expanded=False):
+        with st.expander("Gestionar prioridad manual (casos especiales)", expanded=False):
+            st.caption("La prioridad automática no puede desactivarse mientras el oficio activo supere 5 días. "
+                       "Retirar la marca manual no elimina la urgencia por antigüedad.")
             opciones = {f"{r.get('Folio', '')} · {r.get('No. de oficio', '')} · {str(r.get('Asunto', ''))[:75]}": r
-                        for r in registros}
+                        for r in registros if not _finalizado_urgencia(r)}
             if opciones:
-                seleccion = st.selectbox("Selecciona un oficio", list(opciones), key="urgencia_seleccion")
+                seleccion = st.selectbox("Selecciona un oficio activo", list(opciones), key="urgencia_seleccion")
                 oficio = opciones[seleccion]
                 folio = str(oficio.get("Folio", "")).strip()
                 numero = str(oficio.get("No. de oficio", "")).strip()
                 marcado = marcas.get((folio, numero), False)
-                st.caption("Estado actual: " + ("Urgente" if marcado else "Sin prioridad urgente"))
-                if st.button("Quitar urgencia" if marcado else "Marcar como urgente",
+                dias = _dias_desde_recepcion(oficio.get("Fecha de recepción"))
+                st.caption(f"Antigüedad: {dias if dias is not None else 'sin fecha'} días · "
+                           f"Prioridad manual: {'Sí' if marcado else 'No'}")
+                if st.button("Quitar marca manual" if marcado else "Marcar prioridad manual",
                              key="urgencia_guardar"):
                     try:
                         _actualizar_urgencia(folio, numero, not marcado)
@@ -4440,10 +4481,10 @@ def _modulo_lateral_documentos(tipo):
                 d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
     if estado != "Todos":
         filtrados = [r for r in filtrados if str(r.get("Estatus", "")).strip() == estado]
-    st.markdown('<div class="urg-label">OFICIOS URGENTES</div>', unsafe_allow_html=True)
-    st.caption(f"{len(filtrados)} oficio(s) · Ordenados por mayor antigüedad")
+    st.markdown('<div class="urg-label">EXPEDIENTES PRIORITARIOS</div>', unsafe_allow_html=True)
+    st.caption(f"{len(filtrados)} expediente(s) · Ordenados del más antiguo al más reciente")
     if not filtrados:
-        mensaje = ("No hay oficios marcados como urgentes todavía."
+        mensaje = ("No hay oficios activos con urgencia automática o manual."
                    if not lista else "No se encontraron oficios con estos filtros.")
         st.markdown(
             f'<div class="urg-empty"><div style="font-size:28px">▤</div>'
@@ -4458,22 +4499,26 @@ def _modulo_lateral_documentos(tipo):
         estatus = str(oficio.get("Estatus", "")).strip() or "Sin estado"
         asunto = str(oficio.get("Asunto", "")).strip() or "Sin asunto"
         responsable = str(oficio.get("Responsable", "")).strip() or "No asignado"
+        automatico = dias is not None and dias > UMBRAL_URGENCIA_DIAS
+        razon = "POR ANTIGÜEDAD" if automatico else "PRIORIDAD MANUAL"
+        dias_etiqueta = f"{dias} días naturales" if dias is not None else "Fecha por verificar"
         st.markdown(
-            '<div class="urg-doc">'
-            f'<strong>Folio {html.escape(folio or "—")}</strong> &nbsp; '
-            f'<span class="tag">Urgente</span><br>'
-            f'<span class="meta">{html.escape(numero)} · {html.escape(asunto[:110])}</span><br>'
-            f'<span class="meta">Recepción: {html.escape(fecha)} &nbsp; | &nbsp; '
-            f'Días transcurridos: <strong>{dias if dias is not None else "—"}</strong>'
-            f' &nbsp; | &nbsp; Estado: {html.escape(estatus)}'
-            f' &nbsp; | &nbsp; Responsable: {html.escape(responsable)}</span>'
+            '<div class="urg-doc" style="padding:17px 20px;margin:12px 0 5px;">'
+            '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
+            f'<div><strong style="font-size:16px;">{html.escape(numero or folio or "Expediente")}</strong>'
+            f'<span class="tag" style="margin-left:12px;">{razon}</span></div>'
+            f'<strong style="font-size:14px;color:#8a6735;">{html.escape(dias_etiqueta)}</strong></div>'
+            f'<div class="meta" style="margin-top:7px;">{html.escape(asunto[:160])}</div>'
+            '<div class="meta" style="margin-top:8px;padding-top:7px;border-top:1px solid #ded8cc;">'
+            f'Folio {html.escape(folio or "—")} &nbsp; · &nbsp; Recepción: {html.escape(fecha)}'
+            f' &nbsp; · &nbsp; {html.escape(estatus)} &nbsp; · &nbsp; {html.escape(responsable)}</div>'
             '</div>', unsafe_allow_html=True)
         with st.expander(f"Abrir expediente · {numero or folio}", expanded=False):
             st.markdown(f"**Asunto:** {asunto}")
             st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
             _documentos_seccion(oficio)
             if es_administrador():
-                if st.button("Retirar urgencia", key=f"urg_retirar_{indice}_{folio}"):
+                if marcas.get((folio, numero), False) and st.button("Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
                     try:
                         _actualizar_urgencia(folio, numero, False)
                         st.rerun()
@@ -6781,6 +6826,189 @@ elif st.session_state.menu_activo == "oficios":
         </style>
         """, unsafe_allow_html=True)
 
+        # Refinamiento compacto del expediente: estilos aislados a esta sección.
+        st.markdown("""
+        <style>
+        .exp-titulo {margin:17px 0 10px!important;border-left:2px solid #B89A63;padding-left:12px}
+        .exp-titulo strong {font-size:19px!important;color:#172F40!important;font-weight:780!important}
+        .exp-titulo p {font-size:11px!important;color:#526471!important;margin-top:2px!important}
+        .exp-panel {background:#FAF9F6!important;border-color:#E0DCD3!important;
+            box-shadow:0 3px 12px rgba(25,39,40,.045)!important}
+        .exp-cabecera {background:linear-gradient(112deg,#333A39,#414643)!important;
+            border-left:3px solid #B89A63!important;padding:15px 20px!important}
+        .exp-eyebrow {font-size:9px!important;letter-spacing:1.6px!important;color:#E4C78F!important}
+        .exp-numero {font-size:20px!important;letter-spacing:.1px;margin-top:6px!important;color:#FFFFFF!important}
+        .exp-proyecto {font-size:11px!important;color:#F0F0EC!important;margin-top:5px!important}
+        .exp-estado {border:1px solid #C5A56C!important;background:rgba(255,255,255,.07)!important;
+            color:#FFFFFF!important;border-radius:20px!important;padding:5px 12px!important;font-size:10px!important}
+        .st-key-expediente_campos {background:#FAF9F6!important;border-color:#E0DCD3!important;
+            padding:10px 12px 12px!important}
+        .st-key-expediente_campos [data-testid="stHorizontalBlock"] {gap:9px!important;margin-bottom:8px!important}
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] {background:#FFFFFF!important;
+            border:1px solid #E4E1D9!important;border-radius:7px!important;
+            padding:8px 11px 9px!important;min-height:61px!important;
+            transition:border-color .18s,background .18s!important}
+        .st-key-expediente_campos [class*="st-key-exp_celda_"]:hover {
+            border-color:#C4AC80!important;background:#FFFEFC!important}
+        .st-key-expediente_campos .exp-label {color:#4D5C60!important;font-size:10px!important;
+            letter-spacing:.65px!important;font-weight:780!important}
+        .st-key-expediente_campos .exp-value {color:#10283B!important;font-size:13px!important;
+            font-weight:720!important;margin-top:3px!important;line-height:1.35!important}
+        .st-key-expediente_campos [class*="st-key-exp_editar_"] button {
+            background:#F7F4EC!important;border:1px solid #D8C8AA!important;
+            border-radius:5px!important;color:#66512C!important;
+            min-height:21px!important;height:21px!important;width:22px!important}
+        .st-key-expediente_campos [class*="st-key-exp_editar_"] button:hover {
+            border-color:#A9874E!important;background:#F3E9D6!important}
+        .st-key-expediente_campos [data-testid="stExpander"] {
+            border-color:#DAD6CB!important;background:#FFFEFC!important}
+        .exp-seguimiento {border-top:0!important;padding:13px 20px 15px!important}
+        .exp-seguimiento-label {color:#42575B!important;font-size:10px!important;
+            letter-spacing:1.1px!important;margin-bottom:14px!important}
+        .exp-etapas:before {background:#CCD3CE!important;height:2px!important;top:12px!important}
+        .exp-punto {width:25px!important;height:25px!important;margin-bottom:7px!important;
+            background:#F1F0EC!important;border:1px solid #C7CDC6!important;
+            color:#53636A!important;font-size:11px!important}
+        .exp-etapa.completa .exp-punto {background:#476977!important;border-color:#476977!important;color:#FFFFFF!important}
+        .exp-etapa.actual .exp-punto {background:#B69558!important;border-color:#B69558!important;color:#FFFFFF!important}
+        .exp-etapa-nombre {color:#263F4A!important;font-size:11px!important;font-weight:750!important}
+        .exp-etapa-nota {color:#526874!important;font-size:10px!important;margin-top:3px!important}
+        @media(max-width:650px) {
+          .exp-cabecera {padding:14px 15px!important}
+          .exp-numero {font-size:17px!important}
+          .st-key-expediente_campos {padding:9px!important}
+          .st-key-expediente_campos [data-testid="stHorizontalBlock"] {gap:7px!important}
+          .st-key-expediente_campos [class*="st-key-exp_celda_"] {min-height:57px!important;padding:8px!important}
+          .exp-seguimiento {padding:12px 8px!important}
+          .exp-etapa-nombre {font-size:10px!important}
+          .exp-etapa-nota {font-size:9px!important}
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # Ajuste final de proporciones: evita las alturas forzadas de estilos
+        # anteriores y mantiene legible el contenido en pantallas estrechas.
+        st.markdown("""
+        <style>
+        .st-key-expediente_campos {
+            padding: 12px 14px 14px !important;
+            background: #FBFAF7 !important;
+            border: 1px solid #DEDAD1 !important;
+            border-top: 0 !important;
+            border-radius: 0 0 9px 9px !important;
+        }
+        .st-key-expediente_campos [data-testid="stHorizontalBlock"] {
+            align-items: stretch !important;
+            gap: 12px !important;
+            margin-bottom: 10px !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] {
+            min-height: 0 !important;
+            height: auto !important;
+            padding: 10px 13px !important;
+            border: 1px solid #E0DDD6 !important;
+            border-radius: 7px !important;
+            background: #FFFFFF !important;
+            box-shadow: 0 1px 3px rgba(21,37,43,.035) !important;
+            overflow: visible !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] [data-testid="stVerticalBlock"] {
+            gap: 3px !important;
+        }
+        .st-key-expediente_campos .exp-label {
+            color: #50636C !important;
+            font-size: 10px !important;
+            letter-spacing: .7px !important;
+            font-weight: 750 !important;
+        }
+        .st-key-expediente_campos .exp-value {
+            color: #142F3E !important;
+            font-size: 13px !important;
+            font-weight: 650 !important;
+            line-height: 1.45 !important;
+            margin-top: 4px !important;
+            overflow-wrap: anywhere !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_editar_"] button {
+            height: 25px !important;
+            min-height: 25px !important;
+            width: 27px !important;
+            background: #F8F5EE !important;
+            border: 1px solid #D8C5A2 !important;
+            color: #765D36 !important;
+        }
+        .st-key-expediente_campos [data-testid="stExpander"] {
+            background: #FFFFFF !important;
+            border: 1px solid #E0DDD6 !important;
+        }
+        @media (max-width: 720px) {
+            .st-key-expediente_campos {padding: 9px !important;}
+            .st-key-expediente_campos [data-testid="stHorizontalBlock"] {
+                gap: 8px !important;
+            }
+            .st-key-expediente_campos [class*="st-key-exp_celda_"] {
+                padding: 9px 10px !important;
+            }
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # Corrección estructural: Streamlit separa los widgets del encabezado y
+        # del valor con un gap vertical propio. Se elimina SOLO en estas tarjetas.
+        # Las reglas anteriores se mantienen por compatibilidad con el resto de la UI.
+        st.markdown("""
+        <style>
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] {
+            min-height: 0 !important;
+            padding: 10px 13px 11px !important;
+            align-self: start !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] > div[data-testid="stVerticalBlock"],
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] div[data-testid="stVerticalBlock"] {
+            gap: 0 !important;
+            row-gap: 0 !important;
+            justify-content: flex-start !important;
+            align-content: start !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] div[data-testid="stHorizontalBlock"] {
+            margin: 0 !important;
+            padding: 0 !important;
+            align-items: center !important;
+            min-height: 27px !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] div[data-testid="stElementContainer"],
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] div[data-testid="stMarkdownContainer"] {
+            margin-top: 0 !important;
+            margin-bottom: 0 !important;
+            padding-top: 0 !important;
+            padding-bottom: 0 !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] .exp-label {
+            line-height: 1.25 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] .exp-value {
+            margin: 2px 0 0 !important;
+            padding: 0 !important;
+            line-height: 1.35 !important;
+            font-size: 13px !important;
+            font-weight: 700 !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] [data-testid="stExpander"] {
+            margin: 4px 0 0 !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] [data-testid="stExpander"] details summary {
+            min-height: 35px !important;
+            padding-top: 6px !important;
+            padding-bottom: 6px !important;
+        }
+        .st-key-expediente_campos [class*="st-key-exp_celda_"] [data-testid="stButton"] {
+            margin: 0 !important;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
         campos = [
             ("folio", "Folio", "Folio", folio_resultado),
             ("responsable", "Responsable", "Responsable", responsable_resultado),
@@ -6917,22 +7145,52 @@ elif st.session_state.menu_activo == "oficios":
                 f'<div class="exp-etapa-nota">{dato_visible(nota)}</div></div>'
             )
 
+        # Únicamente el estatus exacto "Firmado" utiliza fondo verde.
+        # Todos los demás estatus (incluidas revisiones, firma y correcciones)
+        # utilizan fondo rojo, sin modificar el estado real del expediente.
+        estado_cabecera = str(estatus_resultado or "").strip().casefold()
+        if estado_cabecera == "firmado":
+            clase_cabecera = "exp-cabecera-firmado"
+        else:
+            clase_cabecera = "exp-cabecera-pendiente"
+
+        st.markdown("""
+        <style>
+        .exp-cabecera.exp-cabecera-firmado {
+            background:linear-gradient(112deg,#205743,#307357)!important;
+            border-left-color:#B9D9B7!important;
+        }
+        .exp-cabecera.exp-cabecera-pendiente {
+            background:linear-gradient(112deg,#8D3437,#AD4548)!important;
+            border-left-color:#E6B2A7!important;
+        }
+        .exp-cabecera .exp-estado {
+            font-size:15px!important;
+            font-weight:800!important;
+            padding:8px 17px!important;
+            background:rgba(255,255,255,.13)!important;
+            border:1px solid rgba(255,255,255,.55)!important;
+            color:#FFFFFF!important;
+            letter-spacing:.2px;
+        }
+        @media(max-width:650px) {
+            .exp-cabecera .exp-estado {font-size:14px!important;padding:7px 13px!important}
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
         st.markdown(f"""
         <div class="exp-titulo"><strong>Detalle del expediente</strong>
-          <p>Información general y seguimiento del oficio seleccionado</p></div>
+          <p>Información general · Seguimiento documental</p></div>
         <div class="exp-panel" style="border-bottom:0;border-radius:10px 10px 0 0">
-          <div class="exp-cabecera"><div class="exp-cabecera-fila">
-            <div><div class="exp-eyebrow">EXPEDIENTE LOCALIZADO</div>
+          <div class="exp-cabecera {clase_cabecera}"><div class="exp-cabecera-fila">
+            <div><div class="exp-eyebrow">CONTROL DOCUMENTAL / EXPEDIENTE</div>
               <div class="exp-numero">{dato_visible(numero_resultado or folio_resultado)}</div>
               <div class="exp-proyecto">{dato_visible(proyecto_resultado, 'Proyecto no especificado')}</div>
             </div><div class="exp-estado">{dato_visible(estatus_resultado, 'Sin estatus')}</div>
           </div></div>
         </div>
         """, unsafe_allow_html=True)
-
-        if es_administrador():
-            with st.expander("🗑 Eliminar este oficio · Confirmación obligatoria", expanded=False):
-                _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
 
         if not puede_editar_responsable(responsable_resultado):
             if es_administrador():
@@ -6946,20 +7204,35 @@ elif st.session_state.menu_activo == "oficios":
         else:
             st.caption("Para editar un dato, utiliza el icono ✎ junto al nombre del campo.")
 
+        # Distribución jerárquica: tres datos breves, dos datos descriptivos
+        # y asunto a todo el ancho. Conserva cada widget y su clave original.
         with st.container(key="expediente_campos"):
-            for inicio_fila in (0, 3):
-                columnas = st.columns(3, gap="small")
-                for columna_st, campo in zip(columnas, campos[inicio_fila:inicio_fila + 3]):
-                    with columna_st:
-                        editar_campo(*campo)
+            fila_identificacion = st.columns(3, gap="small")
+            for columna_st, campo in zip(fila_identificacion, campos[:3]):
+                with columna_st:
+                    editar_campo(*campo)
+
+            fila_contexto = st.columns([1, 2], gap="small")
+            with fila_contexto[0]:
+                editar_campo(*campos[3])  # Fecha de recepción
+            with fila_contexto[1]:
+                editar_campo(*campos[4])  # Proyecto
+
+            # El asunto no compite por espacio con las demás tarjetas.
+            editar_campo(*campos[5])
 
         st.markdown(f"""
-        <div class="exp-panel" style="border-radius:0 0 10px 10px;border-top:0;margin-top:0px">
+        <div class="exp-panel" style="border-radius:9px;border:1px solid #DEDAD1;margin-top:12px">
           <div class="exp-seguimiento"><div class="exp-seguimiento-label">SEGUIMIENTO DEL TRÁMITE</div>
             <div class="exp-etapas">{etapas_html}</div>
           </div>
         </div>
         """, unsafe_allow_html=True)
+
+        # Acciones administrativas al final del resumen, sin alterar sus permisos.
+        if es_administrador():
+            with st.expander("⚙ Acciones administrativas · Eliminar oficio", expanded=False):
+                _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
 
         # =====================================================
         # DOCUMENTOS DEL EXPEDIENTE
