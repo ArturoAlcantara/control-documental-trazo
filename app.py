@@ -378,6 +378,8 @@ def mostrar_login():
 
 
 def mostrar_sesion():
+    if st.session_state.get("menu_activo") in ("oficios", "pendientes", "urgentes", "firmados"):
+        return  # Sesión y cierre están en la barra institucional del módulo.
     col_sesion1, col_sesion2 = st.columns([6, 1])
     with col_sesion2:
         rol = st.session_state.get("rol", "auxiliar")
@@ -400,6 +402,7 @@ def mostrar_sesion():
             st.session_state.cargo_institucional = ""
             st.session_state.responsable_oficios = ""
             st.session_state.menu_activo = "home"
+            st.session_state.pop("area_actual", None)
             st.session_state.pop("pend_bandeja", None)
             st.rerun()
 
@@ -412,6 +415,284 @@ if not st.session_state.autenticado:
     mostrar_login()
     st.stop()
 
+
+# =========================================================
+# SEPARACIÓN DE ÁREAS — ANTES DE CARGAR DISEÑO GEOMÉTRICO
+# =========================================================
+# Los IDs son las claves [usuarios.<id>] en secrets.toml, NO nombres mostrados.
+# Solo estas dos cuentas pueden cambiar de área.
+USUARIOS_DOS_AREAS = frozenset({"alondra", "arturo"})
+AREAS_DISPONIBLES = {"diseno": "Diseño Geométrico", "setf": "Sistemas Eléctricos de Tracción Ferroviaria"}
+
+
+def areas_autorizadas():
+    exigir_sesion()
+    usuario = identificador_sesion()
+    if usuario in USUARIOS_DOS_AREAS:
+        return ("diseno", "setf")
+    # La adscripción solo la controla secrets.toml, nunca un parámetro de URL
+    # ni una selección hecha por el navegador.
+    try:
+        area = str(st.secrets["usuarios"][usuario].get("area", "diseno")).strip().lower()
+    except (KeyError, TypeError):
+        area = "diseno"
+    if area not in AREAS_DISPONIBLES:
+        raise ValueError("Área no válida para esta cuenta. Revisa [usuarios.*].area en Secrets.")
+    return (area,)
+
+
+autorizadas = areas_autorizadas()
+if st.session_state.get("area_actual") not in autorizadas:
+    st.session_state.area_actual = None if len(autorizadas) == 2 else autorizadas[0]
+
+
+def cerrar_sesion_selector():
+    _cookies_sesion["sesion"] = ""
+    _cookies_sesion.save()
+    for clave, valor in {
+        "autenticado": False, "usuario_actual": None, "usuario_id": None,
+        "rol": "auxiliar", "cargo_institucional": "", "responsable_oficios": "",
+        "area_actual": None, "menu_activo": "home",
+    }.items():
+        st.session_state[clave] = valor
+    st.session_state.pop("pend_bandeja", None)
+    st.rerun()
+
+
+def _imagen_selector(nombre):
+    """Codifica imágenes locales; si faltan, mantiene el selector utilizable."""
+    ruta = Path(__file__).resolve().parent / "assets" / nombre
+    if not ruta.is_file():
+        return ""
+    mime = "image/png" if ruta.suffix.lower() == ".png" else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(ruta.read_bytes()).decode('ascii')}"
+
+
+def mostrar_selector_areas():
+    fondo = _imagen_selector("fondo_selector.png")
+    foto_diseno = _imagen_selector("tarjeta_diseno.png")
+    foto_setf = _imagen_selector("tarjeta_setf.png")
+    logo = _imagen_selector("logo_selector.png")
+    # Identificación de versión y comprobación de recursos SOLO en el selector.
+    # Si aparece este código, Streamlit está ejecutando el app.py correcto.
+    recursos = {
+        "fondo_selector.png": fondo,
+        "tarjeta_diseno.png": foto_diseno,
+        "tarjeta_setf.png": foto_setf,
+        "logo_selector.png": logo,
+    }
+    faltantes = [nombre for nombre, contenido in recursos.items() if not contenido]
+    if faltantes:
+        st.warning(
+            "Faltan imágenes en la carpeta assets junto a este app.py: "
+            + ", ".join(faltantes)
+            + ". Carpeta esperada: "
+            + str(Path(__file__).resolve().parent / "assets")
+        )
+
+    # CSS exclusivo del selector; el resto del sistema no recibe estos estilos.
+    fondo_css = (f'linear-gradient(90deg,rgba(247,249,250,.74),rgba(250,251,251,.84)),url("{fondo}")'
+                 if fondo else 'linear-gradient(130deg,#eef3f6,#fafafa)')
+    st.markdown(f"""
+    <style>
+    [data-testid="stAppViewContainer"] {{
+       background-image:{fondo_css} !important;
+       background-position:center center !important;
+       background-size:cover !important;
+       background-attachment:fixed !important;
+    }}
+    [data-testid="stHeader"] {{background:transparent!important;}}
+    #MainMenu, footer {{visibility:hidden;}}
+    .block-container {{padding-top:.35rem!important;padding-bottom:0!important;max-width:1480px!important;}}
+    [data-testid="stAppViewContainer"] {{overflow-y:auto;}}
+    @media(min-width:1000px) and (min-height:700px) {{
+       [data-testid="stAppViewContainer"] {{overflow-y:hidden!important;}}
+    }}
+    [data-testid="stHeader"] {{height:0!important;min-height:0!important;}}
+    [data-testid="stToolbar"] {{display:none!important;}}
+    [data-testid="stMainBlockContainer"] > div {{gap:0!important;}}
+    /* Compactamos únicamente la portada sin afectar los módulos de oficios. */
+    /* La franja se extiende a toda la pantalla, pero solo en este selector. */
+    [data-testid="stAppViewContainer"]::before {{
+       content:"";position:fixed;top:0;left:0;right:0;height:100px;
+       background:linear-gradient(110deg,#102235,#20374a);z-index:0;
+       border-bottom:1px solid rgba(200,164,96,.3);
+    }}
+    .selector-cabecera {{height:72px;display:flex;align-items:center;gap:18px;color:white;position:relative;z-index:1;transform:translateY(-22px);}}
+    .selector-logo {{width:76px;height:62px;object-fit:contain;}}
+    .selector-marca {{border-left:1px solid #caa45e;padding-left:20px;line-height:1.1}}
+    .selector-marca strong {{font-size:23px;letter-spacing:1.4px;display:block;color:#fff}}
+    .selector-marca span {{font-size:11px;letter-spacing:3.5px;display:block;color:#d5dce3;margin-top:8px}}
+    .selector-sesion {{color:#e7edf3;text-align:right;padding-top:0;font-size:12px;transform:translateY(-22px);}}
+    .selector-sesion strong {{font-size:15px;color:white;display:block;margin-top:4px}}
+    .selector-hero {{text-align:center;margin:28px auto 42px;}}
+    .selector-eyebrow {{color:#a87b34;letter-spacing:3.2px;font-size:12px;font-weight:800}}
+    .selector-rule {{width:46px;height:2px;background:#b8893e;margin:10px auto}}
+    .selector-titulo {{color:#10283b;font-size:clamp(27px,3.2vw,42px);font-weight:850;letter-spacing:-1px;line-height:1.13}}
+    .selector-subtitulo {{color:#657688;font-size:15px;margin-top:9px}}
+    .selector-card {{overflow:hidden;background:rgba(255,255,255,.96);
+       border:1px solid #d7dce0;border-radius:20px;
+       box-shadow:0 10px 28px rgba(13,33,49,.15);height:316px;
+       transition:transform .18s ease,box-shadow .18s ease;}}
+    .selector-card:hover {{transform:translateY(-4px);box-shadow:0 20px 42px rgba(13,33,49,.19)}}
+    .selector-card.diseno {{border-color:#c89b51;}}
+    .selector-foto {{height:126px;position:relative;background-color:#294359;background-size:cover;background-position:center;}}
+    .selector-foto::after {{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(13,35,54,.55),rgba(18,38,57,.12));}}
+    .selector-etiqueta {{position:absolute;top:17px;left:18px;z-index:1;color:#fff;
+       background:rgba(21,36,51,.7);padding:8px 13px;border-radius:7px;
+       font-size:12px;letter-spacing:1px;font-weight:750;}}
+    .diseno .selector-etiqueta {{background:#d3a75d;color:#112a3d;}}
+    .selector-cuerpo {{padding:24px 24px 12px;min-height:166px;position:relative;}}
+    .selector-icono {{position:absolute;top:-25px;left:24px;width:52px;height:52px;
+       display:flex;align-items:center;justify-content:center;
+       background:#172f46;border-radius:13px;color:#d4a656;border:2px solid #d1a358;
+       font-size:27px;box-shadow:0 5px 15px rgba(9,28,44,.25);}}
+    .selector-nombre {{font-size:21px;font-weight:820;color:#11283e;line-height:1.18;margin-top:10px;min-height:49px}}
+     .selector-descripcion {{font-size:13px;color:#637485;line-height:1.55;margin-top:5px}}
+    .selector-pie {{font-size:11px;color:#637585;text-align:center;margin:10px 0 3px;}}
+    /* Botones auténticos de Streamlit: conservan toda la interacción Python. */
+    [class*="st-key-seleccionar_diseno"] button,
+    [class*="st-key-seleccionar_setf"] button {{
+       min-height:48px!important;border-radius:9px!important;font-size:14px!important;
+       font-weight:750!important;transition:all .2s ease!important;margin-top:2px!important;
+    }}
+    [class*="st-key-seleccionar_diseno"] button {{background:#c79a4d!important;color:white!important;border:1px solid #bd9043!important}}
+    [class*="st-key-seleccionar_diseno"] button:hover {{background:#b78b41!important;}}
+    [class*="st-key-seleccionar_setf"] button {{background:rgba(255,255,255,.94)!important;color:#142c40!important;border:1px solid #9caebc!important}}
+    [class*="st-key-seleccionar_setf"] button:hover {{background:#edf2f5!important;}}
+    [class*="st-key-salir_selector"] {{display:flex;align-items:center;min-height:104px;transform:translateY(-22px);}}
+    [class*="st-key-salir_selector"] button {{background:transparent!important;color:#fff!important;
+       border:1px solid #cca75f!important;border-radius:9px!important;min-height:43px!important;}}
+    [class*="st-key-salir_selector"] button:hover {{background:#334b60!important;color:#fff!important;}}
+    @media(max-width:900px) {{
+       .selector-marca strong {{font-size:17px;}}.selector-marca span {{font-size:9px;}}
+       .selector-logo {{width:55px;}}.selector-hero {{margin-top:22px;}}
+       .selector-card {{height:290px;}}.selector-foto {{height:115px;}}
+       .selector-nombre {{font-size:19px;}}.selector-cuerpo {{padding-left:17px;padding-right:17px;}}
+    }}
+    @media(min-width:901px) and (max-height:760px) {{
+       .selector-hero {{margin:16px auto 27px;}}
+       .selector-titulo {{font-size:34px;}}
+       .selector-card {{height:258px;}}
+       .selector-foto {{height:106px;}}
+       .selector-cuerpo {{padding-top:21px;}}
+       .selector-pie {{margin-top:5px;}}
+    }}
+    @media(max-width:640px) {{
+       .selector-marca strong {{font-size:13px;}}
+       .selector-marca span {{font-size:8px;letter-spacing:1px;}}
+       .selector-hero {{margin:15px auto 22px;}}
+       .selector-card {{height:auto;min-height:235px;}}
+       .selector-foto {{height:110px;}}
+       .selector-cuerpo {{min-height:125px;}}
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+
+    nav_izq, nav_usuario, nav_salir = st.columns([4.3, 1.55, 1.2], gap="medium", vertical_alignment="center")
+    with nav_izq:
+        marca_logo = f'<img class="selector-logo" src="{logo}" alt="Logotipo">' if logo else '<span style="font-size:34px;color:#d3a75d">▰</span>'
+        st.markdown(f"""<div class="selector-cabecera">{marca_logo}<div class="selector-marca">
+            <strong>CONTROL DOCUMENTAL</strong><span>INFRAESTRUCTURA FERROVIARIA</span>
+            </div></div>""", unsafe_allow_html=True)
+    with nav_usuario:
+        # Nombre institucional del selector, independiente del tratamiento en Secrets.
+        usuario_actual_id = identificador_sesion()
+        if usuario_actual_id == "alondra" or any(
+            palabra in str(st.session_state.get("usuario_actual") or "").casefold()
+            for palabra in ("alondra", "barajas")
+        ):
+            nombre = "Tte. Alondra Barajas"
+        else:
+            nombre = html.escape(str(st.session_state.get("usuario_actual") or "Usuario"))
+        # Chrome puede traducir "Tte." como "Señora" incluso cuando la UI ya está en español.
+        # Restringir la traducción en el propio elemento del nombre, no en toda la página.
+        st.markdown(
+            f'<div class="selector-sesion">Sesión:'
+            f'<strong class="notranslate" translate="no" lang="es-MX">{nombre}</strong>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with nav_salir:
+        if st.button("↪ Cerrar sesión", key="salir_selector", use_container_width=True):
+            cerrar_sesion_selector()
+
+    st.markdown("""<div class="selector-hero">
+      <div class="selector-eyebrow">CONTROL DOCUMENTAL · ACCESO INSTITUCIONAL</div>
+      <div class="selector-rule"></div>
+      <div class="selector-titulo">Selecciona tu área de trabajo</div>
+      <div class="selector-subtitulo">Elige la mesa de trabajo que deseas consultar.</div>
+      </div>""", unsafe_allow_html=True)
+
+    espacio_izq, columna_diseno, columna_setf, espacio_der = st.columns([.4, 4.8, 4.8, .4], gap="large")
+    with columna_diseno:
+        foto = f'background-image:url(\'{foto_diseno}\')' if foto_diseno else 'background:linear-gradient(115deg,#1a374f,#a77d49)'
+        st.markdown(f"""<div class="selector-card diseno">
+          <div class="selector-foto" style="{foto}"><span class="selector-etiqueta">✓ &nbsp; ÁREA ACTIVA</span></div>
+          <div class="selector-cuerpo"><div class="selector-icono">◩</div>
+          <div class="selector-nombre">Diseño Geométrico</div>
+          <div class="selector-descripcion">Registro y seguimiento de oficios, revisión y firmas.</div>
+          </div></div>""", unsafe_allow_html=True)
+        if st.button("Ingresar a Diseño Geométrico  →", key="seleccionar_diseno", type="primary", use_container_width=True):
+            st.session_state.area_actual = "diseno"
+            st.session_state.menu_activo = "home"
+            st.rerun()
+    with columna_setf:
+        foto = f'background-image:url(\'{foto_setf}\')' if foto_setf else 'background:linear-gradient(115deg,#314b60,#92a2aa)'
+        st.markdown(f"""<div class="selector-card setf">
+          <div class="selector-foto" style="{foto}"><span class="selector-etiqueta">◷ &nbsp; PRÓXIMAMENTE</span></div>
+          <div class="selector-cuerpo"><div class="selector-icono" style="color:white;border-color:#dce5ed">ϟ</div>
+          <div class="selector-nombre">Sistemas Eléctricos de<br>Tracción Ferroviaria</div>
+          <div class="selector-descripcion">Vista preliminar. Próximamente, gestión documental de SETF.</div>
+          </div></div>""", unsafe_allow_html=True)
+        if st.button("Visualizar interfaz SETF  →", key="seleccionar_setf", use_container_width=True):
+            st.session_state.area_actual = "setf"
+            st.session_state.menu_activo = "home"
+            st.rerun()
+    st.markdown('<div class="selector-pie">ⓘ &nbsp; La selección de áreas está disponible únicamente para Alondra y Arturo.<br><span style="font-size:10px;opacity:.65;letter-spacing:.8px">INTERFAZ INSTITUCIONAL · VERSIÓN VISUAL 2.4</span></div>', unsafe_allow_html=True)
+
+
+if len(autorizadas) == 2 and st.session_state.area_actual is None:
+    mostrar_selector_areas()
+    st.stop()
+
+if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "oficios", "pendientes", "urgentes", "firmados"):
+    espacio, cambiar = st.columns([5,1])
+    with cambiar:
+        if st.button("⇄ Cambiar de área", key="cambiar_area_institucional", use_container_width=True):
+            st.session_state.area_actual = None
+            st.session_state.menu_activo = "home"
+            st.session_state.pop("pend_bandeja", None)
+            st.rerun()
+
+# Vista provisional SETF integrada en el mismo archivo.
+def mostrar_setf():
+    st.markdown("""<div style='text-align:center;padding:38px 0 24px'>
+       <div style='font-size:12px;letter-spacing:3px;color:#a17a3e;font-weight:750'>MESA DE TRABAJO · SETF</div>
+       <h1 style='color:#10283b'>Sistemas Eléctricos de Tracción Ferroviaria</h1>
+       <p style='color:#647484;font-size:17px'>Control documental</p></div>""", unsafe_allow_html=True)
+    a,b = st.columns(2, gap="large")
+    with a:
+        with st.container(border=True):
+            st.subheader("📁 Gestión de oficios")
+            st.write("Espacio reservado para los oficios de SETF.")
+            st.button("Próximamente", key="setf_oficios", disabled=True, use_container_width=True)
+    with b:
+        with st.container(border=True):
+            st.subheader("📋 Seguimiento documental")
+            st.write("Espacio reservado para pendientes, revisiones y firmas.")
+            st.button("Próximamente", key="setf_seguimiento", disabled=True, use_container_width=True)
+    st.info("Vista provisional: SETF todavía no consulta, registra ni modifica documentos.")
+
+
+if st.session_state.area_actual == "setf":
+    _, cerrar = st.columns([6,1])
+    with cerrar:
+        st.caption(f"Sesión: {st.session_state.usuario_actual}")
+        if st.button("Cerrar sesión", key="salir_setf", use_container_width=True):
+            cerrar_sesion_selector()
+    mostrar_setf()
+    st.stop()
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -830,6 +1111,22 @@ def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No esp
                                   f"Procedencia: {procedencia}. Entregado/elaborado por: {origen or 'No indicado'}")
     except Exception as error:
         st.warning(f"La versión quedó guardada, pero falló el registro de procedencia: {error}")
+    # Se guarda también una copia PDF privada e inmutable para el historial.
+    # El Word original permanece porque las correcciones requieren DOCX editable.
+    try:
+        _archivar_pdf_borrador(
+            folio, numero,
+            {"Folio": str(folio), "No. de oficio": str(numero),
+             "Version": version, "Nombre": subido["nombre"],
+             "Drive ID": subido["id"]},
+            docx_bytes=archivo.getvalue(),
+        )
+    except Exception as error:
+        st.warning(
+            "La versión Word quedó registrada, pero su copia histórica PDF está "
+            "pendiente de generar. Se podrá preparar después desde el historial. "
+            f"Detalle: {_mensaje_error_sheets(error)}"
+        )
     return subido
 
 
@@ -975,6 +1272,922 @@ def _descargar_docx_drive(drive_id):
     return respuesta.content
 
 
+
+def _convertir_word_pdf_privado(documento_word):
+    """Convierte el Word original a PDF localmente sin publicar ni modificar Drive.
+
+    Prioridad: LibreOffice. En Windows, también admite Word por COM (PowerShell
+    sin dependencias Python adicionales, o pywin32 como alternativa).
+    Nunca sustituye el documento por un PDF reconstruido de manera incompleta.
+    """
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    import zipfile
+
+    if not documento_word or not zipfile.is_zipfile(BytesIO(documento_word)):
+        raise ValueError("El archivo de origen no es un documento Word .docx válido.")
+
+    with tempfile.TemporaryDirectory(prefix="revision_word_pdf_") as tmp:
+        carpeta = Path(tmp)
+        archivo_word = carpeta / "documento_original.docx"
+        archivo_pdf = carpeta / "documento_original.pdf"
+        archivo_word.write_bytes(documento_word)
+        intentos = []
+
+        # 1. LibreOffice, preferido por no requerir Microsoft Word ni pywin32.
+        candidatos = [shutil.which("soffice"), shutil.which("libreoffice")]
+        if sys.platform.startswith("win"):
+            candidatos.extend(
+                str(Path(directorio) / "LibreOffice" / "program" / "soffice.exe")
+                for directorio in (
+                    os.getenv("PROGRAMFILES", r"C:\Program Files"),
+                    os.getenv("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                    os.getenv("LOCALAPPDATA", ""),
+                ) if directorio
+            )
+        ejecutable = next((c for c in candidatos if c and Path(c).is_file()), None)
+        if ejecutable:
+            try:
+                perfil = (carpeta / "perfil_libreoffice").as_uri()
+                proceso = subprocess.run(
+                    [ejecutable, f"-env:UserInstallation={perfil}", "--headless",
+                     "--convert-to", "pdf:writer_pdf_Export", "--outdir",
+                     str(carpeta), str(archivo_word)],
+                    capture_output=True, text=True, timeout=120, check=False,
+                )
+                if proceso.returncode != 0 or not archivo_pdf.is_file():
+                    intentos.append("LibreOffice: " +
+                                   (proceso.stderr or proceso.stdout or "No generó un PDF.").strip()[:200])
+            except (OSError, subprocess.TimeoutExpired) as error:
+                intentos.append("LibreOffice: " + str(error)[:200])
+        else:
+            intentos.append("LibreOffice no está instalado o no se encontró su ejecutable.")
+
+        # 2. Word instalado en el escritorio Windows: PowerShell crea el objeto COM
+        #    sin exigir que el entorno Python tenga instalado 'pythoncom'.
+        if not archivo_pdf.is_file() and sys.platform.startswith("win"):
+            powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+            if powershell:
+                script = r"""
+$ErrorActionPreference = 'Stop'
+$word = $null
+$documento = $null
+try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
+    try { $word.AutomationSecurity = 3 } catch {}
+    $documento = $word.Documents.Open($env:PDF_WORD_ORIGEN, $false, $true)
+    $documento.ExportAsFixedFormat($env:PDF_WORD_DESTINO, 17)
+} finally {
+    if ($null -ne $documento) {
+        try { $documento.Close(0) } catch {}
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($documento)
+    }
+    if ($null -ne $word) {
+        try { $word.Quit() } catch {}
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($word)
+    }
+}
+"""
+                entorno = os.environ.copy()
+                entorno["PDF_WORD_ORIGEN"] = str(archivo_word)
+                entorno["PDF_WORD_DESTINO"] = str(archivo_pdf)
+                try:
+                    proceso = subprocess.run(
+                        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+                        env=entorno, capture_output=True, text=True, timeout=120,
+                        check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if proceso.returncode != 0 or not archivo_pdf.is_file():
+                        intentos.append("Microsoft Word: " +
+                                       (proceso.stderr or proceso.stdout or "No generó el PDF.").strip()[:200])
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    intentos.append("Microsoft Word: " + str(error)[:200])
+            else:
+                intentos.append("No se encontró PowerShell para ejecutar Microsoft Word.")
+
+        # 3. Alternativa adicional para instalaciones donde Word COM + pywin32
+        #    ya esté configurado. No se requiere que pythoncom exista para probar
+        #    la vía anterior.
+        if not archivo_pdf.is_file() and sys.platform.startswith("win"):
+            word_app = None
+            documento = None
+            pythoncom_mod = None
+            try:
+                import pythoncom as pythoncom_mod
+                import win32com.client
+                pythoncom_mod.CoInitialize()
+                word_app = win32com.client.DispatchEx("Word.Application")
+                word_app.Visible = False
+                word_app.DisplayAlerts = 0
+                documento = word_app.Documents.Open(
+                    str(archivo_word), ReadOnly=True, AddToRecentFiles=False
+                )
+                documento.ExportAsFixedFormat(str(archivo_pdf), 17)
+            except ModuleNotFoundError:
+                intentos.append("pywin32 no está instalado (opcional si funciona Word o LibreOffice).")
+            except Exception as error:
+                intentos.append("Word/pywin32: " + str(error)[:200])
+            finally:
+                if documento is not None:
+                    try:
+                        documento.Close(False)
+                    except Exception:
+                        pass
+                if word_app is not None:
+                    try:
+                        word_app.Quit()
+                    except Exception:
+                        pass
+                if pythoncom_mod is not None:
+                    try:
+                        pythoncom_mod.CoUninitialize()
+                    except Exception:
+                        pass
+
+        if not archivo_pdf.is_file():
+            diagnostico = " | ".join(intentos[-2:])
+            raise RuntimeError(
+                "No se pudo generar el PDF en este equipo. "
+                "Instala LibreOffice desde libreoffice.org y reinicia Streamlit; "
+                "o utiliza Microsoft Word instalado en Windows. "
+                "Como alternativa, instala pywin32 con: python -m pip install pywin32. "
+                "Tu Word sigue disponible y no se modificó. "
+                + ("Detalles: " + diagnostico if diagnostico else "")
+            )
+        pdf = archivo_pdf.read_bytes()
+        if not pdf.startswith(b"%PDF-") or len(pdf) < 200:
+            raise RuntimeError("La conversión devolvió un archivo que no es un PDF válido.")
+        return pdf
+
+
+# ================================================================
+# HISTORIAL DOCUMENTAL EN PDF + VISTA PREVIA PRIVADA
+# ================================================================
+# Nunca se borran ni sobreescriben los Word originales. Son los archivos
+# editables del flujo de correcciones. Los PDF quedan archivados en Drive
+# dentro de la carpeta privada del mismo expediente, con nombre estable.
+
+
+def _nombre_pdf_archivado(version):
+    import hashlib
+    version_num = int(version.get("Version") or 0)
+    original = Path(str(version.get("Nombre") or "documento.docx")).stem
+    original = re.sub(r"[^A-Za-z0-9._-]+", "_", original).strip("._-")[:85] or "documento"
+    origen_id = str(version.get("Drive ID") or "")
+    huella = hashlib.sha256(origen_id.encode("utf-8")).hexdigest()[:12]
+    return f"V{version_num:02d}_{original}_{huella}.pdf"
+
+
+def _buscar_pdf_archivado(folio, numero, version):
+    """Consulta el PDF privado si ya fue archivado para este DOCX concreto."""
+    nombre = _nombre_pdf_archivado(version)
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    # Nombre generado solo con [A-Za-z0-9._-], seguro para la consulta de Drive.
+    consulta = (
+        f"'{carpeta}' in parents and name = '{nombre}' "
+        "and mimeType = 'application/pdf' and trashed = false"
+    )
+    respuesta = _drive_sesion().get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={"q": consulta, "fields": "files(id,name,mimeType,webViewLink),nextPageToken",
+                "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
+                "pageSize": 20},
+        timeout=30,
+    )
+    archivos = _drive_json(respuesta, "consultar archivo PDF del historial").get("files", [])
+    return archivos[0] if archivos else None
+
+
+def _subir_pdf_archivado(folio, numero, version, pdf_bytes):
+    """Almacena el PDF en la misma carpeta privada que el Word sin crear duplicados."""
+    if not isinstance(pdf_bytes, bytes) or not pdf_bytes.startswith(b"%PDF-"):
+        raise ValueError("La conversión no generó un PDF válido.")
+    if len(pdf_bytes) > 40 * 1024 * 1024:
+        raise ValueError("El PDF supera los 40 MB permitidos para esta copia histórica.")
+    existente = _buscar_pdf_archivado(folio, numero, version)
+    if existente:
+        return existente["id"], False
+
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    nombre = _nombre_pdf_archivado(version)
+    sesion = _drive_sesion()
+    inicio = sesion.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,name",
+                "supportsAllDrives": "true"},
+        json={"name": nombre, "parents": [carpeta], "mimeType": "application/pdf"},
+        headers={"X-Upload-Content-Type": "application/pdf",
+                 "X-Upload-Content-Length": str(len(pdf_bytes))},
+        timeout=30,
+    )
+    if not inicio.ok:
+        _drive_json(inicio, "iniciar archivo PDF del historial")
+    url_subida = inicio.headers.get("Location", "")
+    if not url_subida.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Drive no devolvió una URL segura para archivar el PDF.")
+    fin = sesion.put(
+        url_subida, data=pdf_bytes,
+        headers={"Content-Type": "application/pdf",
+                 "Content-Length": str(len(pdf_bytes))}, timeout=120,
+    )
+    archivo = _drive_json(fin, "guardar PDF histórico")
+    return archivo["id"], True
+
+
+def _descargar_pdf_privado(drive_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", str(drive_id)):
+        raise ValueError("ID de archivo PDF no válido.")
+    respuesta = _drive_sesion().get(
+        f"https://www.googleapis.com/drive/v3/files/{drive_id}",
+        params={"alt": "media", "supportsAllDrives": "true"}, timeout=90,
+    )
+    if not respuesta.ok:
+        raise RuntimeError(f"No se pudo consultar el PDF privado (HTTP {respuesta.status_code}).")
+    data = respuesta.content
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("La copia en Drive no es un PDF válido.")
+    return data
+
+
+def _archivar_pdf_borrador(folio, numero, version, docx_bytes=None):
+    """Obtiene la copia PDF; las versiones antiguas se convierten una sola vez."""
+    _verificar_expediente_documental(folio, numero)
+    documento_id = str(version.get("Drive ID") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", documento_id):
+        raise ValueError("Esta versión no tiene un Word de origen válido en Drive.")
+    previo = _buscar_pdf_archivado(folio, numero, version)
+    if previo:
+        return _descargar_pdf_privado(previo["id"])
+
+    origen = docx_bytes if docx_bytes is not None else _descargar_docx_drive(documento_id)
+    convertido = _convertir_word_pdf_privado(origen)
+    pdf_id, creado = _subir_pdf_archivado(folio, numero, version, convertido)
+    if creado:
+        # La bitácora es complementaria: el PDF seguirá localizable por su
+        # nombre estable aunque falle el registro de este evento.
+        try:
+            _registrar_evento_borrador(
+                folio, numero, int(version.get("Version") or 0),
+                "PDF histórico archivado",
+                "Copia de lectura: " + _nombre_pdf_archivado(version),
+            )
+        except Exception as error:
+            st.warning("El PDF se archivó en Drive, pero la bitácora no pudo actualizarse: "
+                       + _mensaje_error_sheets(error))
+    return convertido
+
+
+def _mostrar_pdf_privado(pdf_bytes, clave):
+    """Vista previa embebida con visor local; nunca se publica el PDF en una URL."""
+    if not isinstance(pdf_bytes, bytes) or not pdf_bytes.startswith(b"%PDF-"):
+        st.error("No se puede mostrar un PDF inválido.")
+        return
+    try:
+        from streamlit_pdf_viewer import pdf_viewer
+        pdf_viewer(pdf_bytes, width="100%", height=690, key=clave)
+        return
+    except ImportError:
+        pass
+    except Exception as error:
+        st.warning("El visor adicional no pudo abrir el documento: " + str(error)[:170])
+    if hasattr(st, "pdf"):
+        try:
+            st.pdf(pdf_bytes, height=690)
+            return
+        except Exception as error:
+            st.warning("El visor integrado no está disponible: " + str(error)[:170])
+    st.info("Para visualizar el PDF aquí mismo, instala en el entorno de Streamlit: "
+            "python -m pip install streamlit-pdf-viewer. "
+            "La descarga PDF seguirá funcionando sin el visor.")
+
+
+def _enlace_pdf_drive(archivo):
+    """Enlace de visualización de Drive para un PDF privado ya archivado.
+
+    El link no modifica permisos. Google Drive exige que la persona tenga
+    acceso al archivo o a la carpeta que lo contiene.
+    """
+    from urllib.parse import urlparse
+
+    drive_id = str((archivo or {}).get("id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", drive_id):
+        raise ValueError("El PDF archivado no tiene un ID de Drive válido.")
+    url_oficial = str((archivo or {}).get("webViewLink") or "").strip()
+    if url_oficial:
+        parsed = urlparse(url_oficial)
+        if parsed.scheme == "https" and parsed.hostname in ("drive.google.com", "docs.google.com"):
+            return url_oficial
+    return f"https://drive.google.com/file/d/{drive_id}/view"
+
+
+def _fila_version_pdf(folio, numero, version, version_vigente=False, *, compacto=False):
+    """Histórico PDF en Drive: enlace directo, sin descargas ni visor duplicado.
+
+    Las versiones DOCX de origen se conservan para recuperación y auditoría.
+    Una versión antigua sin copia PDF ofrece archivarla una única vez.
+    """
+    import hashlib
+
+    n = int(version.get("Version") or 0)
+    doc_id = str(version.get("Drive ID") or "")
+    clave = "hist_pdf_" + hashlib.sha256(
+        f"{folio}|{numero}|{n}|{doc_id}".encode("utf-8")
+    ).hexdigest()[:18]
+    titulo = f"V{n:02d} · {Path(str(version.get('Nombre') or 'documento')).stem}.pdf"
+
+    try:
+        archivo = _buscar_pdf_archivado(folio, numero, version)
+    except Exception as error:
+        st.warning("No fue posible consultar el archivo histórico en Drive: " +
+                   _mensaje_error_sheets(error))
+        return
+
+    if archivo:
+        # Abre el PDF real en Drive; los permisos siguen controlados por Google.
+        url = _enlace_pdf_drive(archivo)
+        if compacto:
+            st.markdown(
+                '<div class="hist-pdf-link-row">'
+                '<span class="hist-pdf-mark">PDF</span>'
+                f'<span class="hist-pdf-filename" title="{html.escape(titulo, quote=True)}">'
+                f'{html.escape(titulo)}</span>'
+                f'<a class="hist-pdf-open" href="{html.escape(url, quote=True)}" '
+                'target="_blank" rel="noopener noreferrer" '
+                'aria-label="Abrir PDF histórico en Google Drive">'
+                'Abrir en Drive ↗</a></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="padding:9px 12px;border-left:2px solid #B9936C;'
+                'border-bottom:1px solid #E0D5CB;background:rgba(255,254,251,.65);'
+                'border-radius:4px 7px 7px 4px">'
+                f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+                'rel="noopener noreferrer" '
+                'style="color:#604551;font-weight:700;text-decoration:none">'
+                f'📑 {html.escape(titulo)} &nbsp; ↗ Abrir en Google Drive'
+                '</a></div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Archivo PDF histórico · " + str(version.get("Fecha registro") or "Sin fecha") +
+                       " · Requiere acceso a Google Drive")
+    else:
+        if compacto:
+            st.markdown(
+                f'<div class="hist-pdf-pending">PDF de V{n:02d} pendiente de archivar en Drive</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(f"**📑 {html.escape(titulo)}**", unsafe_allow_html=True)
+            st.caption("Esta versión aún no tiene PDF archivado en Google Drive.")
+        if st.button("↻ Archivar PDF histórico en Drive", key=f"{clave}_archivar",
+                     use_container_width=True):
+            try:
+                with st.spinner("Convirtiendo y guardando el PDF histórico en Drive..."):
+                    _archivar_pdf_borrador(folio, numero, version)
+                st.rerun()
+            except Exception as error:
+                st.error("No se pudo archivar el PDF histórico: " +
+                         _mensaje_error_sheets(error))
+
+
+
+
+def _eventos_agrupados_por_version(movimientos):
+    """Organiza el histórico según la versión REAL registrada en Sheets.
+
+    No se infieren versiones a partir de la fecha ni se trasladan comentarios
+    de una versión a la siguiente. Cada decisión queda junto al Word revisado.
+    """
+    por_version = {}
+    no_asignados = []
+    for evento in movimientos:
+        try:
+            numero_version = int(str(evento.get("Version") or "").strip())
+            if numero_version < 1:
+                raise ValueError("Número inválido")
+        except (ValueError, TypeError):
+            no_asignados.append(evento)
+            continue
+        por_version.setdefault(numero_version, []).append(evento)
+    # Las fechas se guardan como ISO 8601; garantiza el orden histórico.
+    for relacionados in por_version.values():
+        relacionados.sort(key=lambda e: str(e.get("Fecha") or ""))
+    return por_version, no_asignados
+
+
+def _texto_detalle_historial(evento):
+    """Evita mostrar JSON técnico o URLs extensas como si fueran observaciones."""
+    detalle = str(evento.get("Detalle") or "").strip()
+    if not detalle:
+        return ""
+    if detalle.startswith("{"):
+        try:
+            metadatos = json.loads(detalle)
+            if isinstance(metadatos, dict):
+                nombre = str(metadatos.get("nombre") or "").strip()
+                if str(evento.get("Accion") or "").strip() in (
+                    "Word corregido por la Tte.", "PDF corregido por la Tte.",
+                ):
+                    formato = ("PDF" if str(evento.get("Accion") or "").strip().startswith("PDF")
+                               else "Word")
+                    return (f"Documento {formato} con modificaciones adjuntado por la Tte." +
+                            (f" Archivo: {nombre}." if nombre else ""))
+                if nombre:
+                    return f"Documento adjunto: {nombre}."
+                return "Información técnica de archivo registrada en la bitácora."
+        except (ValueError, TypeError):
+            pass
+    return detalle
+
+
+def _historial_version_estilos():
+    """Estilo localizado: no cambia botones, PDFs, autorizaciones ni otros módulos."""
+    st.markdown("""
+    <style>
+    [class*="st-key-hist_pdf_version_"] {
+        background:linear-gradient(145deg,#FFFEFC,#F8F4EF)!important;
+        border:1px solid #D7C6B7!important;
+        border-left:3px solid #B9936C!important;
+        border-radius:10px!important;
+        padding:12px 15px 10px!important;
+        margin:9px 0!important;
+        box-shadow:0 3px 11px rgba(65,48,46,.045)!important;
+    }
+    .hist-version-title {
+        display:flex;justify-content:space-between;align-items:baseline;
+        gap:10px;margin-bottom:5px;color:#493842;font-weight:780;font-size:13px;
+    }
+    .hist-version-date {color:#867A79;font-size:11px;font-weight:500;}
+    .hist-feedback {
+        border-left:2px solid #C69B67;
+        background:linear-gradient(90deg,rgba(191,147,107,.11),rgba(191,147,107,.025));
+        padding:9px 12px;margin:9px 0 6px;border-radius:2px 7px 7px 2px;
+    }
+    .hist-feedback.aprobado {border-left-color:#688C78;background:rgba(104,140,120,.08);}
+    .hist-feedback-title {font-size:11px;font-weight:800;color:#5B4146;margin-bottom:4px;}
+    .hist-feedback-body {font-size:12px;color:#493B42;line-height:1.56;overflow-wrap:anywhere;}
+    .hist-feedback-meta {font-size:10px;color:#897A76;margin-top:4px;}
+    .hist-version-empty {font-size:11px;color:#827874;margin:8px 0 2px;}
+    [class*="st-key-hist_pdf_version_"] [data-testid="stExpander"] {
+        border:1px solid #D8CDC6!important;border-radius:7px!important;
+        background:rgba(250,248,245,.88)!important;
+    }
+    [class*="st-key-hist_pdf_version_"] [data-testid="stExpander"] summary {
+        padding:5px 8px!important;min-height:30px!important;
+    }
+    [class*="st-key-hist_pdf_version_"] [data-testid="stExpander"] summary p {
+        font-size:11px!important;color:#5C4E52!important;
+    }
+    /* Encabezado compacto: Vxx, fecha y enlace en una fila legible. */
+    .hist-version-number {display:flex;align-items:center;gap:9px;font-size:13px;font-weight:800;}
+    .hist-version-number small {font-size:9px;letter-spacing:1.1px;font-weight:800;color:#906C58;}
+    .hist-pdf-link-row {display:flex;align-items:center;gap:9px;min-width:0;
+        padding:5px 8px;background:rgba(255,255,255,.55);
+        border:1px solid rgba(182,145,122,.45);border-radius:7px;}
+    .hist-pdf-mark {font-size:9px;color:#9A4E40;background:#F0DDDA;
+        border:1px solid #D8B2AB;border-radius:4px;padding:4px 5px;font-weight:850;}
+    .hist-pdf-filename {min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;
+        white-space:nowrap;font-size:11px;color:#534943;}
+    .hist-pdf-open {flex-shrink:0;color:#7C4B32!important;text-decoration:none!important;
+        border:1px solid #BF9981;background:#FFFBF7;border-radius:6px;
+        padding:6px 10px;font-size:11px;font-weight:800;white-space:nowrap;}
+    .hist-pdf-open:hover {background:#EDDDCF;color:#50311F!important;}
+    .hist-pdf-pending {color:#85543C;font-size:11px;margin:2px 0;}
+    .hist-quick-summary {display:flex;justify-content:space-between;gap:8px;
+        color:#75665D;font-size:10px;padding:3px 2px 0;}
+    .hist-movement-label {font-size:9px;font-weight:800;letter-spacing:1.3px;
+        margin-top:9px;color:#8B624B;}
+    [class*="st-key-hist_pdf_version_"] [data-testid="stVerticalBlock"] {gap:4px!important;}
+    [class*="st-key-hist_pdf_version_"] [data-testid="stToggle"] label p {font-size:11px!important;}
+    [class*="st-key-hist_pdf_version_"] [data-testid="stToggle"] {margin-top:0!important;}
+    .hist-movement {border-top:1px solid #E8DFD8;padding:7px 0;}
+    .hist-movement strong {display:block;font-size:11px;color:#4B3F44;}
+    .hist-movement span {display:block;font-size:10px;color:#776D6D;}
+    .hist-movement p {font-size:11px;line-height:1.5;color:#574D4F;margin:3px 0 0;overflow-wrap:anywhere;}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _mostrar_movimientos_version(movimientos, numero_version, resumen_actual=False, *, dentro_de_detalle=False):
+    """Comentarios de revisión visibles; demás hechos bajo un desplegable.
+
+    Las observaciones se consultan en EVENTOS_BORRADORES, sin duplicar nada
+    ni editar celdas, y se asignan usando exclusivamente el campo Version.
+    """
+    acciones_decision = {
+        ETAPA_CORRECCIONES: ("↩ Correcciones solicitadas por la Tte.", False),
+        ETAPA_RETORNO_FIRMA: ("↩ Correcciones posteriores a firma", False),
+        ETAPA_FIRMA: ("✓ Autorizado para firma por la Tte.", True),
+    }
+    decisiones = [e for e in movimientos if str(e.get("Accion") or "").strip() in acciones_decision]
+    secundarios = [e for e in movimientos if str(e.get("Accion") or "").strip() not in acciones_decision]
+    for evento in decisiones:
+        accion = str(evento.get("Accion") or "").strip()
+        titulo, aprobado = acciones_decision[accion]
+        detalle = _texto_detalle_historial(evento)
+        detalle_visible = detalle or ("Sin observaciones adicionales." if aprobado
+                                      else "No se registró texto de observaciones.")
+        css = " aprobado" if aprobado else ""
+        st.markdown(
+            f'<div class="hist-feedback{css}">'
+            f'<div class="hist-feedback-title">{html.escape(titulo)}</div>'
+            f'<div class="hist-feedback-body">{html.escape(detalle_visible).replace(chr(10), "<br>")}</div>'
+            f'<div class="hist-feedback-meta">{html.escape(str(evento.get("Usuario") or "Usuario no indicado"))}'
+            f' · {html.escape(str(evento.get("Fecha") or "Sin fecha"))}</div>'
+            '</div>', unsafe_allow_html=True)
+    if not decisiones and not resumen_actual:
+        st.markdown('<div class="hist-version-empty">Sin devolución ni decisión de la Tte. registrada para esta versión.</div>',
+                    unsafe_allow_html=True)
+    if secundarios:
+        def _mostrar_entradas():
+            st.markdown('<div class="hist-movement-label">REGISTRO TÉCNICO</div>',
+                        unsafe_allow_html=True)
+            for evento in secundarios:
+                accion = html.escape(str(evento.get("Accion") or "Movimiento"))
+                fecha = html.escape(str(evento.get("Fecha") or "Sin fecha"))
+                usuario = html.escape(str(evento.get("Usuario") or "Usuario no indicado"))
+                detalle = html.escape(_texto_detalle_historial(evento)).replace("\n", "<br>")
+                st.markdown(
+                    f'<div class="hist-movement"><strong>{accion}</strong>'
+                    f'<span>{fecha} · {usuario}</span>'
+                    + (f'<p>{detalle}</p>' if detalle else "")
+                    + '</div>', unsafe_allow_html=True)
+        if dentro_de_detalle:
+            _mostrar_entradas()
+        else:
+            # Sin expanders anidados, ya que historial puede vivir dentro
+            # de otro st.expander en la pantalla de revisión.
+            if st.toggle(f"Otros movimientos de V{numero_version:02d} · {len(secundarios)}",
+                         key=f"hist_mov_{numero_version}_{len(secundarios)}"):
+                _mostrar_entradas()
+
+
+def _mostrar_historial_pdf_por_version(folio, numero, versiones_anteriores, movimientos, *, actual=None):
+    """Una fila compacta por PDF, comentarios y bitácora desplegables por versión.
+
+    El archivo vigente no se confunde con los históricos; cada comentario
+    conserva la asociación exacta a la columna Version de Sheets.
+    """
+    from hashlib import sha256
+    _historial_version_estilos()
+    por_version, sin_version = _eventos_agrupados_por_version(movimientos)
+    acciones_decision = {ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA, ETAPA_FIRMA}
+    if not versiones_anteriores:
+        st.caption("Todavía no hay versiones anteriores.")
+    for v in sorted(versiones_anteriores, key=lambda x: int(x.get("Version") or 0), reverse=True):
+        n = int(v.get("Version") or 0)
+        clave = sha256(f"{folio}|{numero}|{n}".encode("utf-8")).hexdigest()[:14]
+        relacionados = por_version.get(n, [])
+        decisiones = sum(str(e.get("Accion") or "").strip() in acciones_decision for e in relacionados)
+        devoluciones = sum(str(e.get("Accion") or "").strip() in
+                           (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) for e in relacionados)
+        aprobaciones = decisiones - devoluciones
+        secundarios = len(relacionados) - decisiones
+        fecha = html.escape(str(v.get("Fecha registro") or "")[:10])
+        if devoluciones:
+            texto_resumen = f"{devoluciones} devolución{'es' if devoluciones != 1 else ''}"
+        elif aprobaciones:
+            texto_resumen = f"{aprobaciones} autorización{'es' if aprobaciones != 1 else ''}"
+        else:
+            texto_resumen = "Sin observaciones de revisión"
+        with st.container(key=f"hist_pdf_version_{clave}"):
+            st.markdown(
+                '<div class="hist-version-title">'
+                f'<span class="hist-version-number">V{n:02d} <small>HISTÓRICO</small></span>'
+                f'<span class="hist-version-date">{fecha}</span>'
+                '</div>', unsafe_allow_html=True,
+            )
+            _fila_version_pdf(folio, numero, v, compacto=True)
+            st.markdown(
+                '<div class="hist-quick-summary">'
+                f'<span>{html.escape(texto_resumen)}</span>'
+                f'<span>{secundarios} movimiento{'s' if secundarios != 1 else ''}</span>'
+                '</div>', unsafe_allow_html=True,
+            )
+            if relacionados:
+                if st.toggle(f"Ver detalles de V{n:02d}", key=f"hist_detalle_{clave}"):
+                    _mostrar_movimientos_version(relacionados, n, dentro_de_detalle=True)
+    if actual is not None:
+        n_actual = int(actual.get("Version") or 0)
+        if por_version.get(n_actual):
+            clave_actual = sha256(f"{folio}|{numero}|{n_actual}".encode("utf-8")).hexdigest()[:14]
+            if st.toggle(
+                f"Movimientos de la versión vigente V{n_actual:02d} · {len(por_version[n_actual])}",
+                key=f"hist_actual_{clave_actual}",
+            ):
+                _mostrar_movimientos_version(por_version[n_actual], n_actual,
+                                             resumen_actual=True, dentro_de_detalle=True)
+    if sin_version:
+        # Los registros sin Version NO se adjudican a ninguna versión.
+        if st.toggle(f"Movimientos sin versión identificada · {len(sin_version)}",
+                     key=f"hist_sin_version_{sha256(f'{folio}|{numero}'.encode()).hexdigest()[:12]}"):
+            for evento in sin_version:
+                st.caption(f"{evento.get('Fecha', '')} · {evento.get('Accion', '')} · "
+                           f"{_texto_detalle_historial(evento)}")
+
+
+def _botones_word_y_pdf(drive_id, nombre, clave):
+    """Accesos elegantes para Word/PDF, conservando Drive privado y el flujo actual.
+
+    Preparar Word guarda el DOCX en la sesión y Preparar PDF convierte esa misma
+    versión vigente. Las descargas aparecen únicamente cuando están listas.
+    """
+    import hashlib
+
+    clave_segura = hashlib.sha256(str(clave).encode("utf-8")).hexdigest()[:18]
+    base = f"revision_formatos_{clave_segura}"
+    id_registrado = f"{base}_id"
+    id_actual = str(drive_id or "").strip()
+    nombre_word = Path(str(nombre or "documento.docx")).name
+    if not nombre_word.lower().endswith(".docx"):
+        nombre_word += ".docx"
+    nombre_pdf = str(Path(nombre_word).with_suffix(".pdf"))
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", id_actual):
+        st.warning("Este expediente no tiene un documento Word descargable registrado.")
+        return
+
+    # Evita entregar una versión anterior si cambia el documento de Drive.
+    if st.session_state.get(id_registrado) != id_actual:
+        st.session_state[id_registrado] = id_actual
+        st.session_state.pop(f"{base}_word", None)
+        st.session_state.pop(f"{base}_pdf", None)
+
+    # Se limita a los elementos con claves revision_formatos_* para no alterar
+    # los botones de aprobación, correcciones, navegación ni otros módulos.
+    st.markdown("""
+    <style>
+    /* DOSSIER DOCUMENTAL · ACCIONES DE ARCHIVO */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_word_panel"],
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"] {
+        position:relative!important;
+        background:linear-gradient(150deg,#FFFEFB 0%,#F4F0EA 100%)!important;
+        border:1px solid #D6C5B7!important;
+        border-radius:13px!important;
+        padding:15px 17px 15px!important;
+        box-shadow:0 5px 15px rgba(62,47,44,.075),inset 0 1px rgba(255,255,255,.75)!important;
+        min-width:0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_word_panel"]:before,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"]:before {
+        content:"";position:absolute;left:17px;top:0;width:59px;height:2px;
+        background:linear-gradient(90deg,#B78C61,transparent);
+    }
+    .revision-file-heading {display:flex;align-items:center;gap:11px;margin-bottom:9px;min-height:42px;}
+    .revision-file-symbol {display:flex;align-items:center;justify-content:center;width:38px;height:38px;
+        flex:0 0 38px;border-radius:11px;background:#E7EBF0;border:1px solid #C6D1DB;color:#3E5D79;
+        font-size:12px;letter-spacing:.5px;font-weight:850;}
+    .revision-file-heading.pdf .revision-file-symbol {background:#F2E9E6;border-color:#DDBEB7;color:#985D52;}
+    .revision-file-name {font-size:14px;color:#453843;font-weight:800;line-height:1.22;}
+    .revision-file-detail {font-size:11px;line-height:1.4;color:#81777A;margin-top:3px;}
+    .revision-file-flag {display:inline-block;margin:0 0 9px;color:#5E776D;font-size:10px;
+        font-weight:750;letter-spacing:.25px;}
+    .revision-file-pending {display:inline-block;margin:0 0 9px;color:#98826B;font-size:10px;
+        font-weight:650;letter-spacing:.25px;}
+    /* Botón discreto de preparación */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button {
+        background:#F7F3EE!important;color:#58434C!important;
+        border:1px solid #CBB7A7!important;border-radius:9px!important;
+        min-height:39px!important;height:auto!important;padding:8px 14px!important;
+        font-size:12px!important;font-weight:680!important;
+        box-shadow:none!important;transition:transform .18s ease,background .18s ease,box-shadow .18s ease!important;
+    }
+    /* Descarga, acción principal, sin cambiar la lógica de st.download_button */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button {
+        background:#483A45!important;color:#FFF9F3!important;
+        border:1px solid #B58B68!important;border-radius:9px!important;
+        min-height:39px!important;height:auto!important;padding:8px 14px!important;
+        font-size:12px!important;font-weight:750!important;
+        box-shadow:0 3px 9px rgba(43,33,37,.14)!important;
+        transition:transform .18s ease,background .18s ease,box-shadow .18s ease!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button *,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button * {
+        color:#FFF9F3!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button:hover,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button:hover {
+        background:#EAE1D9!important;border-color:#B88D66!important;
+        transform:translateY(-1px);box-shadow:0 3px 9px rgba(67,48,42,.08)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button:hover,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button:hover {
+        background:#5B4753!important;border-color:#C39A76!important;
+        transform:translateY(-1px);box-shadow:0 6px 14px rgba(43,33,37,.16)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"] button:focus-visible {
+        outline:2px solid #B99272!important;outline-offset:2px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"] [data-testid="stExpander"] {
+        border:1px solid #D9CAC0!important;border-radius:8px!important;
+        background:transparent!important;margin-top:8px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"] [data-testid="stExpander"] summary {
+        min-height:35px!important;padding:6px 11px!important;
+    }
+    @media(max-width:700px) {
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_word_panel"],
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"] {
+            padding:12px!important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Los botones nativos de Streamlit no permiten translate="no" directamente.
+    # Las etiquetas visuales se pintan con CSS (Chrome no las reescribe al traducir).
+    # El texto original del widget sigue presente para accesibilidad y como respaldo.
+    st.markdown("""
+    <style>
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button {
+        position:relative!important;min-height:39px!important;overflow:hidden!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button p,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button p,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button p,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button p {
+        font-size:0!important;color:transparent!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button::after,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button::after,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button::after,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button::after {
+        position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+        padding:3px 9px;font-size:12px;font-weight:720;line-height:1.2;
+        white-space:nowrap;pointer-events:none;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_word"] button::after {content:"Preparar Word";color:#58434C;}
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_prep_pdf"] button::after {content:"Preparar PDF";color:#58434C;}
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_word"] button::after {content:"Descargar Word";color:#FFF9F3;}
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_desc_pdf"] button::after {content:"Descargar PDF";color:#FFF9F3;}
+    .revision-file-heading {min-height:36px!important;margin-bottom:5px!important;}
+    .revision-ext {font-size:11px;font-weight:600;color:#857A72;margin-left:5px;}
+    .revision-file-flag {font-size:10px!important;margin-bottom:5px!important;}
+    div[class*="st-key-tte_consulta_panel_"] .tte-module-heading {margin-bottom:7px!important;padding-bottom:7px!important;}
+    div[class*="st-key-tte_consulta_panel_"] .tte-module-icon {width:32px;height:32px;font-size:17px;}
+    div[class*="st-key-tte_consulta_panel_"] .tte-document-line small {
+        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;
+    }
+    @media (max-width:700px) {
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"] button::after {font-size:11px;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    columna_word, columna_pdf = st.columns(2, gap="small")
+    with columna_word:
+        with st.container(key=f"{base}_word_panel"):
+            st.markdown(
+                '<div class="revision-file-heading word notranslate" translate="no" lang="es-MX">'
+                '<div class="revision-file-symbol">W</div>'
+                '<div class="revision-file-name">Word <span class="revision-ext">.docx</span></div>'
+                '</div>', unsafe_allow_html=True,
+            )
+            listo_word = f"{base}_word" in st.session_state
+            if listo_word:
+                st.markdown('<span class="revision-file-flag notranslate" translate="no">✓ Listo</span>',
+                            unsafe_allow_html=True)
+            if listo_word:
+                preparar, descargar = st.columns([1, 1.2], gap="small")
+            else:
+                preparar, descargar = st.container(), None
+            with preparar:
+                if st.button("Preparar archivo .docx",
+                             key=f"{base}_prep_word", use_container_width=True):
+                    try:
+                        with st.spinner("Recuperando Word del expediente..."):
+                            st.session_state[f"{base}_word"] = _descargar_docx_drive(id_actual)
+                        st.rerun()  # Muestra la descarga en cuanto termina la preparación.
+                    except Exception as error:
+                        st.error(f"No se pudo preparar Word: {_mensaje_error_sheets(error)}")
+            if listo_word:
+                with descargar:
+                    st.download_button(
+                        "Descargar archivo .docx",
+                        data=st.session_state[f"{base}_word"],
+                        file_name=nombre_word,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"{base}_desc_word", use_container_width=True,
+                    )
+
+    with columna_pdf:
+        with st.container(key=f"{base}_pdf_panel"):
+            st.markdown(
+                '<div class="revision-file-heading pdf notranslate" translate="no" lang="es-MX">'
+                '<div class="revision-file-symbol">PDF</div>'
+                '<div class="revision-file-name">PDF <span class="revision-ext">.pdf</span></div>'
+                '</div>', unsafe_allow_html=True,
+            )
+            listo_pdf = f"{base}_pdf" in st.session_state
+            if listo_pdf:
+                st.markdown('<span class="revision-file-flag notranslate" translate="no">✓ Listo</span>',
+                            unsafe_allow_html=True)
+            if listo_pdf:
+                preparar, descargar = st.columns([1, 1.2], gap="small")
+            else:
+                preparar, descargar = st.container(), None
+            with preparar:
+                if st.button("Preparar archivo .pdf",
+                             key=f"{base}_prep_pdf", use_container_width=True):
+                    try:
+                        with st.spinner("Convirtiendo el Word vigente a PDF..."):
+                            word = st.session_state.get(f"{base}_word")
+                            if word is None:
+                                word = _descargar_docx_drive(id_actual)
+                                st.session_state[f"{base}_word"] = word
+                            st.session_state[f"{base}_pdf"] = _convertir_word_pdf_privado(word)
+                        st.rerun()  # Habilita descarga y vista previa inmediatamente.
+                    except Exception as error:
+                        st.error(f"No se pudo preparar PDF: {_mensaje_error_sheets(error)}")
+            if listo_pdf:
+                with descargar:
+                    st.download_button(
+                        "Descargar archivo .pdf", data=st.session_state[f"{base}_pdf"],
+                        file_name=nombre_pdf, mime="application/pdf",
+                        key=f"{base}_desc_pdf", use_container_width=True,
+                    )
+                with st.expander("◉ Vista previa del PDF", expanded=False):
+                    _mostrar_pdf_privado(st.session_state[f"{base}_pdf"], f"{base}_visor")
+
+
+def _adjuntar_documento_corregido_tte(folio, numero, archivo):
+    """Adjunto opcional DOCX o PDF de la Tte., guardado en Drive y en bitácora.
+
+    La versión principal en BORRADORES sigue intacta. Solo se registra el
+    adjunto de devolución si la Tte. adjuntó un archivo efectivamente.
+    """
+    if archivo is None:
+        return None
+    exigir_permiso_revision_final()
+    _verificar_expediente_documental(folio, numero)
+    versiones = _borradores_expediente(folio, numero)
+    if not versiones or str(versiones[-1].get("Etapa", "")) != ETAPA_TTE:
+        raise ValueError("El oficio ya no está en revisión de la Tte.")
+
+    nombre_original = Path(str(archivo.name)).name
+    extension = Path(nombre_original).suffix.lower()
+    if extension == ".docx":
+        # Reutilizar el comportamiento existente para Word y su bitácora.
+        return _adjuntar_word_corregido_tte(folio, numero, archivo)
+    if extension != ".pdf":
+        raise ValueError("La Tte. solo puede adjuntar Word (.docx) o PDF (.pdf).")
+
+    contenido = archivo.getvalue()
+    if not contenido.startswith(b"%PDF-"):
+        raise ValueError("El archivo seleccionado no parece ser un PDF válido.")
+    if len(contenido) > 40 * 1024 * 1024:
+        raise ValueError("El PDF adjunto no puede superar 40 MB.")
+
+    version = int(versiones[-1].get("Version") or 0)
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    nombre_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", nombre_original)
+    nombre_drive = f"tte_correcciones_v{version:03d}_{nombre_seguro}"[:180]
+    sesion = _drive_sesion()
+    inicio = sesion.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,name,webViewLink", "supportsAllDrives": "true"},
+        json={"name": nombre_drive, "parents": [carpeta], "mimeType": "application/pdf"},
+        headers={"X-Upload-Content-Type": "application/pdf",
+                 "X-Upload-Content-Length": str(len(contenido))},
+        timeout=30,
+    )
+    if not inicio.ok:
+        _drive_json(inicio, "iniciar subida del PDF corregido por la Tte.")
+    url_subida = inicio.headers.get("Location", "")
+    if not url_subida.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Drive no devolvió una dirección válida para subir el PDF.")
+    fin = sesion.put(
+        url_subida, data=contenido,
+        headers={"Content-Type": "application/pdf", "Content-Length": str(len(contenido))},
+        timeout=120,
+    )
+    subido_drive = _drive_json(fin, "guardar PDF corregido por la Tte.")
+    drive_id = str(subido_drive["id"])
+    url = str(subido_drive.get("webViewLink") or f"https://drive.google.com/file/d/{drive_id}/view")
+    subido = {"id": drive_id, "nombre": nombre_drive, "url": url}
+    detalle = json.dumps({"nombre": nombre_drive, "url": url,
+                          "drive_id": drive_id, "formato": "pdf"}, ensure_ascii=False)
+    try:
+        _registrar_evento_borrador(folio, numero, version,
+                                   "PDF corregido por la Tte.", detalle)
+    except Exception as error:
+        raise RuntimeError(
+            "El PDF se guardó en Drive, pero falló el registro en la bitácora. "
+            f"Se encuentra aquí: {url}. {error}"
+        ) from error
+    return subido
+
+
 def _adjuntar_word_corregido_tte(folio, numero, archivo):
     """Guarda el Word opcional de la Tte. sin reemplazar la versión del equipo."""
     exigir_permiso_revision_final()
@@ -999,7 +2212,7 @@ def _adjuntar_word_corregido_tte(folio, numero, archivo):
 
 
 def _word_tte_devolucion(folio, numero, etapa):
-    """Consulta y descarga el Word devuelto por la Tte. en la ronda actual."""
+    """Muestra el Word o PDF opcional devuelto en la ronda actual de la Tte."""
     if etapa != ETAPA_CORRECCIONES:
         return
     try:
@@ -1016,43 +2229,58 @@ def _word_tte_devolucion(folio, numero, etapa):
              if str(eventos[i].get("Accion", "")).strip()
              in (ETAPA_TTE, ETAPA_CORRECCIONES)), -1,
         )
+        acciones = ("Word corregido por la Tte.", "PDF corregido por la Tte.")
         adjuntos = [
             e for e in eventos[inicio + 1:ultima_devolucion]
-            if str(e.get("Accion", "")).strip() == "Word corregido por la Tte."
+            if str(e.get("Accion", "")).strip() in acciones
         ]
         if not adjuntos:
             return
-        dato = json.loads(str(adjuntos[-1].get("Detalle", "")))
-        url = str(dato.get("url", ""))
+        evento = adjuntos[-1]
+        dato = json.loads(str(evento.get("Detalle", "")))
         drive_id = str(dato.get("drive_id", ""))
-        nombre = str(dato.get("nombre", "Word_corregido_Tte.docx"))
-        st.info("La Tte. devolvió un Word con modificaciones. Puedes consultarlo o descargarlo.")
+        es_pdf = str(evento.get("Accion", "")).strip() == acciones[1]
+        extension = ".pdf" if es_pdf else ".docx"
+        nombre = str(dato.get("nombre") or ("Archivo_Tte" + extension))
+        url = str(dato.get("url", ""))
+        titulo = "PDF" if es_pdf else "Word"
+        st.info(f"La Tte. adjuntó un {titulo} con sus correcciones. "
+                "El archivo original del expediente no fue reemplazado.")
         col_drive, col_descarga = st.columns(2)
         with col_drive:
-            if url.startswith("https://drive.google.com/"):
-                st.link_button("↗ Consultar Word de la Tte. en Drive", url,
+            if url.startswith("https://drive.google.com/file/d/"):
+                st.link_button(f"↗ Ver {titulo} de la Tte. en Drive", url,
                                use_container_width=True)
         with col_descarga:
-            if st.button("↓ Preparar descarga Word de la Tte.",
-                         key=f"tte_word_preparar_{folio}_{numero}",
+            clave_base = f"tte_adj_{folio}_{numero}"
+            if st.button(f"↓ Preparar {titulo} de la Tte.",
+                         key=f"{clave_base}_preparar_{extension[1:]}",
                          use_container_width=True):
                 try:
-                    st.session_state[f"tte_word_bytes_{folio}_{numero}"] = _descargar_docx_drive(drive_id)
-                    st.session_state[f"tte_word_id_{folio}_{numero}"] = drive_id
+                    datos = (_descargar_pdf_privado(drive_id) if es_pdf
+                             else _descargar_docx_drive(drive_id))
+                    st.session_state[f"{clave_base}_bytes"] = datos
+                    st.session_state[f"{clave_base}_id"] = drive_id
                 except Exception as error:
-                    st.error(f"No se pudo descargar el Word: {_mensaje_error_sheets(error)}")
-            if (st.session_state.get(f"tte_word_id_{folio}_{numero}") == drive_id
-                    and f"tte_word_bytes_{folio}_{numero}" in st.session_state):
+                    st.error(f"No se pudo consultar el {titulo}: {_mensaje_error_sheets(error)}")
+            if (st.session_state.get(f"{clave_base}_id") == drive_id
+                    and f"{clave_base}_bytes" in st.session_state):
                 st.download_button(
-                    "Descargar archivo .docx",
-                    data=st.session_state[f"tte_word_bytes_{folio}_{numero}"],
+                    f"Descargar {titulo} de la Tte.",
+                    data=st.session_state[f"{clave_base}_bytes"],
                     file_name=nombre,
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"tte_word_descargar_{folio}_{numero}",
+                    mime=("application/pdf" if es_pdf else
+                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                    key=f"{clave_base}_descargar_{extension[1:]}",
                     use_container_width=True,
                 )
+        if es_pdf and st.session_state.get(f"{clave_base}_id") == drive_id:
+            with st.expander("◉ Vista previa del PDF devuelto", expanded=False):
+                _mostrar_pdf_privado(st.session_state[f"{clave_base}_bytes"],
+                                     f"{clave_base}_visor_{drive_id}")
     except Exception as error:
-        st.warning(f"No se pudo consultar el Word devuelto por la Tte.: {_mensaje_error_sheets(error)}")
+        st.warning(f"No se pudo consultar el documento devuelto por la Tte.: "
+                   f"{_mensaje_error_sheets(error)}")
 
 
 def _mensaje_error_sheets(error):
@@ -1143,58 +2371,23 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
     if ultimo:
         st.markdown(f"**📄 {html.escape(str(ultimo.get('Nombre', 'Documento Word')))}**")
         st.caption(f"Registrado por: {ultimo.get('Usuario', '')} · {ultimo.get('Fecha registro', '')}")
-        ver, descargar = st.columns(2)
-        with ver:
-            st.link_button("Consultar en Google Drive ↗", str(ultimo.get("URL", "")), use_container_width=True)
-        with descargar:
-            if st.button("Preparar descarga para Word ↓", key=f"doc_preparar_{folio}_{numero}", use_container_width=True):
-                try:
-                    with st.spinner("Descargando desde Google Drive..."):
-                        st.session_state[f"doc_bytes_{folio}_{numero}"] = _descargar_docx_drive(ultimo["Drive ID"])
-                        st.session_state[f"doc_id_{folio}_{numero}"] = ultimo["Drive ID"]
-                except Exception as error:
-                    st.error(str(error))
-            if (st.session_state.get(f"doc_id_{folio}_{numero}") == ultimo["Drive ID"]
-                    and f"doc_bytes_{folio}_{numero}" in st.session_state):
-                st.download_button("Descargar .docx", st.session_state[f"doc_bytes_{folio}_{numero}"],
-                                   file_name=str(ultimo["Nombre"]),
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                   key=f"doc_descargar_{folio}_{numero}", use_container_width=True)
-        with st.expander(f"Historial completo de versiones · {len(versiones)}/15", expanded=False):
+        _botones_word_y_pdf(
+            ultimo.get("Drive ID", ""), ultimo.get("Nombre", "Documento Word"),
+            f"borrador_{folio}_{numero}_{ultimo.get('Version', '')}",
+        )
+        with st.expander(f"Historial PDF y observaciones · {max(len(versiones)-1,0)} anteriores",
+                         expanded=False):
             try:
                 movimientos = _eventos_expediente(folio, numero)
             except Exception as error:
                 movimientos = []
                 st.warning(f"No se pudo consultar la bitácora: {_mensaje_error_sheets(error)}")
-            for version in reversed(versiones):
-                n = int(version.get("Version") or 0)
-                st.markdown(f"**V{n:02d} · {html.escape(str(version.get('Nombre', 'Word')))}**")
-                st.caption(f"Cargada: {version.get('Fecha registro', '—')} · "
-                           f"Por: {version.get('Usuario', '—')} · "
-                           f"Etapa registrada: {version.get('Etapa', '—')}")
-                enlace = str(version.get("URL", ""))
-                if enlace.startswith("https://"):
-                    st.link_button(f"Consultar Word V{n:02d} en Drive ↗", enlace,
-                                   key=f"hist_drive_{folio}_{numero}_{n}")
-                relacionados = [e for e in movimientos if int(e.get("Version") or 0) == n]
-                for e in relacionados:
-                    st.caption(f"{e.get('Fecha', '—')} · {e.get('Usuario', '—')} · "
-                               f"{e.get('Accion', '—')}: {e.get('Detalle', '')}")
-                st.divider()
+            anteriores = [v for v in versiones
+                          if int(v.get("Version") or 0) < int(ultimo.get("Version") or 0)]
+            _mostrar_historial_pdf_por_version(folio, numero, anteriores, movimientos, actual=ultimo)
     else:
         st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
 
-    try:
-        eventos = _eventos_expediente(folio, numero) if ultimo else []
-    except Exception as error:
-        eventos = []
-        st.caption(f"Bitácora temporalmente no disponible: {error}")
-    if eventos:
-        with st.expander(f"Bitácora de movimientos · {len(eventos)} eventos"):
-            for evento in reversed(eventos):
-                st.markdown(f"**{html.escape(str(evento['Accion']))}** · "
-                            f"V{int(evento['Version']):02d} · {html.escape(str(evento['Usuario']))}")
-                st.caption(f"{evento['Fecha']} · {evento.get('Detalle', '')}")
 
     admin = puede_gestionar_borradores()
     tte = puede_realizar_revision_final()
@@ -1293,8 +2486,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                                 horizontal=True)
             comentario = st.text_area("Observaciones de revisión (opcional)",
                                       placeholder="Puedes dejar indicaciones o continuar sin comentarios")
-            archivo_tte = (st.file_uploader("Word modificado por la Tte. (opcional)",
-                                          type=["docx"],
+            archivo_tte = (st.file_uploader("Word o PDF con modificaciones de la Tte. (opcional)",
+                                          type=["docx", "pdf"],
                                           key=f"tte_archivo_opcional_{folio}_{numero}")
                            if decision == "Solicitar correcciones" else None)
             enviar = st.form_submit_button("Registrar decisión", type="primary", use_container_width=True)
@@ -1304,8 +2497,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                 # Registrar primero el adjunto para evitar que quede inaccesible
                 # si el expediente cambia de etapa durante la operación.
                 if nueva == ETAPA_CORRECCIONES and archivo_tte is not None:
-                    with st.spinner("Guardando Word corregido en Drive..."):
-                        _adjuntar_word_corregido_tte(folio, numero, archivo_tte)
+                    with st.spinner("Guardando documento corregido en Drive..."):
+                        _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
                 _actualizar_oficio_flujo(folio, numero, {
                     "Estatus": "En firma" if nueva == ETAPA_FIRMA else "En correcciones"
                 }, autorizacion_tte=True)
@@ -1436,6 +2629,7 @@ def _eliminar_oficio_confirmado(folio, numero):
         "OFICIOS": conectar_google_sheets(),
         "BORRADORES": _hoja_borradores(),
         "EVENTOS_BORRADORES": _hoja_eventos_borradores(),
+        "MODALIDADES_TRAMITE": _hoja_modalidades(),
     }
     filas_borrar = {}
     for nombre, hoja in hojas.items():
@@ -1461,12 +2655,13 @@ def _eliminar_oficio_confirmado(folio, numero):
     auditoria.append_row([str(folio), str(numero), identificador_sesion(),
         datetime.now().astimezone().isoformat(timespec="seconds"),
         len(filas_borrar["BORRADORES"]), len(filas_borrar["EVENTOS_BORRADORES"]),
-        "Eliminado de Sheets; archivos de Google Drive conservados"], value_input_option="RAW")
+        "Eliminado de Sheets (incluida modalidad); archivos de Google Drive conservados"], value_input_option="RAW")
     # Eliminar de abajo arriba; si hay fallo, la auditoría permite reconstruir el incidente.
-    for nombre in ("EVENTOS_BORRADORES", "BORRADORES", "OFICIOS"):
+    for nombre in ("EVENTOS_BORRADORES", "BORRADORES", "MODALIDADES_TRAMITE", "OFICIOS"):
         for indice in sorted(filas_borrar[nombre], reverse=True):
             hojas[nombre].delete_rows(indice)
     _invalidar_cache_documental(borradores=True, eventos=True, oficios=True)
+    _leer_modalidades.clear()
     # Comprobación de consistencia: ningún panel debe recuperar el expediente.
     for nombre, hoja in hojas.items():
         datos_restantes = hoja.get_all_values()
@@ -1909,6 +3104,397 @@ def documentos_formulario(tipo):
 
 
 # =========================================================
+# MODALIDADES DE TRÁMITE (hoja auxiliar, OFICIOS sin cambios)
+# =========================================================
+COLUMNAS_MODALIDADES = [
+    "Folio", "No. de oficio", "Tipo de trámite", "Tiene antecedentes",
+    "Nombre principal", "URL principal", "Estado directo", "Registrado por",
+    "Fecha registro", "Fecha envío firma", "Autorizado por", "Observaciones",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_modalidades():
+    libro = conectar_google_sheets().spreadsheet
+    try:
+        hoja = libro.worksheet("MODALIDADES_TRAMITE")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="MODALIDADES_TRAMITE", rows=1000,
+                                  cols=len(COLUMNAS_MODALIDADES))
+        hoja.append_row(COLUMNAS_MODALIDADES, value_input_option="RAW")
+    if hoja.row_values(1) != COLUMNAS_MODALIDADES:
+        raise ValueError("La hoja MODALIDADES_TRAMITE tiene columnas inesperadas.")
+    return hoja
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_modalidades():
+    return _hoja_modalidades().get_all_records()
+
+
+def _modalidad_expediente(folio, numero):
+    """Devuelve el registro auxiliar; ausencia equivale a trámite legado/ordinario."""
+    return next((r for r in _leer_modalidades()
+                 if str(r.get("Folio", "")).strip() == str(folio).strip()
+                 and str(r.get("No. de oficio", "")).strip() == str(numero).strip()), None)
+
+
+def _registrar_modalidad(folio, numero, tipo, tiene_antecedentes,
+                         nombre_principal="", url_principal=""):
+    """Registrar modalidad sin alterar ni añadir columnas a OFICIOS."""
+    exigir_sesion()
+    hoja = _hoja_modalidades()
+    if _modalidad_expediente(folio, numero) is not None:
+        raise ValueError("Ya hay una modalidad registrada para este expediente.")
+    from zoneinfo import ZoneInfo
+    fecha = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+    hoja.append_row([
+        str(folio), str(numero), str(tipo), "Sí" if tiene_antecedentes else "No",
+        str(nombre_principal), str(url_principal),
+        "Pendiente de autorización" if tipo == "Directo" else "Registro ordinario",
+        identificador_sesion(), fecha, "", "", "",
+    ], value_input_option="RAW")
+    _leer_modalidades.clear()
+
+
+def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
+    """La etapa se actualiza sobre la fila única, con comprobación de concurrencia."""
+    exigir_permiso_revision_final()
+    hoja = _hoja_modalidades()
+    valores = hoja.get_all_values()
+    if not valores or valores[0] != COLUMNAS_MODALIDADES:
+        raise ValueError("Estructura inesperada en la hoja de modalidades.")
+    matches = [(i, r) for i, r in enumerate(valores[1:], start=2)
+               if len(r) >= 2 and r[0].strip() == str(folio).strip()
+               and r[1].strip() == str(numero).strip()]
+    if len(matches) != 1:
+        raise ValueError("No se encontró una modalidad única para este oficio.")
+    fila, actual = matches[0]
+    if len(actual) < 7 or actual[2] != "Directo":
+        raise PermissionError("El trámite no está registrado como directo.")
+    if actual[6] != "Pendiente de autorización":
+        raise ValueError("Este trámite ya recibió una decisión; recarga la página.")
+    from zoneinfo import ZoneInfo
+    fecha = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+    cambios = {7: estado, 11: identificador_sesion(), 12: str(observaciones).strip()}
+    if estado == "En firma":
+        cambios[10] = fecha
+    from gspread.utils import rowcol_to_a1
+    hoja.batch_update([{"range": rowcol_to_a1(fila, col), "values": [[valor]]}
+                       for col, valor in cambios.items()], value_input_option="RAW")
+    _leer_modalidades.clear()
+
+
+def _autorizar_tramite_directo(folio, numero, autorizar, observaciones=""):
+    """Solo Tte.: confirma un envío; no cuenta un simple registro como salida."""
+    exigir_permiso_revision_final()
+    registro = _modalidad_expediente(folio, numero)
+    if not registro or registro.get("Tipo de trámite") != "Directo":
+        raise ValueError("El expediente no está dado de alta como trámite directo.")
+    if registro.get("Estado directo") != "Pendiente de autorización":
+        raise ValueError("La decisión ya fue registrada.")
+    # Validación fresca antes de autorizar, independiente de Session State.
+    coincidencias = [r for r in _leer_registros_oficios()
+                     if str(r.get("Folio", "")).strip() == str(folio).strip()
+                     and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+    if len(coincidencias) != 1 or str(coincidencias[0].get("Estatus", "")).strip() != "En revisión":
+        raise ValueError("El oficio ya no espera revisión, o no es único en OFICIOS.")
+    nuevo = "En firma" if autorizar else "En correcciones"
+    # El origen/versión 0 distingue al trámite directo de los borradores.
+    _actualizar_oficio_flujo(folio, numero, {"Estatus": nuevo}, autorizacion_tte=True)
+    try:
+        _registrar_evento_borrador(
+            folio, numero, 0, ETAPA_FIRMA if autorizar else ETAPA_CORRECCIONES,
+            "Trámite directo: " + (observaciones.strip() or "Sin observaciones")
+        )
+    except Exception as error:
+        # No fingir que un envío quedó contado cuando falló la bitácora.
+        raise RuntimeError("Se actualizó el estatus en OFICIOS, pero falló la bitácora. "
+                           "Contacta al administrador para conciliar el envío sin duplicarlo. "
+                           f"Detalle: {error}") from error
+    try:
+        _actualizar_modalidad_directa(folio, numero, nuevo, observaciones)
+    except Exception as error:
+        st.warning("El cambio y su bitácora ya están guardados, pero no se pudo "
+                   "actualizar la ficha auxiliar: " + str(error))
+
+
+def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo,
+                                   nombre_principal=None, url_principal=None):
+    """Actualización auxiliar para John/Alejandra sin modificar los permisos de la Tte."""
+    exigir_permiso_borradores()
+    hoja = _hoja_modalidades()
+    valores = hoja.get_all_values()
+    filas = [(i, r) for i, r in enumerate(valores[1:], start=2)
+             if len(r) >= 7 and r[0].strip() == str(folio).strip()
+             and r[1].strip() == str(numero).strip()]
+    if len(filas) != 1:
+        raise ValueError("No se encontró el expediente directo de forma única.")
+    fila, anterior = filas[0]
+    if anterior[2] != "Directo" or anterior[6] != estado_previo:
+        raise ValueError("El trámite directo cambió de etapa. Actualiza la bandeja.")
+    cambios = {7: estado_nuevo}
+    if nombre_principal is not None:
+        cambios[5] = nombre_principal
+    if url_principal is not None:
+        cambios[6] = url_principal
+    from gspread.utils import rowcol_to_a1
+    hoja.batch_update([{"range": rowcol_to_a1(fila, columna), "values": [[dato]]}
+                       for columna, dato in cambios.items()], value_input_option="RAW")
+    _leer_modalidades.clear()
+
+
+def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fecha=None, comentario=""):
+    """Recepción real del oficio firmado o retorno con correcciones (sin borradores)."""
+    exigir_permiso_borradores()
+    datos = _modalidad_expediente(folio, numero)
+    if not datos or datos.get("Tipo de trámite") != "Directo" or datos.get("Estado directo") != "En firma":
+        raise ValueError("No existe un trámite directo activo en firma.")
+    oficio = _verificar_expediente_documental(folio, numero)
+    if str(oficio.get("Estatus", "")).strip() != "En firma":
+        raise ValueError("El oficio no está en firma externa.")
+    if resultado == "Regresó firmado":
+        from urllib.parse import urlparse
+        link = urlparse(str(url).strip())
+        if not nombre.strip() or link.scheme != "https" or (link.hostname or "").lower() not in (
+                "drive.google.com", "docs.google.com"):
+            raise ValueError("Indica el nombre y un enlace válido de Drive del oficio firmado.")
+        if fecha is None:
+            raise ValueError("Indica la fecha real de recepción de la firma.")
+        archivo = json.dumps([{"nombre": nombre.strip(), "url": url.strip()}], ensure_ascii=False)
+        _actualizar_oficio_flujo(folio, numero, {
+            "Estatus": "Firmado", "Firmado": archivo, "Fecha de entrega": fecha.isoformat()
+        })
+        try:
+            _registrar_evento_borrador(folio, numero, 0, ETAPA_ARCHIVADO,
+                                      f"Trámite directo · recepción de firma: {nombre} · {fecha.isoformat()}")
+        finally:
+            # El estado real de OFICIOS sigue siendo fuente de verdad.
+            _actualizar_datos_directo_revisor(folio, numero, "En firma", "Firmado")
+    else:
+        if not comentario.strip():
+            raise ValueError("Describe las correcciones de firma externa.")
+        _actualizar_oficio_flujo(folio, numero, {"Estatus": "En correcciones"})
+        try:
+            _registrar_evento_borrador(folio, numero, 0, ETAPA_RETORNO_FIRMA,
+                                      "Trámite directo · " + comentario.strip())
+        finally:
+            _actualizar_datos_directo_revisor(folio, numero, "En firma", "En correcciones")
+
+
+def _reenviar_tramite_directo(folio, numero, nombre, url):
+    exigir_permiso_borradores()
+    from urllib.parse import urlparse
+    link = urlparse(str(url).strip())
+    if not nombre.strip() or link.scheme != "https" or (link.hostname or "").lower() not in (
+            "drive.google.com", "docs.google.com"):
+        raise ValueError("Indica un documento actualizado de Google Drive.")
+    datos = _modalidad_expediente(folio, numero)
+    oficio = _verificar_expediente_documental(folio, numero)
+    if not datos or datos.get("Estado directo") != "En correcciones" or oficio.get("Estatus") != "En correcciones":
+        raise ValueError("El oficio ya no está en correcciones.")
+    _actualizar_oficio_flujo(folio, numero, {"Estatus": "En revisión"})
+    try:
+        _registrar_evento_borrador(folio, numero, 0, ETAPA_TTE,
+                                  "Trámite directo · nueva entrega para revisión")
+    finally:
+        _actualizar_datos_directo_revisor(folio, numero, "En correcciones",
+                                         "Pendiente de autorización", nombre.strip(), url.strip())
+
+
+def _panel_directos_para_revisores():
+    """Recibir firmas y reentregar directos, sin modificar el flujo Word ordinario."""
+    if not puede_gestionar_borradores():
+        return
+    try:
+        todos = _leer_modalidades()
+        directos = [m for m in todos if m.get("Tipo de trámite") == "Directo"
+                    and m.get("Estado directo") in ("En firma", "En correcciones")]
+        estados = {(str(x.get("Folio", "")).strip(), str(x.get("No. de oficio", "")).strip()): x
+                   for x in _leer_registros_oficios()}
+        directos = [m for m in directos
+                    if str(estados.get((str(m.get("Folio", "")).strip(),
+                                        str(m.get("No. de oficio", "")).strip()), {}).get("Estatus", "")).strip() == m.get("Estado directo")]
+    except Exception as error:
+        st.warning("Trámites directos: no se pudo leer la información auxiliar: " + str(error))
+        return
+    if not directos:
+        return
+    st.markdown("#### Seguimiento · trámites directos")
+    st.caption("Aquí se registra el regreso firmado o el reenvío corregido, sin crear borradores Word.")
+    for m in directos:
+        folio = str(m.get("Folio", "")).strip()
+        numero = str(m.get("No. de oficio", "")).strip()
+        estado = str(m.get("Estado directo", ""))
+        clave = hashlib.sha256(f"direct-review|{folio}|{numero}".encode()).hexdigest()[:12]
+        with st.expander(f"{numero} · Folio {folio} · {estado}", expanded=False):
+            enlace = str(m.get("URL principal", "")).strip()
+            if enlace.startswith("https://"):
+                st.link_button("Oficio principal (Drive)", enlace, use_container_width=True)
+            if estado == "En correcciones":
+                try:
+                    eventos_directos = _eventos_expediente(folio, numero)
+                    for evento_directo in eventos_directos:
+                        accion_evento = str(evento_directo.get("Accion", ""))
+                        if accion_evento == ETAPA_CORRECCIONES:
+                            st.info("Observaciones de la Tte.: " + str(evento_directo.get("Detalle", "")))
+                        elif accion_evento == "Adjunto de correcciones directo":
+                            try:
+                                detalle_adjunto = json.loads(str(evento_directo.get("Detalle", "")))
+                                if str(detalle_adjunto.get("url", "")).startswith("https://"):
+                                    st.link_button("Documento devuelto: " + str(detalle_adjunto.get("nombre", "")),
+                                                   detalle_adjunto["url"], use_container_width=True)
+                            except (ValueError, TypeError, AttributeError):
+                                pass
+                except Exception:
+                    st.caption("La bitácora de observaciones no está disponible temporalmente.")
+                with st.form(key=f"directo_reentregar_{clave}"):
+                    nombre_nuevo = st.text_input("Nombre del documento actualizado", value=str(m.get("Nombre principal", "")))
+                    url_nueva = st.text_input("Enlace del documento actualizado", value=enlace)
+                    confirmar = st.checkbox("Confirmo la nueva entrega a la Tte.")
+                    enviar = st.form_submit_button("Reenviar a revisión", type="primary", use_container_width=True)
+                if enviar:
+                    if not confirmar:
+                        st.warning("Confirma el reenvío del documento actualizado.")
+                    else:
+                        try:
+                            _reenviar_tramite_directo(folio, numero, nombre_nuevo, url_nueva)
+                            st.success("Oficio reenviado a la Tte.")
+                            st.rerun()
+                        except Exception as error:
+                            st.error(str(error))
+            else:
+                resultado = st.radio("Resultado de firma externa", ["Regresó firmado", "Regresó con correcciones"],
+                                     key=f"directo_resultado_{clave}", horizontal=True)
+                with st.form(key=f"directo_resultado_form_{clave}"):
+                    if resultado == "Regresó firmado":
+                        nombre_f = st.text_input("Nombre del oficio firmado", key=f"directo_firm_nombre_{clave}")
+                        url_f = st.text_input("Enlace de Drive del oficio firmado", key=f"directo_firm_url_{clave}")
+                        fecha_f = st.date_input("Fecha real de recepción", value=None,
+                                                 format="DD/MM/YYYY", key=f"directo_firm_fecha_{clave}")
+                    else:
+                        nombre_f, url_f, fecha_f = "", "", None
+                    comentario = st.text_area("Observaciones", key=f"directo_firm_obs_{clave}")
+                    confirmar = st.checkbox("Confirmo la recepción y el resultado")
+                    guardar = st.form_submit_button("Registrar resultado", type="primary", use_container_width=True)
+                if guardar:
+                    if not confirmar:
+                        st.warning("Confirma el resultado del trámite.")
+                    else:
+                        try:
+                            _guardar_resultado_directo(folio, numero, resultado,
+                                                       nombre_f, url_f, fecha_f, comentario)
+                            st.success("Resultado registrado.")
+                            st.rerun()
+                        except Exception as error:
+                            st.error(str(error))
+
+
+def _adjuntar_correccion_directo_tte(folio, numero, archivo):
+    """Word/PDF opcional en trámite directo, sin exigir una versión BORRADORES."""
+    if archivo is None:
+        return None
+    exigir_permiso_revision_final()
+    registro = _modalidad_expediente(folio, numero)
+    if not registro or registro.get("Tipo de trámite") != "Directo" or registro.get("Estado directo") != "Pendiente de autorización":
+        raise ValueError("El trámite directo ya no está pendiente de revisión.")
+    nombre_original = Path(str(archivo.name)).name
+    extension = Path(nombre_original).suffix.lower()
+    tipos = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+             ".pdf": "application/pdf"}
+    if extension not in tipos:
+        raise ValueError("Adjunta únicamente Word .docx o PDF .pdf.")
+    contenido = archivo.getvalue()
+    if len(contenido) > 40 * 1024 * 1024 or not contenido.startswith(b"PK" if extension == ".docx" else b"%PDF-"):
+        raise ValueError("El documento debe ser Word/PDF válido y no superar 40 MB.")
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    nombre = "tte_directo_" + re.sub(r"[^A-Za-z0-9._-]", "_", nombre_original)[:155]
+    sesion = _drive_sesion()
+    tipo_mime = tipos[extension]
+    inicio = sesion.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,name,webViewLink",
+                "supportsAllDrives": "true"},
+        json={"name": nombre, "parents": [carpeta], "mimeType": tipo_mime},
+        headers={"X-Upload-Content-Type": tipo_mime,
+                 "X-Upload-Content-Length": str(len(contenido))}, timeout=30,
+    )
+    if not inicio.ok:
+        _drive_json(inicio, "preparar devolución de trámite directo")
+    enlace_subida = inicio.headers.get("Location", "")
+    if not enlace_subida.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Drive no devolvió una sesión de subida segura.")
+    fin = sesion.put(enlace_subida, data=contenido,
+                     headers={"Content-Type": tipo_mime,
+                              "Content-Length": str(len(contenido))}, timeout=120)
+    subido = _drive_json(fin, "guardar documento de corrección directa")
+    url = str(subido.get("webViewLink") or f"https://drive.google.com/file/d/{subido['id']}/view")
+    _registrar_evento_borrador(folio, numero, 0, "Adjunto de correcciones directo",
+                               json.dumps({"nombre": nombre, "url": url}, ensure_ascii=False))
+    return {"nombre": nombre, "url": url}
+
+
+def _panel_tramites_directos_tte():
+    """Expedientes directos pendientes de Alondra: consulta y autorización."""
+    if not puede_realizar_revision_final():
+        return
+    try:
+        directos = [m for m in _leer_modalidades()
+                    if m.get("Tipo de trámite") == "Directo"
+                    and m.get("Estado directo") == "Pendiente de autorización"]
+        oficios = {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()): r
+                   for r in _leer_registros_oficios()}
+    except Exception as error:
+        st.warning("No se pudo consultar la bandeja de trámites directos: " + str(error))
+        return
+    pendientes = [m for m in directos
+                  if str(oficios.get((str(m.get("Folio", "")).strip(),
+                                     str(m.get("No. de oficio", "")).strip()), {}).get("Estatus", "")).strip() == "En revisión"]
+    if not pendientes:
+        return
+    st.markdown("#### Trámites directos · Revisión de la Tte.")
+    st.caption("Oficios sin etapas intermedias de borrador. Autorizar es una decisión; "
+               "el registro por sí solo no cuenta como salida a firma.")
+    for m in pendientes:
+        folio = str(m.get("Folio", "")).strip()
+        numero = str(m.get("No. de oficio", "")).strip()
+        clave = hashlib.sha256(f"{folio}|{numero}".encode()).hexdigest()[:12]
+        r = oficios.get((folio, numero), {})
+        with st.container(border=True, key=f"directo_tte_{clave}"):
+            st.markdown(f"**{html.escape(numero)}** · Folio {html.escape(folio)}")
+            st.caption(f"Responsable: {r.get('Responsable', '')} · "
+                       f"{r.get('Asunto', '')}")
+            url = str(m.get("URL principal", "")).strip()
+            if url.startswith("https://"):
+                st.link_button("Ver oficio principal en Drive", url, use_container_width=True)
+            obs = st.text_area("Observaciones (opcional)", key=f"directo_obs_{clave}", height=68)
+            adjunto_directo = st.file_uploader(
+                "Word o PDF con correcciones (opcional)", type=["docx", "pdf"],
+                key=f"directo_adj_tte_{clave}",
+            )
+            confirm = st.checkbox("Confirmo que revisé el oficio", key=f"directo_confirm_{clave}")
+            a, b = st.columns(2)
+            with a:
+                aprobar = st.button("Autorizar envío a firma", key=f"directo_ok_{clave}",
+                                    use_container_width=True, type="primary")
+            with b:
+                devolver = st.button("Solicitar correcciones", key=f"directo_regresar_{clave}",
+                                     use_container_width=True)
+            if aprobar or devolver:
+                if not confirm:
+                    st.warning("Confirma la revisión antes de emitir la decisión.")
+                else:
+                    try:
+                        if devolver and adjunto_directo is not None:
+                            _adjuntar_correccion_directo_tte(folio, numero, adjunto_directo)
+                        _autorizar_tramite_directo(folio, numero, aprobar, obs)
+                        st.success("Decisión registrada y expediente actualizado.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(str(error))
+
+
+# =========================================================
 # FORMULARIO DE REGISTRO
 # =========================================================
 
@@ -1992,6 +3578,35 @@ def formulario_nuevo_oficio():
         scrolling=False
     )
 
+    # Un solo flujo institucional. Tener folio o antecedentes no cambia las etapas.
+    # Los trámites directos LEGADOS siguen siendo consultables, pero no se crean
+    # nuevos trámites directos desde este formulario.
+    tramite_directo = False
+    st.markdown("#### Identificación del oficio")
+    tiene_folio = st.checkbox(
+        "Este oficio tiene folio", value=True,
+        key=f"tiene_folio_{version}",
+        help="Si no existe folio, el expediente se identifica por su número de oficio.",
+    )
+    tiene_antecedentes = st.checkbox(
+        "Este oficio tiene antecedentes", value=True,
+        key=f"tiene_antecedentes_{version}",
+        help="Si no tiene antecedentes, el registro continúa normalmente.",
+    )
+    # Caso especial: el oficio aún no tiene folio ni antecedentes. El número
+    # definitivo de salida se captura en «Oficio que saldrá firmado» más abajo.
+    # Sigue siendo un trámite ORDINARIO, sin saltar las etapas de revisión/firma.
+    registro_solo_numero_salida = not tiene_folio and not tiene_antecedentes
+    if registro_solo_numero_salida:
+        st.info(
+            "**Registro sin folio ni antecedentes.** Indica el proyecto y el número "
+            "con el que saldrá el oficio firmado. No necesitas un enlace de Drive "
+            "en este momento; podrás vincular el documento al recibirlo firmado."
+        )
+    elif not tiene_folio or not tiene_antecedentes:
+        st.caption("Los campos que no correspondan se guardarán vacíos. "
+                   "El estatus, la revisión y la firma siguen el proceso habitual.")
+
     # =========================================================
     # 01 · DATOS PRINCIPALES
     # =========================================================
@@ -2011,38 +3626,36 @@ def formulario_nuevo_oficio():
         unsafe_allow_html=True
     )
 
-    col1, col2, col3 = st.columns([1, 1.25, 1])
-
-    with col1:
-        folio = st.text_input(
-            "Folio",
-            key=f"folio_{version}"
-        )
-
-    with col2:
-        numero = st.text_input(
-            "No. de oficio",
-            key=f"numero_{version}"
-        )
-
-    with col3:
-        responsable = st.selectbox(
-            "Responsable",
-            [
-                "Alejandra",
-                "Alex",
-                "Jesús",
-                "Cecilia",
-                "Tte. Barajas",
-                "Ricardo",
-                "Magali",
-                "John",
-                "Karina"
-            ],
-            index=None,
-            placeholder="Seleccionar responsable",
-            key=f"responsable_{version}"
-        )
+    responsables_disponibles = [
+        "Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
+        "Ricardo", "Magali", "John", "Karina",
+    ]
+    if registro_solo_numero_salida:
+        # Estos campos no se dibujan arriba ni como placeholders.
+        # «numero» recibirá el valor del campo de salida antes de guardar.
+        folio = ""
+        numero = ""
+        st.markdown("**Proyecto al que pertenece el oficio**")
+    else:
+        col1, col2, col3 = st.columns([1, 1.25, 1])
+        with col1:
+            if tiene_folio:
+                folio = st.text_input(
+                    "Folio",
+                    key=f"folio_{version}",
+                    placeholder="Captura el folio",
+                )
+            else:
+                folio = ""
+                st.markdown("**Folio**")
+                st.caption("No aplica · expediente sin folio")
+        with col2:
+            numero = st.text_input("No. de oficio", key=f"numero_{version}")
+        with col3:
+            responsable = st.selectbox(
+                "Responsable", responsables_disponibles, index=None,
+                placeholder="Seleccionar responsable", key=f"responsable_{version}"
+            )
 
     col4, col5 = st.columns([1, 1.6])
 
@@ -2126,6 +3739,13 @@ def formulario_nuevo_oficio():
     else:
         proyecto = ""
 
+    if registro_solo_numero_salida:
+        # El responsable sigue siendo necesario para permisos y seguimiento.
+        responsable = st.selectbox(
+            "Responsable del oficio", responsables_disponibles, index=None,
+            placeholder="Seleccionar responsable", key=f"responsable_{version}"
+        )
+
     asunto = st.text_area(
         "Asunto",
         height=75,
@@ -2165,9 +3785,20 @@ def formulario_nuevo_oficio():
     col6, col7, col8 = st.columns(3)
 
     with col6:
-        estatus = st.selectbox(
-            "Estatus", ESTATUS_OFICIOS, key=f"estatus_{version}"
-        )
+        if tramite_directo:
+            estatus = "En revisión"
+            st.text_input("Estatus", value="En revisión · trámite directo",
+                          disabled=True, key=f"estado_directo_{version}")
+        else:
+            # Un oficio sin folio ni antecedentes se registra antes de que
+            # exista la versión firmada. Su estado se actualizará después.
+            estados_registro = (
+                [e for e in ESTATUS_OFICIOS if e != "Firmado"]
+                if registro_solo_numero_salida else ESTATUS_OFICIOS
+            )
+            estatus = st.selectbox(
+                "Estatus", estados_registro, key=f"estatus_{version}"
+            )
 
     es_firmado = estatus == "Firmado"
 
@@ -2186,9 +3817,19 @@ def formulario_nuevo_oficio():
             disabled=not es_firmado
         )
 
-    # Oficio firmado
+    # Identificador del oficio que saldrá firmado / documento ya firmado.
     st.markdown(
         """
+        <div style="
+            color:#E8F0F5;
+            font-size:11px;
+            font-weight:700;
+            margin-top:10px;
+            margin-bottom:4px;
+        ">
+            ▣ Identificación del oficio por firmar
+        </div>
+        """ if registro_solo_numero_salida else """
         <div style="
             color:#E8F0F5;
             font-size:11px;
@@ -2204,30 +3845,49 @@ def formulario_nuevo_oficio():
 
     col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
 
-    with col_firmado_nombre:
-        nombre_firmado = st.text_input(
-            "Nombre del documento",
-            placeholder="Ej. LFSLPSTL-IB-26-2119",
-            key=f"nuevo_nombre_firmado_{version}",
-            disabled=not es_firmado
-        )
-
-    with col_firmado_link:
-        liga_firmado = st.text_input(
-            "Enlace de Drive",
-            placeholder="Pega aquí el enlace de Drive...",
-            key=f"nuevo_liga_firmado_{version}",
-            disabled=not es_firmado
-        )
-
-    # Construir el JSON o string requerido para el guardado de 'firmado'
-    if es_firmado and (nombre_firmado.strip() or liga_firmado.strip()):
-        firmado = json.dumps([{
-            "nombre": nombre_firmado.strip(),
-            "url": liga_firmado.strip()
-        }], ensure_ascii=False)
+    if registro_solo_numero_salida:
+        with col_firmado_nombre:
+            numero_salida = st.text_input(
+                "Nombre o número del oficio que saldrá firmado",
+                placeholder="Ej. LFSLPSTL-IB-26-2119",
+                key=f"nuevo_numero_salida_{version}",
+                help="Este será el número de oficio con el que se identificará el expediente.",
+            )
+        with col_firmado_link:
+            # En este tipo de registro todavía no se solicita documento firmado.
+            st.text_input(
+                "Enlace de Drive · disponible después de firmar",
+                value="", disabled=True,
+                placeholder="Se habilita al registrar el documento firmado",
+                key=f"nuevo_liga_firmado_sin_folio_{version}",
+            )
+        numero = numero_salida.strip()
+        nombre_firmado, liga_firmado = "", ""
+        firmado = ""  # No crear un enlace/documento ficticio.
+        st.caption("El número de salida se guardará como número de oficio. "
+                   "El enlace podrá añadirse cuando el documento regrese firmado.")
     else:
-        firmado = ""
+        with col_firmado_nombre:
+            nombre_firmado = st.text_input(
+                "Nombre del documento",
+                placeholder="Ej. LFSLPSTL-IB-26-2119",
+                key=f"nuevo_nombre_firmado_{version}",
+                disabled=not es_firmado
+            )
+        with col_firmado_link:
+            liga_firmado = st.text_input(
+                "Enlace de Drive",
+                placeholder="Pega aquí el enlace de Drive...",
+                key=f"nuevo_liga_firmado_{version}",
+                disabled=not es_firmado
+            )
+        if es_firmado and (nombre_firmado.strip() or liga_firmado.strip()):
+            firmado = json.dumps([{
+                "nombre": nombre_firmado.strip(),
+                "url": liga_firmado.strip()
+            }], ensure_ascii=False)
+        else:
+            firmado = ""
 
     st.markdown(
         """
@@ -2267,39 +3927,62 @@ def formulario_nuevo_oficio():
         unsafe_allow_html=True
     )
 
-    col_doc1, col_doc2 = st.columns(2)
+    nombre_principal = ""
+    url_principal = ""
+    if tramite_directo:
+        st.markdown("**Oficio principal · enlace del archivo a tramitar**")
+        col_nombre_principal, col_url_principal = st.columns([1, 1.8])
+        with col_nombre_principal:
+            nombre_principal = st.text_input(
+                "Nombre del oficio", key=f"directo_nombre_{version}",
+                placeholder="Ej. Oficio 19327")
+        with col_url_principal:
+            url_principal = st.text_input(
+                "Enlace del oficio (Drive)", key=f"directo_url_{version}",
+                placeholder="https://drive.google.com/...")
 
-    with col_doc1:
-        st.markdown(
-            """
-            <div style="
-                color:#E8F0F5;
-                font-size:11px;
-                font-weight:700;
-                margin-bottom:4px;
-            ">
-                ▣ &nbsp; Antecedentes
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        antecedentes = documentos_formulario(f"antecedentes_{version}")
-
-    with col_doc2:
-        st.markdown(
-            """
-            <div style="
-                color:#E8F0F5;
-                font-size:11px;
-                font-weight:700;
-                margin-bottom:4px;
-            ">
-                ◇ &nbsp; Anexos
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    # Sin folio y sin antecedentes: ocultar también el bloque vacío de
+    # antecedentes; anexos continúa disponible si algún expediente los requiere.
+    if registro_solo_numero_salida:
+        antecedentes = []
+        st.markdown("**Anexos (opcionales)**")
         anexos = documentos_formulario(f"anexos_{version}")
+    else:
+        col_doc1, col_doc2 = st.columns(2)
+        with col_doc1:
+            st.markdown(
+                """
+                <div style="
+                    color:#E8F0F5;
+                    font-size:11px;
+                    font-weight:700;
+                    margin-bottom:4px;
+                ">
+                    ▣ &nbsp; Antecedentes
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            if tiene_antecedentes:
+                antecedentes = documentos_formulario(f"antecedentes_{version}")
+            else:
+                antecedentes = []
+                st.caption("Sin antecedentes · este campo quedará vacío en Google Sheets.")
+        with col_doc2:
+            st.markdown(
+                """
+                <div style="
+                    color:#E8F0F5;
+                    font-size:11px;
+                    font-weight:700;
+                    margin-bottom:4px;
+                ">
+                    ◇ &nbsp; Anexos
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            anexos = documentos_formulario(f"anexos_{version}")
 
     observaciones = st.text_area(
         "Observaciones",
@@ -2329,11 +4012,19 @@ def formulario_nuevo_oficio():
         type="primary"
     ):
 
-        # Validar campos obligatorios
-        if not folio.strip() or not numero.strip():
+        # El número de oficio identifica también a los registros sin folio.
+        if not numero.strip():
             st.error(
-                "Debes capturar el folio y número de oficio."
+                "Indica el nombre o número con el que saldrá el oficio firmado."
+                if registro_solo_numero_salida
+                else "Debes capturar el número de oficio."
             )
+            return
+        if registro_solo_numero_salida and not proyecto:
+            st.error("Selecciona el proyecto al que pertenece el oficio.")
+            return
+        if tiene_folio and not folio.strip():
+            st.error("Captura el folio o desmarca «Este oficio tiene folio».")
             return
 
         if not responsable:
@@ -2344,22 +4035,49 @@ def formulario_nuevo_oficio():
             st.error("Para marcar un oficio como Firmado debes indicar su fecha de entrega.")
             return
 
+        if tramite_directo:
+            from urllib.parse import urlparse
+            link = urlparse(url_principal.strip())
+            if not nombre_principal.strip() or link.scheme != "https" or (link.hostname or "").lower() not in (
+                    "drive.google.com", "docs.google.com"):
+                st.error("El trámite directo requiere el nombre y una liga válida de Google Drive "
+                         "para el oficio principal.")
+                return
+
         try:
             with st.spinner("Guardando oficio en Google Sheets..."):
 
                 # Consultar registros existentes
                 existentes = obtener_oficios()
 
-                # Verificar folio duplicado
-                if (
-                    not existentes.empty
-                    and "Folio" in existentes.columns
-                    and folio.strip()
-                    in existentes["Folio"].astype(str).str.strip().values
-                ):
-                    st.error(
-                        "Ya existe un oficio registrado con ese folio."
-                    )
+                # Verificar identidad sin confundir todos los folios vacíos.
+                # No inventar un folio artificial: el número de oficio distingue
+                # los expedientes que carecen de él.
+                if not existentes.empty:
+                    if "Folio" in existentes.columns and folio.strip():
+                        if folio.strip() in existentes["Folio"].fillna("").astype(str).str.strip().values:
+                            st.error("Ya existe un oficio registrado con ese folio.")
+                            return
+                    if "No. de oficio" in existentes.columns:
+                        numeros = existentes["No. de oficio"].fillna("").astype(str).str.strip()
+                        folios = (existentes["Folio"].fillna("").astype(str).str.strip()
+                                  if "Folio" in existentes.columns else None)
+                        # Para nuevos oficios sin folio, la referencia debe ser
+                        # inequívoca aun si otro registro sí tiene folio.
+                        if not folio.strip() and numero.strip() in numeros.values:
+                            st.error("Ya existe un expediente con ese número de oficio. "
+                                     "Revísalo antes de guardar un registro sin folio.")
+                            return
+                        if folios is not None and ((numeros == numero.strip()) &
+                                                   (folios == folio.strip())).any():
+                            st.error("Ese oficio ya está registrado.")
+                            return
+
+                # Verificar que existe la hoja auxiliar antes de registrar en OFICIOS.
+                # No cambia las 12 columnas originales.
+                _hoja_modalidades()
+                if _modalidad_expediente(folio.strip(), numero.strip()):
+                    st.error("Este número de oficio ya tiene modalidad registrada.")
                     return
 
                 # Preparar información
@@ -2387,8 +4105,22 @@ def formulario_nuevo_oficio():
                     observaciones.strip()
                 ]
 
-                # Registrar en Google Sheets
+                # Registrar el oficio y su modalidad. Son dos hojas de un mismo libro;
+                # si la segunda escritura falla se muestra una advertencia específica
+                # para conciliar sin volver a duplicar el oficio.
                 guardar_oficio(datos)
+                try:
+                    _registrar_modalidad(
+                        folio.strip(), numero.strip(),
+                        "Directo" if tramite_directo else "Ordinario",
+                        tiene_antecedentes, nombre_principal.strip(), url_principal.strip(),
+                    )
+                except Exception as error:
+                    st.error("El oficio quedó guardado en OFICIOS, pero falló el registro "
+                             "de modalidad. No lo captures otra vez: solicita la "
+                             "conciliación de MODALIDADES_TRAMITE al administrador. "
+                             f"Detalle: {error}")
+                    return
 
             # Reiniciar formulario únicamente
             # después de completar el guardado
@@ -2686,6 +4418,138 @@ def _panel_revision_tte(registro):
     </style>
     """, unsafe_allow_html=True)
 
+    # Estilo de módulos segregados (únicamente revisión final de Alondra).
+    # Se coloca después de las hojas anteriores y usa claves de Streamlit.
+    st.markdown("""
+    <style>
+    /* Expediente principal: ligero aumento del límite entre oficios. */
+    .stMainBlockContainer div[class*="st-key-tte_expediente_"] {
+        background:linear-gradient(145deg,#F3EFE6,#EBE5D9)!important;
+        border:1px solid #BBA77F!important;
+        border-left:4px solid #BF9653!important;
+        border-radius:16px!important;
+        padding:16px 18px 14px!important;
+        margin-top:16px!important;
+        margin-bottom:42px!important;
+        box-shadow:0 13px 30px rgba(54,42,28,.13)!important;
+    }
+    /* PASO 01: mesa de consulta, salvia/gris cálido. */
+    .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] {
+        position:relative!important;
+        background:linear-gradient(135deg,#EBF0E9 0%,#F3F4ED 65%,#EDF0E6 100%)!important;
+        border:1.5px solid #9CAD91!important;
+        border-left:5px solid #70866A!important;
+        border-radius:13px!important;
+        padding:14px 16px 15px!important;
+        margin-top:15px!important;
+        margin-bottom:4px!important;
+        box-shadow:0 5px 14px rgba(58,81,57,.08)!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] [data-testid="stVerticalBlock"] {
+        gap:.55rem!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] .tte-document-line {
+        background:#FAFBF8!important;
+        border:1px solid #B7C5B0!important;
+        border-left:4px solid #748B6D!important;
+        padding:11px 13px!important;
+        margin:0 0 2px!important;
+        border-radius:9px!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] [data-testid="stExpander"] {
+        background:#FAFBF6!important;
+        border-color:#B4C1A8!important;
+        border-radius:9px!important;
+    }
+    /* Secciones Word/PDF: que se lean como parte de consulta documental. */
+    .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] [class*="st-key-tte_doc_"] {
+        border-color:#AEB9A0!important;
+    }
+    .tte-module-heading {
+        display:flex;align-items:center;gap:13px;
+        margin:0 0 10px;position:relative;
+        padding-bottom:10px;border-bottom:1px solid #BECBB7;
+    }
+    .tte-module-icon {
+        display:flex;align-items:center;justify-content:center;flex:none;
+        width:36px;height:36px;border-radius:9px;
+        color:#4C6348;background:#DCE8D7;border:1px solid #A7BA9E;
+        font-size:20px;font-weight:700;
+    }
+    .tte-module-copy {display:flex;flex-direction:column;gap:2px;min-width:0;}
+    .tte-module-overline {
+        color:#607A5E!important;font-size:9px!important;font-weight:850!important;
+        letter-spacing:1.65px!important;
+    }
+    .tte-module-copy strong {
+        color:#304A36!important;font-size:16px!important;line-height:1.3!important;
+    }
+    .tte-module-copy small {
+        color:#617568!important;font-size:11px!important;line-height:1.45!important;
+    }
+    .tte-module-tag {
+        margin-left:auto;align-self:center;white-space:nowrap;
+        border:1px solid #ADBF9E;border-radius:20px;
+        background:#E1EADB;color:#4C6D4A;
+        font-size:9px;font-weight:850;letter-spacing:1px;padding:6px 9px;
+    }
+    .tte-stage-separator {
+        display:flex;align-items:center;gap:12px;
+        margin:18px 2px 13px;color:#99715E;
+        font-weight:800;font-size:9px;letter-spacing:1.35px;text-align:center;
+    }
+    .tte-stage-separator span {
+        height:1px;flex:1;min-width:15px;
+        background:linear-gradient(90deg,transparent,#BD9881,transparent);
+    }
+    /* PASO 02: una superficie deliberadamente distinta, durazno marfil. */
+    .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] {
+        background:linear-gradient(145deg,#FCF3ED,#F8EAE0)!important;
+        border:1.5px solid #C69B82!important;
+        border-left:5px solid #B6795B!important;
+        border-top:3px solid #BA8164!important;
+        border-radius:13px!important;
+        box-shadow:0 7px 17px rgba(117,70,49,.09)!important;
+        margin:0 0 11px!important;
+        padding:17px 18px 16px!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] .dictamen-kicker {
+        color:#9C6048!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] .dictamen-titulo {
+        color:#583B35!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] .dictamen-descripcion {
+        color:#846358!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] {
+        background:rgba(255,252,248,.64)!important;
+        border:1px solid #D9B9A6!important;
+        border-radius:10px!important;
+        padding:12px 13px!important;
+        margin-top:9px!important;
+    }
+    .tte-expediente-cierre {
+        display:flex;align-items:center;gap:12px;margin:4px 0 0;
+        padding:8px 0 0;color:#8B7967;text-align:center;
+        font-weight:750;letter-spacing:1.45px;font-size:9px;
+        border-top:1px solid #C9BFAE;
+    }
+    .tte-fin-linea {
+        height:1px;flex:1;min-width:10px;
+        background:linear-gradient(90deg,transparent,#C2AE8D,transparent);
+    }
+    @media(max-width:760px) {
+        .stMainBlockContainer div[class*="st-key-tte_expediente_"] {padding:12px!important;margin-bottom:28px!important;}
+        .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] {padding:12px!important;}
+        .tte-module-tag {display:none;}
+        .tte-module-copy strong {font-size:14px!important;}
+        .tte-stage-separator {letter-spacing:.65px;font-size:8px;}
+        .tte-expediente-cierre {letter-spacing:.5px;font-size:8px;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     with st.container(key=f"tte_expediente_{clave}", border=True):
         # Encabezado del expediente: se conserva el diseño original, sin centrarlo.
         st.markdown(
@@ -2710,78 +4574,402 @@ def _panel_revision_tte(registro):
             <div class="tte-step"><span>3</span> Firma externa</div>
         </div>""", unsafe_allow_html=True)
 
-        st.markdown(f'<div class="tte-document-line"><span>📄</span><div>'
-                    f'<strong>{html.escape(nombre)}</strong>'
-                    '<small>Archivo Word · Versión vigente para revisión</small>'
-                    '</div></div>', unsafe_allow_html=True)
+        # PASO 01 — Consulta documental. El contenedor solo cambia presentación;
+        # no interviene en la descarga, la conversión o los permisos de Drive.
+        with st.container(key=f"tte_consulta_panel_{clave}", border=True):
+            st.markdown(
+                '<div class="tte-module-heading">'
+                '<div class="tte-module-icon" aria-hidden="true">▤</div>'
+                '<div class="tte-module-copy">'
+                '<span class="tte-module-overline">PASO 01 · CONSULTA</span>'
+                '<strong>Documentos del oficio</strong>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+            # Nombre íntegro en el tooltip; en pantalla no domina toda la ficha.
+            nombre_breve = nombre if len(nombre) <= 86 else nombre[:82] + "…"
+            st.markdown(
+                '<div class="tte-document-line notranslate" translate="no" lang="es-MX">'
+                '<span aria-hidden="true">📄</span><div>'
+                '<strong>Versión vigente</strong>'
+                f'<small title="{html.escape(nombre, quote=True)}">{html.escape(nombre_breve)}</small>'
+                '</div></div>', unsafe_allow_html=True,
+            )
 
-        ver, descargar = st.columns(2, gap="small")
-        with ver:
-            if url.startswith("https://"):
-                st.link_button("↗ Consultar en Google Drive", url, use_container_width=True)
-            else:
-                st.caption("Enlace de Drive no disponible")
-        with descargar:
-            if st.button("↓ Preparar descarga Word", key=f"tte_prepare_{clave}",
-                         use_container_width=True):
+            # Descargar/visualizar el mismo original privado; lógica sin cambios.
+            _botones_word_y_pdf(drive_id, nombre, f"tte_{folio}_{numero}_{version}")
+
+            with st.expander("Historial PDF · versiones anteriores", expanded=False):
                 try:
-                    with st.spinner("Preparando documento..."):
-                        st.session_state[f"tte_bytes_{clave}"] = _descargar_docx_drive(drive_id)
-                        st.session_state[f"tte_drive_id_{clave}"] = drive_id
+                    versiones = _borradores_expediente(folio, numero)
+                    anteriores = [v for v in versiones if int(v.get("Version") or 0) < version]
+                    eventos = _eventos_expediente(folio, numero)
+                    _mostrar_historial_pdf_por_version(
+                        folio, numero, anteriores, eventos,
+                        actual=next((v for v in versiones if int(v.get("Version") or 0) == version), None),
+                    )
                 except Exception as error:
-                    st.error(f"No se pudo preparar el documento: {error}")
-            if st.session_state.get(f"tte_drive_id_{clave}") == drive_id and f"tte_bytes_{clave}" in st.session_state:
-                st.download_button("Descargar archivo .docx", st.session_state[f"tte_bytes_{clave}"],
-                                   file_name=nombre,
-                                   mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                   key=f"tte_download_{clave}", use_container_width=True)
+                    st.warning(f"Historial temporalmente no disponible: {_mensaje_error_sheets(error)}")
 
-        with st.expander("Ver versiones anteriores y bitácora"):
-            try:
-                versiones = _borradores_expediente(folio, numero)
-                for v in reversed(versiones):
-                    link = str(v.get("URL", ""))
-                    etiqueta = f"V{int(v.get('Version') or 0):02d} · {v.get('Nombre', '')}"
-                    if link.startswith("https://"):
-                        st.markdown(f"[{html.escape(etiqueta)}]({link})")
-                    else:
-                        st.write(etiqueta)
-                eventos = _eventos_expediente(folio, numero)
-                for evento in reversed(eventos):
-                    st.caption(f"V{int(evento.get('Version') or 0):02d} · {evento.get('Fecha', '')} · "
-                               f"{evento.get('Accion', '')} · {evento.get('Usuario', '')} · "
-                               f"{evento.get('Detalle', '')}")
-            except Exception as error:
-                st.caption(f"Historial temporalmente no disponible: {_mensaje_error_sheets(error)}")
+        st.markdown(
+            '<div class="tte-stage-separator" aria-hidden="true">'
+            '<span></span><strong>REVISIÓN REALIZADA · EMITIR RESOLUCIÓN</strong><span></span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
-        st.markdown('<div class="tte-decision-title">Decisión sobre este documento</div>'
-                    '<div class="tte-decision-sub">Seleccione una opción y confirme para registrar el resultado.</div>',
-                    unsafe_allow_html=True)
-        decision = st.radio("Resultado de la revisión",
-                            ["Autorizar para firma", "Solicitar correcciones"],
-                            horizontal=True, key=f"tte_decision_{clave}",
-                            label_visibility="collapsed")
-        with st.form(key=f"tte_form_{clave}"):
-            if decision == "Solicitar correcciones":
-                archivo_tte = st.file_uploader(
-                    "Word con modificaciones de la Tte. (opcional)",
-                    type=["docx"], key=f"tte_word_devolucion_{clave}",
-                    help="John y Alejandra podrán abrirlo en Drive y descargarlo en Word.")
-                comentario = st.text_area(
-                    "Comentarios u observaciones (opcional)",
-                    placeholder="Puedes escribir observaciones o dejar este campo vacío.",
-                    key=f"tte_observaciones_{clave}")
-            else:
-                comentario = st.text_area("Observaciones adicionales (opcional)",
-                                          placeholder="Puede agregar alguna indicación para el trámite de firma...",
-                                          key=f"tte_observaciones_{clave}")
-            confirmado = st.checkbox(
-                "Confirmo que revisé el documento y deseo registrar esta decisión.",
-                key=f"tte_confirmar_{clave}")
-            enviar = st.form_submit_button(
-                "✓ Autorizar y enviar a firma" if decision == "Autorizar para firma"
-                else "↩ Solicitar correcciones",
-                type="primary", use_container_width=True)
+        # Panel de dictamen V2: dos botones-tarjeta NATIVOS de Streamlit.
+        # Evita los selectores CSS de radio que no funcionaron en versiones previas.
+        st.markdown("""
+        <style>
+        /* Panel de dictamen, aislado por identificador de expediente. */
+        div[class*="st-key-tte_dictamen_panel_"] {
+            position:relative!important;
+            padding:17px 20px 18px!important;
+            margin-top:12px!important;
+            border:1px solid #C7AE96!important;
+            border-left:4px solid #B88A66!important;
+            border-radius:14px!important;
+            background:linear-gradient(145deg,#FFFEFB 0%,#F5F0E8 100%)!important;
+            box-shadow:0 6px 18px rgba(61,43,46,.075)!important;
+            overflow:hidden!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"]::before {
+            content:"";position:absolute;inset:0 0 auto auto;
+            width:44%;height:76px;pointer-events:none;
+            background:
+              repeating-linear-gradient(165deg,transparent 0 17px,rgba(188,147,107,.15) 18px,transparent 19px 35px),
+              linear-gradient(90deg,transparent,rgba(194,153,113,.09));
+            mask-image:linear-gradient(90deg,transparent,black);
+            opacity:.8;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] .dictamen-cabecera {
+            display:flex;align-items:center;justify-content:space-between;
+            position:relative;z-index:1;gap:14px;margin-bottom:14px;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] .dictamen-kicker {
+            font-size:10px!important;font-weight:850!important;
+            letter-spacing:1.8px!important;color:#9D7055!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] .dictamen-titulo {
+            font-size:23px!important;font-weight:800!important;
+            line-height:1.18!important;color:#403540!important;margin-top:4px;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] .dictamen-descripcion {
+            color:#81746F!important;font-size:12px!important;margin-top:5px;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] .dictamen-sello {
+            width:38px;height:38px;flex-shrink:0;
+            display:flex;align-items:center;justify-content:center;
+            border:1px solid #C9AB8D;border-radius:10px;
+            background:#F1E6D9;color:#946F50;font-size:20px;
+        }
+
+        /* TARJETAS DE DECISIÓN */
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_"] button,
+        div[class*="st-key-tte_dict_choice_"] button {
+            position:relative!important;
+            display:block!important;
+            width:100%!important;
+            min-height:106px!important;
+            margin:0!important;
+            padding:22px 18px 16px 78px!important;
+            border:1.6px solid #CBBFB2!important;
+            border-radius:15px!important;
+            text-align:left!important;
+            white-space:normal!important;
+            box-shadow:inset 0 1px 0 rgba(255,255,255,.82)!important;
+            transition:border-color .18s, background .18s, transform .18s, box-shadow .18s!important;
+            overflow:hidden!important;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_"] button:hover,
+        div[class*="st-key-tte_dict_choice_"] button:hover {
+            transform:translateY(-1px)!important;
+            box-shadow:0 6px 16px rgba(74,56,52,.10)!important;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_"] button:focus-visible,
+        div[class*="st-key-tte_dict_choice_"] button:focus-visible {
+            outline:2px solid #B98B65!important;outline-offset:2px!important;
+        }
+        div[class*="st-key-tte_dict_choice_"] button > div,
+        div[class*="st-key-tte_dict_choice_"] button > div > div,
+        div[class*="st-key-tte_dict_choice_"] button span,
+        div[class*="st-key-tte_dict_choice_"] button p {
+            display:block!important;
+            width:100%!important;
+            text-align:left!important;
+            justify-content:flex-start!important;
+            align-items:flex-start!important;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_"] button p,
+        div[class*="st-key-tte_dict_choice_"] button p {
+            margin:0!important;
+            color:#43393C!important;
+            font-size:15px!important;
+            font-weight:790!important;
+            line-height:1.15!important;
+            letter-spacing:.1px!important;
+            text-align:left!important;
+        }
+        div[class*="st-key-tte_dict_choice_"] button::before {
+            position:absolute;left:18px;top:20px;
+            width:34px;height:34px;border-radius:10px;
+            display:grid;place-items:center;
+            font-size:20px;font-weight:850;
+            box-shadow:inset 0 1px 0 rgba(255,255,255,.65);
+        }
+        div[class*="st-key-tte_dict_choice_"] button::after {
+            position:absolute;left:78px;right:18px;top:57px;
+            font-size:12px;font-weight:520;line-height:1.35;text-align:left;
+        }
+
+        /* AUTORIZAR */
+        div[class*="st-key-tte_dict_choice_accept_"] button {
+            background:linear-gradient(180deg,#EEF5EA 0%,#E6EFE2 100%)!important;
+            border-color:#A9BAA3!important;
+        }
+        div[class*="st-key-tte_dict_choice_accept_"] button::before {
+            content:"✓";background:#D9E8D3;color:#547253;
+        }
+        div[class*="st-key-tte_dict_choice_accept_"] button::after {
+            content:"Documento validado para continuar con el proceso de firma.";
+            color:#5F7860;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_accept_selected_"] button,
+        div[class*="st-key-tte_dict_choice_accept_selected_"] button {
+            background:linear-gradient(180deg,#DCECD8 0%,#D3E5CF 100%)!important;
+            border:2px solid #6F9573!important;
+            box-shadow:inset 5px 0 0 #6F9573, 0 6px 16px rgba(70,103,75,.10)!important;
+        }
+        div[class*="st-key-tte_dict_choice_accept_selected_"] button p {
+            color:#304C34!important;
+        }
+        div[class*="st-key-tte_dict_choice_accept_selected_"] button::after {
+            color:#48664B!important;
+        }
+
+        /* CORRECCIONES */
+        div[class*="st-key-tte_dict_choice_return_"] button {
+            background:linear-gradient(180deg,#FBF0EE 0%,#F8E8E6 100%)!important;
+            border-color:#D3A9A1!important;
+        }
+        div[class*="st-key-tte_dict_choice_return_"] button::before {
+            content:"↶";background:#F0D9D4;color:#9D5A53;
+        }
+        div[class*="st-key-tte_dict_choice_return_"] button::after {
+            content:"Devolver el documento con las observaciones necesarias.";
+            color:#8D645D;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dict_choice_return_selected_"] button,
+        div[class*="st-key-tte_dict_choice_return_selected_"] button {
+            background:linear-gradient(180deg,#F5DCD8 0%,#F1D2CD 100%)!important;
+            border:2px solid #B96F67!important;
+            box-shadow:inset 5px 0 0 #B96F67, 0 6px 16px rgba(146,83,75,.10)!important;
+        }
+        div[class*="st-key-tte_dict_choice_return_selected_"] button p {
+            color:#6E3935!important;
+        }
+        div[class*="st-key-tte_dict_choice_return_selected_"] button::after {
+            color:#86514D!important;
+        }
+
+        /* FORMULARIO */
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] {
+            margin-top:10px!important;padding:14px 0 0!important;
+            background:transparent!important;border:0!important;
+            border-top:1px solid #DDCDBD!important;border-radius:0!important;
+            box-shadow:none!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] [data-testid="stWidgetLabel"] p {
+            font-size:12px!important;font-weight:680!important;color:#584A4A!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] [data-baseweb="textarea"] > div,
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] [data-testid="stFileUploaderDropzone"] {
+            background:#FFFEFC!important;border:1px solid #CDBDAD!important;
+            border-radius:10px!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stForm"] textarea {
+            background:#FFFEFC!important;color:#463941!important;
+            min-height:74px!important;font-size:13px!important;line-height:1.45!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stCheckbox"] p {
+            font-size:12px!important;color:#605454!important;
+        }
+        .stMainBlockContainer div[class*="st-key-tte_dictamen_panel_"] [data-testid="stFormSubmitButton"] button,
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stFormSubmitButton"] button {
+            background:#5D564D!important;color:#FFFDFB!important;
+            border:1px solid #BD9169!important;
+            border-left:4px solid #D0A675!important;
+            border-radius:10px!important;
+            min-height:48px!important;font-size:14px!important;font-weight:770!important;
+            box-shadow:0 4px 12px rgba(49,36,47,.13)!important;
+        }
+        div[class*="st-key-tte_dictamen_panel_"] [data-testid="stFormSubmitButton"] button:hover {
+            background:#70675C!important;color:#fff!important;
+        }
+
+        @media(max-width:780px) {
+            div[class*="st-key-tte_dictamen_panel_"]{padding:14px 12px!important;}
+            div[class*="st-key-tte_dict_choice_"] button{
+                min-height:114px!important;
+                padding:19px 12px 14px 64px!important;
+            }
+            div[class*="st-key-tte_dict_choice_"] button::before{
+                left:14px;top:18px;width:30px;height:30px;font-size:18px;
+            }
+            div[class*="st-key-tte_dict_choice_"] button::after{
+                left:64px;right:12px;top:54px;font-size:11.5px;
+            }
+            div[class*="st-key-tte_dict_choice_"] button p{
+                font-size:14px!important;
+            }
+        }
+
+        /* COLORES DE RELLENO: verde / rojo compatibles con marfil y cobre */
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_accept_"] button,
+        [class*="st-key-tte_dict_choice_accept_"] button {
+            background:linear-gradient(135deg,#DCEBD7 0%,#CEE2C9 100%)!important;
+            border:1.8px solid #84A482!important;
+        }
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_accept_selected_"] button,
+        [class*="st-key-tte_dict_choice_accept_selected_"] button {
+            background:linear-gradient(135deg,#CCE4C8 0%,#B5D6B3 100%)!important;
+            border:2px solid #5D8B65!important;
+            box-shadow:inset 5px 0 0 #5D8B65,0 5px 15px rgba(56,102,67,.13)!important;
+        }
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_return_"] button,
+        [class*="st-key-tte_dict_choice_return_"] button {
+            background:linear-gradient(135deg,#F5DDD9 0%,#ECCDC7 100%)!important;
+            border:1.8px solid #CB8A80!important;
+        }
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_return_selected_"] button,
+        [class*="st-key-tte_dict_choice_return_selected_"] button {
+            background:linear-gradient(135deg,#F0CCC6 0%,#E9B3AC 100%)!important;
+            border:2px solid #AD5E58!important;
+            box-shadow:inset 5px 0 0 #AD5E58,0 5px 15px rgba(130,66,62,.14)!important;
+        }
+        /* El texto pertenece a una fila distinta de la descripción; no se superponen. */
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_"] button,
+        [class*="st-key-tte_dict_choice_"] button {
+            display:flex!important;
+            align-items:flex-start!important;
+            justify-content:flex-start!important;
+            min-height:112px!important;
+            padding:22px 15px 44px 68px!important;
+        }
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_"] button > div,
+        [class*="st-key-tte_dict_choice_"] button > div {
+            align-self:flex-start!important;
+            display:flex!important;
+            align-items:flex-start!important;
+            justify-content:flex-start!important;
+            min-width:0!important;
+        }
+        .stMainBlockContainer [class*="st-key-tte_dict_choice_"] button p,
+        [class*="st-key-tte_dict_choice_"] button p {
+            text-align:left!important;
+            font-size:14px!important;
+            font-weight:760!important;
+            line-height:1.32!important;
+            margin:0!important;
+            padding:0!important;
+            overflow-wrap:break-word!important;
+        }
+        [class*="st-key-tte_dict_choice_"] button::before {
+            left:17px!important;top:20px!important;
+            width:33px!important;height:33px!important;
+        }
+        [class*="st-key-tte_dict_choice_"] button::after {
+            left:68px!important;right:14px!important;
+            top:auto!important;bottom:18px!important;
+            font-size:11.5px!important;
+            line-height:1.35!important;
+            white-space:normal!important;
+        }
+        /* Cada acción obtiene sus colores de título, sin alterar la jerarquía tipográfica. */
+        [class*="st-key-tte_dict_choice_accept_"] button p {color:#355439!important;}
+        [class*="st-key-tte_dict_choice_return_"] button p {color:#763D39!important;}
+        @media(max-width:780px) {
+            .stMainBlockContainer [class*="st-key-tte_dict_choice_"] button,
+            [class*="st-key-tte_dict_choice_"] button {
+                min-height:122px!important;padding:18px 11px 50px 59px!important;
+            }
+            [class*="st-key-tte_dict_choice_"] button::before {
+                left:12px!important;top:16px!important;
+            }
+            [class*="st-key-tte_dict_choice_"] button::after {
+                left:59px!important;right:9px!important;bottom:12px!important;
+                font-size:10.8px!important;
+            }
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        with st.container(key=f"tte_dictamen_panel_{clave}"):
+            st.markdown(
+                '<div class="dictamen-cabecera">'
+                '<div><div class="dictamen-kicker">PASO 02 · EMISIÓN DE DICTAMEN</div>'
+                '<div class="dictamen-titulo">Dictamen de revisión</div>'
+                '<div class="dictamen-descripcion">Registra la autorización o devuelve el documento con observaciones.</div>'
+                '</div><div class="dictamen-sello" aria-hidden="true">◇</div></div>',
+                unsafe_allow_html=True,
+            )
+            decision_key = f"tte_decision_{clave}"
+            if st.session_state.get(decision_key) not in ("Autorizar para firma", "Solicitar correcciones"):
+                st.session_state[decision_key] = "Autorizar para firma"
+
+            # Botones auténticos, enteramente clicables. Se guarda únicamente el
+            # resultado seleccionado en Session State; no se registra ningún cambio
+            # documental hasta el submit confirmado que está más abajo.
+            col_autorizar, col_correcciones = st.columns(2, gap="medium")
+            with col_autorizar:
+                with st.container(key=f"tte_dict_choice_accept_{'selected' if st.session_state[decision_key] == 'Autorizar para firma' else 'idle'}_{clave}"):
+                    if st.button(
+                        "Autorizar para firma",
+                        key=f"tte_elegir_autorizar_{clave}",
+                        use_container_width=True,
+                        help="Documento validado para continuar con el proceso de firma.",
+                    ):
+                        st.session_state[decision_key] = "Autorizar para firma"
+                        st.rerun()
+            with col_correcciones:
+                with st.container(key=f"tte_dict_choice_return_{'selected' if st.session_state[decision_key] == 'Solicitar correcciones' else 'idle'}_{clave}"):
+                    if st.button(
+                        "Solicitar correcciones",
+                        key=f"tte_elegir_correcciones_{clave}",
+                        use_container_width=True,
+                        help="Devolver el documento con las observaciones necesarias.",
+                    ):
+                        st.session_state[decision_key] = "Solicitar correcciones"
+                        st.rerun()
+            decision = st.session_state[decision_key]
+            with st.form(key=f"tte_form_{clave}"):
+                if decision == "Solicitar correcciones":
+                    archivo_tte = st.file_uploader(
+                        "Word o PDF con modificaciones de la Tte. (opcional)",
+                        type=["docx", "pdf"], key=f"tte_word_devolucion_{clave}",
+                        help="Adjunto opcional. John y Alejandra podrán consultarlo en Drive como Word o PDF.",
+                    )
+                    comentario = st.text_area(
+                        "Comentarios u observaciones (opcional)",
+                        placeholder="Indica las correcciones necesarias para esta versión...",
+                        key=f"tte_observaciones_{clave}", height=76,
+                    )
+                else:
+                    comentario = st.text_area(
+                        "Observaciones adicionales (opcional)",
+                        placeholder="Agrega una indicación para el trámite de firma, si hace falta...",
+                        key=f"tte_observaciones_{clave}", height=76,
+                    )
+                confirmado = st.checkbox(
+                    "Confirmo que revisé el documento y deseo registrar esta decisión.",
+                    key=f"tte_confirmar_{clave}",
+                )
+                enviar = st.form_submit_button(
+                    "✓ Autorizar y enviar a firma →" if decision == "Autorizar para firma"
+                    else "↶ Devolver para correcciones →",
+                    type="primary", use_container_width=True,
+                )
         if enviar:
             if not confirmado:
                 st.warning("Marque la confirmación antes de registrar su decisión.")
@@ -2792,7 +4980,7 @@ def _panel_revision_tte(registro):
                         # Guardar primero el adjunto opcional para que quede asociado
                         # a la devolución vigente en EVENTOS_BORRADORES.
                         if nueva_etapa == ETAPA_CORRECCIONES and archivo_tte is not None:
-                            _adjuntar_word_corregido_tte(folio, numero, archivo_tte)
+                            _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
                         _actualizar_oficio_flujo(folio, numero, {
                             "Estatus": "En firma" if nueva_etapa == ETAPA_FIRMA else "En correcciones"
                         }, autorizacion_tte=True)
@@ -2802,10 +4990,66 @@ def _panel_revision_tte(registro):
                 except Exception as error:
                     st.error(_mensaje_error_sheets(error))
 
+        # Cierre visual: identifica el límite del expediente cuando hay varios.
+        st.markdown(
+            '<div class="tte-expediente-cierre" aria-hidden="true">'
+            '<span class="tte-fin-linea"></span>'
+            '<span>FIN DEL EXPEDIENTE · SIGUIENTE REGISTRO</span>'
+            '<span class="tte-fin-linea"></span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _resumen_revision_tte(ultimos, recibidos):
+    """Indicadores reales, sin contar varias veces una misma versión.
+
+    - Por revisar: última versión de cada expediente en revisión de la Tte.
+    - Recibidos semana: evento de ingreso a revisión de la Tte. en la semana
+      calendario local de Ciudad de México (lunes a domingo).
+    - Pendientes totales: última versión en revisión de Tte. o en firma.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import timedelta
+
+    total_pendientes = sum(
+        str(registro.get("Etapa", "")).strip() in {ETAPA_TTE, ETAPA_FIRMA}
+        for registro in ultimos.values()
+    )
+    try:
+        eventos = _leer_registros_eventos()
+    except Exception:
+        # No sustituimos información no disponible por un cero engañoso.
+        return len(recibidos), None, total_pendientes
+
+    ahora = datetime.now(ZoneInfo("America/Mexico_City"))
+    lunes = (ahora - timedelta(days=ahora.weekday())).date()
+    siguientes_lunes = lunes + timedelta(days=7)
+    versiones_recibidas = set()
+    for evento in eventos:
+        if str(evento.get("Accion", "")).strip() != ETAPA_TTE:
+            continue
+        fecha_raw = str(evento.get("Fecha", "")).strip()
+        try:
+            fecha = datetime.fromisoformat(fecha_raw.replace("Z", "+00:00"))
+            if fecha.tzinfo is None:
+                fecha = fecha.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+            fecha_local = fecha.astimezone(ZoneInfo("America/Mexico_City")).date()
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if lunes <= fecha_local < siguientes_lunes:
+            versiones_recibidas.add((
+                str(evento.get("Folio", "")).strip(),
+                str(evento.get("No. de oficio", "")).strip(),
+                str(evento.get("Version", "")).strip(),
+            ))
+    return len(recibidos), len(versiones_recibidas), total_pendientes
+
 
 def _bandeja_borradores_compartida():
     """Bandeja operativa con acciones para cada revisor."""
-    st.markdown("#### Documentos que requieren atención")
+    if not puede_realizar_revision_final():
+        st.markdown("#### Documentos que requieren atención")
     try:
         registros = _leer_registros_borradores()
     except Exception as error:
@@ -2825,56 +5069,123 @@ def _bandeja_borradores_compartida():
             ultimos[clave] = r
     recibidos = [r for r in ultimos.values() if r.get("Etapa") in etapas]
     if puede_realizar_revision_final():
-        st.markdown('<div class="tte-queue-header"><div class="tte-queue-eyebrow">MESA DE DISEÑO GEOMÉTRICO · AUTORIZACIONES</div>'
-                    '<div class="tte-queue-heading">Centro de autorizaciones</div>'
-                    '<div class="tte-queue-description">Revise los documentos recibidos y registre su decisión en cada expediente.</div>'
-                    '</div>', unsafe_allow_html=True)
-        # Resumen superior: tres indicadores centrados en tarjetas grises.
-        # No modificar el encabezado de cada expediente.
+        imagen_centro = _imagen_selector("banner_centro_autorizaciones.png")
+        imagen_centro_html = (
+            f'<span class="tte-queue-illustration" style="background-image:url(\'{imagen_centro}\')" aria-hidden="true"></span>'
+            if imagen_centro else ''
+        )
+        st.markdown(
+            '<div class="tte-queue-header">'
+            + imagen_centro_html
+            + '<div class="tte-queue-content">'
+            '<div class="tte-queue-eyebrow">CONTROL Y SEGUIMIENTO / AUTORIZACIONES</div>'
+            '<div class="tte-queue-heading">Centro de autorizaciones</div>'
+            '<div class="tte-queue-description">Revisa los documentos recibidos y registra tu decisión en cada expediente.</div>'
+            '</div>'
+            '<div class="tte-queue-rail">DOCUMENTACIÓN &nbsp; / &nbsp; AUTORIZACIONES &nbsp; / &nbsp; CONTROL</div>'
+            '</div>', unsafe_allow_html=True,
+        )
+        # Tres indicadores para la Tte. basados en registros y bitácora reales.
+        por_revisar, recibidos_semana, pendientes_totales = _resumen_revision_tte(ultimos, recibidos)
+        try:
+            oficios_actuales = {(str(x.get("Folio", "")).strip(),
+                                 str(x.get("No. de oficio", "")).strip()): x
+                                for x in _leer_registros_oficios()}
+            modalidades_directas = [x for x in _leer_modalidades()
+                                   if x.get("Tipo de trámite") == "Directo"]
+
+            def _estado_real_directo(m):
+                return str(oficios_actuales.get((str(m.get("Folio", "")).strip(),
+                    str(m.get("No. de oficio", "")).strip()), {}).get("Estatus", "")).strip()
+
+            directos_en_revision = [m for m in modalidades_directas
+                                    if m.get("Estado directo") == "Pendiente de autorización"
+                                    and _estado_real_directo(m) == "En revisión"]
+            directos_en_firma = [m for m in modalidades_directas
+                                if m.get("Estado directo") == "En firma"
+                                and _estado_real_directo(m) == "En firma"]
+            por_revisar += len(directos_en_revision)
+            pendientes_totales += len(directos_en_revision) + len(directos_en_firma)
+            # Ingresos de esta semana: también se cuentan los ya autorizados,
+            # no solo los que permanecen pendientes al consultarlos.
+            if recibidos_semana is not None:
+                from zoneinfo import ZoneInfo
+                from datetime import timedelta
+                hoy_tte = datetime.now(ZoneInfo("America/Mexico_City")).date()
+                lunes_tte = hoy_tte - timedelta(days=hoy_tte.weekday())
+                for direct in modalidades_directas:
+                    if (str(direct.get("Folio", "")).strip(),
+                        str(direct.get("No. de oficio", "")).strip()) not in oficios_actuales:
+                        continue
+                    try:
+                        fecha_directa = datetime.fromisoformat(str(direct.get("Fecha registro", "")))
+                        if fecha_directa.tzinfo and lunes_tte <= fecha_directa.astimezone(ZoneInfo("America/Mexico_City")).date() <= hoy_tte:
+                            recibidos_semana += 1
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as error:
+            st.warning("No se pudieron incluir los trámites directos en los indicadores: " + str(error))
         st.markdown("""
         <style>
+        /* Indicadores exclusivos de la bandeja de revisión final. */
         .tte-summary-card {
-            background:linear-gradient(145deg,#424546,#555859);
-            border:1px solid #747674;
-            border-left:4px solid #c79d59;
+            background:linear-gradient(145deg,#F8F3EB,#EEE7DC);
+            border:1px solid #C7B8A1;
+            border-left:4px solid #B48B55;
             border-radius:12px;
-            min-height:112px;
-            padding:18px 12px 15px;
-            box-shadow:0 5px 14px rgba(25,26,26,.13);
+            min-height:114px;
+            padding:15px 14px 13px;
+            box-shadow:0 5px 14px rgba(60,48,34,.10);
             display:flex;flex-direction:column;align-items:center;
-            justify-content:center;text-align:center;gap:7px;
+            justify-content:center;text-align:center;gap:5px;
         }
         .tte-summary-label {
-            color:#e3e3e1 !important;font-size:13px !important;
-            font-weight:650 !important;line-height:1.3 !important;
+            color:#4D463E!important;font-size:12px!important;
+            font-weight:750!important;line-height:1.3!important;
         }
         .tte-summary-value {
-            color:#fff !important;font-size:27px !important;
-            line-height:1.1 !important;font-weight:800 !important;
-            overflow-wrap:anywhere;
+            color:#34312C!important;font-size:28px!important;
+            line-height:1.15!important;font-weight:800!important;
         }
-        .tte-summary-card--final .tte-summary-value {font-size:22px !important;}
+        .tte-summary-icon {font-size:18px;line-height:1;color:#A47D47;}
+        .tte-summary-card--weekly {border-left-color:#A86C4A;}
+        .tte-summary-card--weekly .tte-summary-icon {color:#A86C4A;}
+        .tte-summary-card--total {border-left-color:#6E7F57;}
+        .tte-summary-card--total .tte-summary-icon {color:#6E7F57;}
         @media(max-width:640px){
-            .tte-summary-card {min-height:94px;padding:12px 6px;}
-            .tte-summary-label {font-size:11px !important;}
-            .tte-summary-value {font-size:21px !important;}
+            .tte-summary-card {min-height:100px;padding:12px 6px;}
+            .tte-summary-label {font-size:10px!important;}
+            .tte-summary-value {font-size:23px!important;}
         }
         </style>
         """, unsafe_allow_html=True)
         m1, m2, m3 = st.columns(3, gap="small")
         with m1:
-            st.markdown(f'<div class="tte-summary-card"><div class="tte-summary-label">Por revisar</div>'
-                        f'<div class="tte-summary-value">{len(recibidos):02d}</div></div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="tte-summary-card"><span class="tte-summary-icon">▤</span>'
+                f'<div class="tte-summary-value">{por_revisar:02d}</div>'
+                '<div class="tte-summary-label">Por revisar</div></div>',
+                unsafe_allow_html=True,
+            )
         with m2:
-            st.markdown(f'<div class="tte-summary-card"><div class="tte-summary-label">Documentos recibidos</div>'
-                        f'<div class="tte-summary-value">{len(ultimos):02d}</div></div>',
-                        unsafe_allow_html=True)
+            semanal_texto = f"{recibidos_semana:02d}" if recibidos_semana is not None else "—"
+            st.markdown(
+                '<div class="tte-summary-card tte-summary-card--weekly">'
+                '<span class="tte-summary-icon">◷</span>'
+                f'<div class="tte-summary-value">{semanal_texto}</div>'
+                '<div class="tte-summary-label">Documentos recibidos en la semana</div></div>',
+                unsafe_allow_html=True,
+            )
         with m3:
-            st.markdown('<div class="tte-summary-card tte-summary-card--final">'
-                        '<div class="tte-summary-label">Tipo de revisión</div>'
-                        '<div class="tte-summary-value">Final</div></div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                '<div class="tte-summary-card tte-summary-card--total">'
+                '<span class="tte-summary-icon">✓</span>'
+                f'<div class="tte-summary-value">{pendientes_totales:02d}</div>'
+                '<div class="tte-summary-label">Pendientes totales (firma/revisión)</div></div>',
+                unsafe_allow_html=True,
+            )
+        if recibidos_semana is None:
+            st.caption("El dato semanal no está disponible: no se pudo consultar la bitácora.")
         if recibidos:
             busqueda = st.text_input("Buscar documento", placeholder="Buscar por folio o número de oficio...",
                                      key="tte_busqueda_revision")
@@ -2883,11 +5194,14 @@ def _bandeja_borradores_compartida():
                 recibidos = [r for r in recibidos if filtro in normalizar_texto(
                     f"{r.get('Folio', '')} {r.get('No. de oficio', '')} {r.get('Nombre', '')}")]
         if not recibidos:
-            st.success("No hay documentos pendientes de su revisión.")
-            return
-        st.caption(f"{len(recibidos)} documento(s) en la bandeja · Seleccione la decisión dentro de cada expediente.")
-        for r in recibidos:
-            _panel_revision_tte(r)
+            st.success("No hay borradores pendientes de su revisión.")
+        else:
+            st.caption(f"{len(recibidos)} documento(s) en la bandeja · Seleccione la decisión dentro de cada expediente.")
+            for r in recibidos:
+                _panel_revision_tte(r)
+        # Una entrada directa no tiene filas en BORRADORES: se consulta aquí
+        # independientemente del proceso ordinario.
+        _panel_tramites_directos_tte()
         return
     if not recibidos:
         st.info("No hay documentos esperando tu intervención.")
@@ -2972,31 +5286,267 @@ def _bandeja_borradores_compartida():
 
 
 def _vista_firma_externa(registros):
-    st.markdown("#### En proceso de firma")
-    st.caption("La firma ocurre fuera de la plataforma. Aquí solo consultamos los oficios enviados.")
-    firmando = registros.loc[registros["Estatus"].fillna("").astype(str).str.strip() == "En firma"]
+    """Bandeja de consulta de los oficios en firma externa (sin acciones de edición).
+
+    Pensada para ~20 registros: búsqueda local y paginación de cinco tarjetas.
+    Usa únicamente los datos ya existentes en la tabla de oficios.
+    """
+    import html
+
+    st.markdown("""
+    <style>
+    /* Diseño exclusivo de la bandeja de firma. No modifica otros módulos. */
+    .firma-bandeja-head {
+        display:flex;align-items:center;justify-content:space-between;
+        gap:18px;flex-wrap:wrap;
+        padding:18px 21px 16px;
+        background:linear-gradient(110deg,#F9F5EF 0%,#EFE8DD 100%);
+        border:1px solid #C9B79F;border-left:4px solid #78917D;
+        border-radius:13px;box-shadow:0 5px 16px rgba(52,47,40,.065);
+        margin:7px 0 14px;
+    }
+    .firma-bandeja-eyebrow {
+        color:#9A7453;font-size:10px;letter-spacing:1.5px;
+        font-weight:800;margin-bottom:4px;
+    }
+    .firma-bandeja-title {
+        font-weight:800;color:#443944;font-size:23px;line-height:1.2;
+        margin:0 0 4px;
+    }
+    .firma-bandeja-desc {font-size:12px;color:#81746B;line-height:1.45;}
+    .firma-bandeja-count {
+        display:flex;align-items:center;gap:10px;
+        border:1px solid #ACC0AA;background:#E7EFE4;
+        border-radius:11px;padding:10px 14px;
+    }
+    .firma-bandeja-count strong {
+        font-size:26px;line-height:1;font-weight:800;color:#49634F;
+        font-variant-numeric:tabular-nums;
+    }
+    .firma-bandeja-count span {
+        font-size:11px;color:#59715C;line-height:1.25;font-weight:700;
+    }
+    .firma-list-count {margin:0 0 8px;color:#877569;font-size:11px;letter-spacing:.2px;}
+    .firma-seguimiento-card {
+        position:relative;overflow:hidden;
+        background:linear-gradient(118deg,#FFFCF8 0%,#FAF5EE 100%);
+        border:1px solid #C8B7A3;border-left:4px solid #78907B;
+        border-radius:13px;box-shadow:0 5px 16px rgba(57,49,44,.075);
+        padding:17px 20px 15px;margin:0 0 13px;
+    }
+    .firma-seguimiento-card::after {
+        content:"";position:absolute;top:0;right:0;
+        width:39%;height:72px;pointer-events:none;opacity:.45;
+        background:repeating-linear-gradient(164deg,transparent 0 17px,rgba(173,144,109,.18) 18px,transparent 19px 32px);
+        mask-image:linear-gradient(90deg,transparent,black);
+    }
+    .firma-card-top {
+        display:flex;justify-content:space-between;align-items:flex-start;
+        gap:14px;position:relative;z-index:1;
+    }
+    .firma-card-left {min-width:0;flex:1;}
+    .firma-card-kicker {
+        color:#A07C58;font-size:9px;letter-spacing:1.4px;
+        font-weight:800;margin-bottom:6px;
+    }
+    .firma-card-oficio {
+        color:#453842;font-size:19px;line-height:1.25;font-weight:800;
+        overflow-wrap:anywhere;
+    }
+    .firma-card-folio {font-size:11px;color:#89776C;margin-top:4px;}
+    .firma-card-status {
+        flex-shrink:0;display:flex;gap:7px;align-items:center;
+        color:#4E6C54;background:#E5EFE3;border:1px solid #A5BBA6;
+        padding:7px 11px;border-radius:100px;font-size:11px;font-weight:750;
+        white-space:nowrap;
+    }
+    .firma-card-status::before {content:"◷";font-size:14px;line-height:1;}
+    .firma-card-body {
+        display:grid;grid-template-columns:minmax(160px,1fr) minmax(0,2fr);
+        gap:16px;border-top:1px solid #E5D9CD;
+        margin-top:13px;padding-top:11px;
+    }
+    .firma-data-label {
+        color:#9B785B;font-size:9px;font-weight:800;
+        letter-spacing:1.1px;margin-bottom:4px;
+    }
+    .firma-data-value {
+        color:#4B4143;font-size:12.5px;font-weight:650;
+        line-height:1.45;overflow-wrap:anywhere;
+    }
+    .firma-card-timeline {
+        margin-top:13px;padding:11px 14px 9px;
+        border-radius:9px;background:#F3EFE8;
+        border:1px solid #E0D5C7;
+    }
+    .firma-timeline-title {
+        color:#98785C;font-size:9px;font-weight:800;
+        letter-spacing:1.2px;margin-bottom:9px;
+    }
+    .firma-stages {
+        display:grid;grid-template-columns:1fr auto 1fr auto 1fr;
+        gap:9px;align-items:center;
+    }
+    .firma-stage {display:flex;align-items:center;gap:7px;min-width:0;}
+    .firma-stage-circle {
+        flex-shrink:0;width:22px;height:22px;
+        display:grid;place-items:center;border-radius:50%;
+        font-size:12px;font-weight:800;
+    }
+    .firma-stage.done .firma-stage-circle {background:#64866A;color:white;}
+    .firma-stage.active .firma-stage-circle {
+        background:#C39B67;color:#FFFDF7;
+        box-shadow:0 0 0 3px rgba(195,155,103,.16);
+    }
+    .firma-stage.future .firma-stage-circle {border:1px solid #C6BBAE;color:#A3978D;}
+    .firma-stage-label {font-size:10px;line-height:1.25;font-weight:700;color:#77675E;}
+    .firma-stage.done .firma-stage-label {color:#64826A;}
+    .firma-stage.active .firma-stage-label {color:#9E753F;}
+    .firma-stage-link {height:1px;width:22px;background:#CDBCA6;}
+    .firma-stage-link.done {background:#7F9F83;}
+    @media(max-width:720px) {
+        .firma-bandeja-head {padding:13px 14px;}
+        .firma-bandeja-title {font-size:19px;}
+        .firma-seguimiento-card {padding:13px 13px 12px;}
+        .firma-card-status {font-size:10px;padding:6px 8px;}
+        .firma-card-oficio {font-size:16px;}
+        .firma-card-body {grid-template-columns:1fr;gap:10px;}
+        .firma-stages {gap:4px;}
+        .firma-stage {gap:4px;}
+        .firma-stage-circle {width:19px;height:19px;font-size:11px;}
+        .firma-stage-label {font-size:9px;}
+        .firma-stage-link {width:11px;}
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Mantener el criterio de estado original. Esta pantalla no muta los datos.
+    firmando = registros.loc[
+        registros["Estatus"].fillna("").astype(str).str.strip() == "En firma"
+    ].copy()
+    total = len(firmando)
+
+    st.markdown(
+        '<div class="firma-bandeja-head">'
+        '<div><div class="firma-bandeja-eyebrow">CONTROL DOCUMENTAL / SEGUIMIENTO</div>'
+        '<div class="firma-bandeja-title">Oficios en proceso de firma</div>'
+        '<div class="firma-bandeja-desc">Consulta de documentos enviados para firma externa.</div></div>'
+        '<div class="firma-bandeja-count">'
+        f'<strong>{total:02d}</strong><span>En proceso<br>de firma</span>'
+        '</div></div>',
+        unsafe_allow_html=True,
+    )
     if firmando.empty:
         st.info("No hay oficios registrados actualmente en firma.")
         return
-    for _, r in firmando.iterrows():
-        with st.container(border=True):
-            st.markdown(f"**{r.get('No. de oficio', '')}** · Folio {r.get('Folio', '')}")
-            st.caption(f"Responsable: {r.get('Responsable', '')} · En firma externa")
-            st.write(str(r.get("Asunto", "")))
 
+    # Hasta unos 20 expedientes: búsqueda y 5 fichas por página evitan scroll excesivo.
+    busqueda = st.text_input(
+        "Buscar oficio en firma",
+        key="firma_externa_busqueda",
+        placeholder="Folio, número, responsable o asunto…",
+    ).strip()
+    if busqueda:
+        termino = normalizar_texto(busqueda)
+        firmando = firmando.loc[
+            firmando.apply(
+                lambda r: termino in normalizar_texto(
+                    " ".join(str(r.get(c, "") or "") for c in
+                             ("No. de oficio", "Folio", "Responsable", "Asunto"))
+                ), axis=1
+            )
+        ]
+    encontrados = len(firmando)
+    if not encontrados:
+        st.info("No se encontraron oficios en firma con esos datos.")
+        return
+
+    por_pagina = 5
+    paginas = (encontrados + por_pagina - 1) // por_pagina
+    numeros_paginas = list(range(1, paginas + 1))
+    pag_key = "firma_externa_pagina"
+    if st.session_state.get(pag_key) not in numeros_paginas:
+        st.session_state[pag_key] = 1
+
+    if paginas > 1:
+        etiqueta, control = st.columns([4, 1], vertical_alignment="center")
+        with etiqueta:
+            st.caption(f"{encontrados} oficio(s) · Mostrando 5 por página · Solo consulta")
+        with control:
+            pagina = st.selectbox(
+                "Página", numeros_paginas, key=pag_key,
+                format_func=lambda n: f"{n} de {paginas}",
+            )
+    else:
+        pagina = 1
+        st.caption(f"{encontrados} oficio(s) · Solo consulta")
+
+    inicio = (pagina - 1) * por_pagina
+    pagina_registros = firmando.iloc[inicio:inicio + por_pagina]
+    tarjetas = []
+    for _, registro in pagina_registros.iterrows():
+        def campo(columna, defecto="No registrado"):
+            valor = registro.get(columna, "")
+            if pd.isna(valor) or not str(valor).strip():
+                return html.escape(defecto)
+            return html.escape(str(valor).strip(), quote=True)
+
+        tarjetas.append(
+            '<article class="firma-seguimiento-card">'
+            '<div class="firma-card-top">'
+            '<div class="firma-card-left">'
+            '<div class="firma-card-kicker">EXPEDIENTE EN SEGUIMIENTO</div>'
+            f'<div class="firma-card-oficio">{campo("No. de oficio")}</div>'
+            f'<div class="firma-card-folio">Folio {campo("Folio")}</div>'
+            '</div>'
+            '<span class="firma-card-status">En firma externa</span>'
+            '</div>'
+            '<div class="firma-card-body">'
+            '<div><div class="firma-data-label">RESPONSABLE</div>'
+            f'<div class="firma-data-value">{campo("Responsable", "No asignado")}</div></div>'
+            '<div><div class="firma-data-label">ASUNTO</div>'
+            f'<div class="firma-data-value">{campo("Asunto", "Sin asunto registrado")}</div></div>'
+            '</div>'
+            '<div class="firma-card-timeline">'
+            '<div class="firma-timeline-title">SEGUIMIENTO DEL TRÁMITE</div>'
+            '<div class="firma-stages">'
+            '<div class="firma-stage done"><span class="firma-stage-circle">✓</span>'
+            '<span class="firma-stage-label">Revisión</span></div>'
+            '<div class="firma-stage-link done"></div>'
+            '<div class="firma-stage active"><span class="firma-stage-circle">◷</span>'
+            '<span class="firma-stage-label">Firma externa</span></div>'
+            '<div class="firma-stage-link"></div>'
+            '<div class="firma-stage future"><span class="firma-stage-circle">○</span>'
+            '<span class="firma-stage-label">Finalizado</span></div>'
+            '</div></div></article>'
+        )
+    st.markdown("".join(tarjetas), unsafe_allow_html=True)
 
 def mostrar_mis_pendientes():
     """Acceso rápido a los oficios activos, respetando los permisos existentes."""
     import html
 
     mostrar_sesion()
-    st.markdown("""
+    # Imagen con transparencia solicitada; un SVG técnico queda como respaldo.
+    imagen_pendientes = (_imagen_selector("banner_mis_pendientes.png")
+                          or _imagen_selector("trazo_pendientes.png"))
+    # The illustration is an explicit child layer: avoids CSS-only image placement
+    # failing due to old pseudo-element rules. When absent, the technical line
+    # drawing in the hero remains as an intentional fallback.
+    ilustracion_pendientes = (
+        f'<span class="pend-hero-illustration" style="background-image:url(\'{imagen_pendientes}\')" aria-hidden="true"></span>'
+        if imagen_pendientes else ''
+    )
+    st.markdown(f"""
     <div class="pend-hero">
-      <div class="pend-hero-kicker">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
-      <div class="pend-hero-title">Mis pendientes</div>
-      <div class="pend-hero-desc">Borradores, revisiones y documentos en proceso de firma</div>
-      <div class="pend-hero-line"></div>
-      <div class="pend-hero-track">TRAZO · ALINEAMIENTO · RASANTE</div>
+      {ilustracion_pendientes}
+      <div class="pend-hero-copy">
+        <div class="pend-hero-kicker">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
+        <div class="pend-hero-title">Mis pendientes</div>
+        <div class="pend-hero-desc">Revisión, validación y seguimiento de documentos</div>
+        <div class="pend-hero-line"></div>
+      </div>
+      <div class="pend-hero-track">TRAZO &nbsp; / &nbsp; ALINEAMIENTO &nbsp; / &nbsp; RASANTE</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3067,23 +5617,61 @@ def mostrar_mis_pendientes():
             "Por revisar" if puede_realizar_revision_final() else "Mis oficios"
         )
     bandeja_actual = st.session_state.pend_bandeja
-    st.markdown('<div class="pend-nav-label">BANDEJAS DE TRABAJO</div>', unsafe_allow_html=True)
+    st.markdown('<div class="pend-nav-head"><span>BANDEJAS DE TRABAJO</span><small>ACCESOS SEGÚN TU ROL</small></div>',
+                unsafe_allow_html=True)
     opciones_nav = [
-        ("Mis oficios", "▣", "Expedientes a mi cargo"),
-        ("Por revisar", "◉", "Documentos por validar"),
-        ("En proceso de firma", "▤", "Seguimiento de firmas"),
-        ("Nuevo oficio", "+", "Registrar expediente"),
+        ("Mis oficios", "▤", "Expedientes asignados", "Consulta y seguimiento de tus oficios."),
+        ("Por revisar", "▣", "Validación documental", "Revisa los documentos que esperan autorización."),
+        ("En proceso de firma", "✎", "Seguimiento de firmas", "Consulta los documentos enviados a firma."),
+        ("Nuevo oficio", "+", "Registro documental", "Crea y registra un oficio en el sistema."),
     ]
-    cols_nav = st.columns(4, gap="small")
-    for i, (nombre, icono, descripcion) in enumerate(opciones_nav):
-        with cols_nav[i]:
-            if nombre not in etiquetas and nombre != "Nuevo oficio":
-                st.markdown('<div class="pend-nav-disabled">Acceso no disponible</div>', unsafe_allow_html=True)
-                continue
+    # Solo se dibujan las bandejas autorizadas: ninguna tarjeta deshabilitada.
+    opciones_visibles = [(i, nombre, icono, subtitulo, descripcion)
+                         for i, (nombre, icono, subtitulo, descripcion) in enumerate(opciones_nav)
+                         if nombre in etiquetas or (
+                             nombre == "Nuevo oficio" and not puede_realizar_revision_final()
+                         )]
+    # Ilustraciones locales para la navegación; no se envían a Drive.
+    imagenes_bandejas = {
+        "Por revisar": _imagen_selector("tarjeta_por_revisar.png"),
+        "En proceso de firma": _imagen_selector("tarjeta_proceso_firma.png"),
+    }
+    # Only show a notice if a required file really is missing in the local assets/.
+    # This distinguishes a missing image from one whose lines are simply too faint.
+    imagenes_requeridas = (
+        "tarjeta_por_revisar.png", "tarjeta_proceso_firma.png",
+        "banner_centro_autorizaciones.png", "banner_mis_pendientes.png",
+    )
+    recursos_faltantes = [
+        nombre_imagen for nombre_imagen in imagenes_requeridas
+        if not (Path(__file__).resolve().parent / "assets" / nombre_imagen).is_file()
+    ]
+    if recursos_faltantes and puede_realizar_revision_final():
+        st.caption("Imágenes no encontradas en assets/: " + ", ".join(recursos_faltantes))
+    cols_nav = st.columns(len(opciones_visibles), gap="medium")
+    for columna, (i, nombre, icono, subtitulo, descripcion) in zip(cols_nav, opciones_visibles):
+        with columna:
             activo = nombre == bandeja_actual
-            with st.container(key=f"pend_nav_{i}_{'activo' if activo else 'normal'}"):
-                st.markdown(f'<div class="pend-nav-caption">{descripcion}</div>', unsafe_allow_html=True)
-                if st.button(f"{icono}  {nombre}", key=f"pend_nav_btn_{i}", use_container_width=True):
+            categoria_visual = {"Por revisar": "revision", "En proceso de firma": "firma"}.get(nombre, "general")
+            tarjeta_imagen = imagenes_bandejas.get(nombre, "")
+            fondo_tarjeta = (
+                f'<span class="pend-tile-art" style="background-image:url(\'{tarjeta_imagen}\')" aria-hidden="true"></span>'
+                if tarjeta_imagen else ''
+            )
+            with st.container(key=f"pend_nav_{i}_{categoria_visual}_{'activo' if activo else 'normal'}"):
+                st.markdown(
+                    fondo_tarjeta + '<div class="pend-tile-head">'
+                    f'<span class="pend-tile-icon">{icono}</span>'
+                    '<div class="pend-tile-body">'
+                    f'<h3 class="pend-tile-name">{html.escape(nombre)}</h3>'
+                    f'<span class="pend-tile-sub">{html.escape(subtitulo)}</span>'
+                    '</div></div>'
+                    f'<p class="pend-tile-copy">{html.escape(descripcion)}</p>',
+                    unsafe_allow_html=True,
+                )
+                etiqueta_boton = "Registrar oficio  ↗" if nombre == "Nuevo oficio" else (
+                    "Bandeja activa  →" if activo else "Abrir bandeja  →")
+                if st.button(etiqueta_boton, key=f"pend_action_{i}", use_container_width=True):
                     if nombre == "Nuevo oficio":
                         navegar_a("oficios")
                     else:
@@ -3329,6 +5917,8 @@ def mostrar_mis_pendientes():
 
     if bandeja_actual == "Por revisar" and "Por revisar" in etiquetas:
         _bandeja_borradores_compartida()
+        # Regresos de firma de los oficios que no tuvieron borradores Word.
+        _panel_directos_para_revisores()
     if bandeja_actual == "En proceso de firma":
         _vista_firma_externa(registros)
 
@@ -3531,11 +6121,11 @@ div[data-testid="stDateInput"] input:focus {
 
 .consulta-panel {
     background: rgba(255, 255, 255, 0.82);
-    border: none;
-    border-top: 2px solid #B08A4A;
-    border-radius: 10px 10px 0 0;
-    padding: 16px 20px 12px 20px;
-    margin-top: 20px;
+    border: 1px solid rgba(189,155,93,.45);
+    border-top: 3px solid #B08A4A;
+    border-radius: 13px;
+    padding: 16px 22px 14px 22px;
+    margin-top: 10px;
     margin-bottom: 10px;
     box-shadow: 0 4px 14px rgba(16, 40, 59, 0.04);
 }
@@ -3666,6 +6256,131 @@ div[data-testid="stHorizontalBlock"] {
 
 
 # =========================================================
+# ENCABEZADO INSTITUCIONAL — MÓDULOS DOCUMENTALES
+# Diseño Geométrico: cabecera compartida, sin cambiar las acciones internas.
+# =========================================================
+def _cerrar_sesion_desde_cabecera():
+    _cookies_sesion["sesion"] = ""
+    _cookies_sesion.save()
+    st.session_state.autenticado = False
+    st.session_state.usuario_actual = None
+    st.session_state.usuario_id = None
+    st.session_state.rol = "auxiliar"
+    st.session_state.cargo_institucional = ""
+    st.session_state.responsable_oficios = ""
+    st.session_state.menu_activo = "home"
+    st.session_state.pop("area_actual", None)
+    st.session_state.pop("pend_bandeja", None)
+    st.rerun()
+
+
+def mostrar_cabecera_documental():
+    """Franja superior única para Oficios, Pendientes, Urgentes y Firmados."""
+    import html as _html
+
+    st.markdown("""
+    <style>
+      /* Únicamente las vistas con cabecera documental */
+      /* Acercar la barra a la parte superior sin afectar los demás módulos. */
+      [data-testid="stMainBlockContainer"]:has(.st-key-cabecera_documental),
+      .block-container:has(.st-key-cabecera_documental) {
+        padding-top: .35rem !important;
+      }
+      /* Streamlit envuelve los containers en otros bloques: hacer sticky
+         también su wrapper impide que se despegue al desplazarse. */
+      [data-testid="stVerticalBlockBorderWrapper"]:has(> .st-key-cabecera_documental),
+      [data-testid="stElementContainer"]:has(> .st-key-cabecera_documental) {
+        position: sticky !important;
+        top: .35rem !important;
+        z-index: 1000 !important;
+      }
+      .st-key-cabecera_documental {
+        background: linear-gradient(110deg, #12273A 0%, #1C3547 70%, #223F4C 100%) !important;
+        border: 1px solid rgba(214,173,107,.33) !important;
+        border-radius: 15px !important;
+        padding: 12px 18px 12px 18px !important;
+        box-shadow: 0 6px 22px rgba(10,28,40,.17) !important;
+        position: sticky !important;
+        top: .35rem !important;
+        z-index: 1000 !important;
+        /* Levantar cabecera y contenido unos 68 px respecto a la versión anterior.
+           Se aplica únicamente a los módulos documentales. */
+        margin-top: -80px !important;
+      }
+      .st-key-cabecera_documental [data-testid="stHorizontalBlock"] {
+        align-items: center !important;
+        gap: 13px !important;
+      }
+      .st-key-cabecera_documental [data-testid="stImage"] img {
+        max-height: 62px !important;
+        max-width: 62px !important;
+        object-fit: contain !important;
+      }
+      .st-key-cabecera_documental p { margin-bottom: 0 !important; }
+      .st-key-cabecera_documental [data-testid="stButton"] button {
+        min-height: 39px !important;
+        width: 100% !important;
+        border-radius: 8px !important;
+        background: rgba(255,255,255,.035) !important;
+        color: #FFF !important;
+        border: 1px solid #BCA06B !important;
+        font-size: .80rem !important;
+        font-weight: 600 !important;
+        white-space: nowrap !important;
+      }
+      .st-key-cabecera_documental [data-testid="stButton"] button:hover {
+        background: #294658 !important;
+        color: #FFF !important;
+      }
+      .st-key-cabecera_documental [data-testid="stButton"] button p,
+      .st-key-cabecera_documental [data-testid="stButton"] button span {color:#FFF !important;}
+      @media (max-width: 1050px) {
+        .st-key-cabecera_documental {padding: 9px !important;}
+        .st-key-cabecera_documental [data-testid="stHorizontalBlock"] {gap:6px !important;}
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    nombre = str(st.session_state.get("usuario_actual") or "").strip()
+    if identificador_sesion() == "alondra":
+        nombre = "Tte. Alondra Barajas"
+    logo = ASSETS_DIR / "logo_selector.png"
+    if not logo.is_file():
+        logo = ASSETS_DIR / "logo_diseno_geometrico.png"
+
+    with st.container(key="cabecera_documental"):
+        col_logo, col_marca, col_sesion, col_area, col_salir = st.columns(
+            [0.65, 3.2, 1.8, 1.65, 1.4], vertical_alignment="center", gap="small"
+        )
+        with col_logo:
+            if logo.is_file():
+                st.image(str(logo), width=59)
+        with col_marca:
+            st.markdown("""<div style="font-weight:800;font-size:21px;letter-spacing:1.2px;line-height:1.2;color:#fff">CONTROL DOCUMENTAL</div>
+            <div style="margin-top:4px;color:#B8C8D3;font-size:10px;font-weight:700;letter-spacing:2px">MESA DE DISEÑO GEOMÉTRICO</div>""", unsafe_allow_html=True)
+        with col_sesion:
+            st.markdown(
+                '<div style="text-align:right;color:#C7D6E0;font-size:11px">Sesión activa</div>'
+                f'<div translate="no" class="notranslate" style="text-align:right;color:white;font-size:13px;font-weight:700">{_html.escape(nombre)}</div>',
+                unsafe_allow_html=True,
+            )
+        with col_area:
+            if len(areas_autorizadas()) == 2:
+                if st.button("⇄ Cambiar de área", key="doc_cabecera_cambiar_area", use_container_width=True):
+                    st.session_state.area_actual = None
+                    st.session_state.menu_activo = "home"
+                    st.session_state.pop("pend_bandeja", None)
+                    st.rerun()
+        with col_salir:
+            if st.button("↪ Cerrar sesión", key="doc_cabecera_salir", use_container_width=True):
+                _cerrar_sesion_desde_cabecera()
+
+
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados"):
+    mostrar_cabecera_documental()
+
+
+# =========================================================
 # MENÚ LATERAL COMPARTIDO: OFICIOS / MIS PENDIENTES
 # =========================================================
 # Mantener la misma estructura de widgets y las mismas claves entre
@@ -3765,8 +6480,9 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
         {"oficios": "inicio", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados"}.get(
             st.session_state.menu_activo, "inicio") +
         '"] button {background:linear-gradient(120deg,#4A4C44,#55574D) !important;'
-        'border:1px solid #B99A65 !important;border-left:4px solid #D2B47A !important;'
-        'box-shadow:0 4px 12px rgba(48,44,35,.18) !important;}'
+        'border:1px solid #C7A465 !important;border-left:6px solid #E2B66B !important;'
+        'box-shadow:inset 3px 0 0 #E2B66B, 0 5px 15px rgba(48,44,35,.22) !important;'
+        'transform:translateX(2px) !important;}'
     ), unsafe_allow_html=True)
     with st.sidebar:
         ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
@@ -3856,6 +6572,15 @@ def _dias_desde_recepcion(valor):
 
 
 def _documentos_seccion(oficio):
+    try:
+        modalidad = _modalidad_expediente(oficio.get("Folio", ""), oficio.get("No. de oficio", ""))
+    except Exception:
+        modalidad = None
+    if modalidad and modalidad.get("Tipo de trámite") == "Directo":
+        enlace = str(modalidad.get("URL principal", "")).strip()
+        if enlace.startswith("https://"):
+            st.link_button("Oficio principal · " + str(modalidad.get("Nombre principal", "")),
+                           enlace, use_container_width=True)
     grupos = (("Oficio firmado", "Firmado"), ("Oficio original / antecedentes", "Antecedente"),
               ("Anexos", "Anexo"))
     for titulo, campo in grupos:
@@ -3931,6 +6656,74 @@ def _modulo_lateral_documentos(tipo):
         .firm-kpi .number {color:#243d35 !important;font-size:34px;font-weight:800;line-height:1.15;}
         .firm-kpi .title {color:#243d35 !important;font-size:14px;font-weight:750;margin-top:4px;}
         .firm-kpi .desc {color:#586e61 !important;font-size:12px;margin-top:4px;}
+        /* Indicadores navegables: toda la superficie es un botón de Streamlit. */
+        [class*="st-key-firm_kpi_"] button {
+            display:flex!important;align-items:center!important;
+            justify-content:flex-start!important;text-align:left!important;
+            width:100%!important;min-height:124px!important;
+            position:relative!important;overflow:hidden!important;
+            padding:14px 17px 29px 20px!important;
+            background:#DFE8E0!important;
+            border:1.5px solid #B0C2B3!important;
+            border-left:5px solid #819F89!important;
+            border-radius:12px!important;
+            box-shadow:0 6px 18px rgba(39,58,49,.10)!important;
+            color:#274335!important;
+            transition:transform .18s,box-shadow .18s,border-color .18s!important;
+        }
+        [class*="st-key-firm_kpi_"] button:hover {
+            transform:translateY(-2px)!important;
+            box-shadow:0 9px 20px rgba(39,58,49,.15)!important;
+            border-color:#6A9176!important;
+        }
+        [class*="st-key-firm_kpi_"] button:focus-visible {
+            outline:2px solid #BC9D69!important;outline-offset:2px!important;
+        }
+        [class*="st-key-firm_kpi_"] button [data-testid="stMarkdownContainer"],
+        [class*="st-key-firm_kpi_"] button p {
+            width:100%!important;margin:0!important;text-align:left!important;
+            color:#284437!important;font-weight:750!important;
+            font-size:13px!important;line-height:1.5!important;
+        }
+        [class*="st-key-firm_kpi_"] button strong {
+            font-size:33px!important;font-weight:850!important;
+            line-height:1.12!important;display:block!important;
+            color:#243D35!important;
+        }
+        [class*="st-key-firm_kpi_"] button::after {
+            position:absolute;left:21px;bottom:10px;
+            font-size:11px;font-weight:500;color:#596F60;
+            letter-spacing:0;pointer-events:none;
+        }
+        [class*="st-key-firm_kpi_hoy"] button::after {content:"Envíos registrados hoy";}
+        [class*="st-key-firm_kpi_semana"] button::after {content:"Salidas del lunes a hoy";}
+        [class*="st-key-firm_kpi_firmados"] button::after {content:"Regresaron con firma";}
+        [class*="st-key-firm_kpi_hoy"] button {border-left-color:#BE9560!important;}
+        [class*="st-key-firm_kpi_semana"] button {border-left-color:#63837A!important;}
+        [class*="st-key-firm_kpi_firmados"] button {border-left-color:#628C6D!important;}
+        /* Estado seleccionado: diferencia inequívoca entre resumen y filtro activo. */
+        [class*="st-key-firm_kpi_"] button[kind="primary"],
+        [class*="st-key-firm_kpi_"] button[data-testid="stBaseButton-primary"] {
+            background:#D0E1D2!important;
+            border-color:#6D9678!important;
+            box-shadow:inset 0 0 0 1px #6D9678,0 9px 20px rgba(39,58,49,.13)!important;
+        }
+        [class*="st-key-firm_kpi_"] button[kind="primary"]::before,
+        [class*="st-key-firm_kpi_"] button[data-testid="stBaseButton-primary"]::before {
+            content:"● Filtro activo";position:absolute;top:12px;right:13px;
+            font-size:10px;font-weight:800;color:#466D51;
+        }
+        .firm-vista-activa {
+            display:flex;justify-content:space-between;align-items:center;
+            background:#EBF1EB;border:1px solid #BACDBD;border-left:4px solid #638A6A;
+            border-radius:10px;padding:10px 13px;margin:10px 0 4px;
+            color:#315240;font-size:12px;font-weight:650;
+        }
+        [class*="st-key-firm_kpi_ver_todos"] button {
+            background:#F7F9F5!important;border:1px solid #90AA96!important;
+            color:#3D6149!important;border-radius:9px!important;font-weight:700!important;
+        }
+
         .firm-caption {color:#42584e;font-size:13px;margin:8px 0 16px;}
         .firm-original-ref {
             background:rgba(245,247,244,.95);border:1px solid #b7c7bd;
@@ -3966,6 +6759,82 @@ def _modulo_lateral_documentos(tipo):
         [class*="st-key-firm_limpiar"] button {
             background:#34413f !important;color:#fff !important;
             border:1px solid #a88e62 !important;border-radius:9px !important;
+        }
+        /* ARCHIVO FIRMADO: registro horizontal sin desplegable general. */
+        div[class*="st-key-firm_reg_row_"] {
+            background:linear-gradient(100deg,#FCFEFB 0%,#EDF3EC 100%)!important;
+            border:1px solid #ADC3B1!important;
+            border-left:4px solid #678C72!important;
+            border-radius:12px!important;
+            padding:12px 16px!important;
+            margin:9px 0 11px!important;
+            box-shadow:0 3px 11px rgba(45,67,52,.09)!important;
+        }
+        div[class*="st-key-firm_reg_row_"] [data-testid="stHorizontalBlock"] {
+            align-items:center!important;
+            column-gap:10px!important;
+        }
+        .firm-inline-file {
+            min-width:0;padding:0 4px 0 2px;
+        }
+        .firm-inline-name {
+            font-size:13px;font-weight:800;line-height:1.3;
+            letter-spacing:.05px;color:#263F34;
+            overflow-wrap:anywhere;margin-bottom:4px;
+        }
+        .firm-inline-meta {
+            font-size:10.5px;color:#677E6E;line-height:1.35;
+            overflow-wrap:anywhere;
+        }
+        div[class*="st-key-firm_reg_row_"] .stLinkButton a,
+        div[class*="st-key-firm_reg_row_"] [data-testid="stPopover"] button,
+        div[class*="st-key-firm_reg_row_"] .stButton button {
+            display:flex!important;align-items:center!important;justify-content:center!important;
+            min-height:40px!important;width:100%!important;
+            padding:6px 10px!important;
+            border:1px solid #9EB7A5!important;
+            border-radius:9px!important;
+            background:#F8FBF7!important;
+            color:#375B43!important;
+            font-size:12px!important;font-weight:750!important;
+            white-space:nowrap!important;
+            box-shadow:0 2px 4px rgba(42,69,48,.04)!important;
+            transition:background .17s,border-color .17s,box-shadow .17s!important;
+        }
+        div[class*="st-key-firm_reg_row_"] .stLinkButton a:hover,
+        div[class*="st-key-firm_reg_row_"] [data-testid="stPopover"] button:hover,
+        div[class*="st-key-firm_reg_row_"] .stButton button:not(:disabled):hover {
+            background:#E3EDE2!important;
+            border-color:#648D6C!important;
+            box-shadow:0 3px 9px rgba(42,69,48,.10)!important;
+        }
+        /* Acción principal: Firmado en verde sólido. */
+        div[class*="st-key-firm_reg_row_"] [data-testid="stHorizontalBlock"]
+        > [data-testid="stColumn"]:nth-child(2) .stLinkButton a,
+        div[class*="st-key-firm_reg_row_"] [data-testid="stHorizontalBlock"]
+        > [data-testid="stColumn"]:nth-child(2) [data-testid="stPopover"] button {
+            background:#345846!important;color:#FFFFFF!important;
+            border:1px solid #345846!important;
+        }
+        div[class*="st-key-firm_reg_row_"] [data-testid="stHorizontalBlock"]
+        > [data-testid="stColumn"]:nth-child(2) .stLinkButton a:hover,
+        div[class*="st-key-firm_reg_row_"] [data-testid="stHorizontalBlock"]
+        > [data-testid="stColumn"]:nth-child(2) [data-testid="stPopover"] button:hover {
+            background:#497158!important;color:#FFFFFF!important;
+        }
+        div[class*="st-key-firm_reg_row_"] .stButton button:disabled {
+            background:#EEF0EB!important;color:#9AAA9D!important;
+            border-color:#D4DED3!important;opacity:.8!important;
+        }
+        .firm-admin-edit {margin:18px 0 7px;}
+        .firm-caption {margin:7px 0 12px!important;}
+        @media(max-width:900px){
+            div[class*="st-key-firm_reg_row_"] {padding:11px!important;}
+            div[class*="st-key-firm_reg_row_"] .stLinkButton a,
+            div[class*="st-key-firm_reg_row_"] [data-testid="stPopover"] button,
+            div[class*="st-key-firm_reg_row_"] .stButton button {
+                font-size:11px!important;padding:6px!important;
+            }
         }
         /* Ornamentación técnica propia del archivo de firmados */
         .firm-hero {position:relative;overflow:hidden;isolation:isolate;}
@@ -4016,25 +6885,148 @@ def _modulo_lateral_documentos(tipo):
             fecha = pd.to_datetime(valor, errors="coerce", dayfirst=True)
             return None if pd.isna(fecha) else fecha.date()
 
-        hoy = datetime.now().date()
-        este_mes = sum((_fecha_firma(r) is not None
-                        and _fecha_firma(r).year == hoy.year
-                        and _fecha_firma(r).month == hoy.month) for r in lista)
-        con_anexos = sum(bool(leer_documentos(r.get("Anexo", ""))) for r in lista)
-        st.markdown('<div class="firm-label">RESUMEN DE DOCUMENTACIÓN FIRMADA</div>',
+        # No confundir envío a firma con devolución del oficio ya firmado.
+        # 1) Salidas a firma: EVENTOS_BORRADORES -> ETAPA_FIRMA.
+        # 2) Regresos firmados: OFICIOS -> Estatus Firmado + Fecha de entrega.
+        from zoneinfo import ZoneInfo
+        zona_local = ZoneInfo("America/Mexico_City")
+        hoy = datetime.now(zona_local).date()
+        lunes = hoy - __import__("datetime").timedelta(days=hoy.weekday())
+
+        def _fecha_evento_firma(valor):
+            texto = str(valor or "").strip()
+            if not texto:
+                return None
+            try:
+                fecha = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+                if fecha.tzinfo is not None:
+                    return fecha.astimezone(zona_local).date()
+                # Eventos sin zona: no se puede asumir que pertenecen a México.
+                # El código propio siempre escribe fechas con offset.
+                return None
+            except (ValueError, TypeError, OverflowError):
+                return None
+
+        firmas_enviadas_hoy = None
+        firmas_enviadas_semana = None
+        claves_hoy, claves_semana = set(), set()
+        try:
+            bitacora_firmas = _leer_registros_eventos()
+            # Un oficio se cuenta una sola vez por periodo aunque haya
+            # reenvíos/actualizaciones registrados en la bitácora.
+            for evento in bitacora_firmas:
+                if str(evento.get("Accion", "")).strip() != ETAPA_FIRMA:
+                    continue
+                fecha_evento = _fecha_evento_firma(evento.get("Fecha"))
+                folio_evento = str(evento.get("Folio", "")).strip()
+                numero_evento = str(evento.get("No. de oficio", "")).strip()
+                if not fecha_evento or not (folio_evento or numero_evento):
+                    continue
+                identidad = (folio_evento, numero_evento)
+                if fecha_evento == hoy:
+                    claves_hoy.add(identidad)
+                if lunes <= fecha_evento <= hoy:
+                    claves_semana.add(identidad)
+            firmas_enviadas_hoy = len(claves_hoy)
+            firmas_enviadas_semana = len(claves_semana)
+        except Exception as error:
+            st.warning("No se pudo consultar la bitácora de envíos a firma; "
+                       "las primeras dos cifras se mostrarán sin dato. "
+                       f"Detalle: {_mensaje_error_sheets(error)}")
+
+        # Los devueltos con firma se cuentan por la fecha de entrega/recepción
+        # registrada, NO por el evento de autorización para enviar a firma.
+        firmados_semana_claves = {
+            (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
+            for r in lista
+            if (fecha := _fecha_firma(r)) is not None and lunes <= fecha <= hoy
+        }
+        st.markdown('<div class="firm-label">MOVIMIENTO DE FIRMAS · SEMANA EN CURSO</div>',
                     unsafe_allow_html=True)
-        kpis = (
-            (len(lista), "Oficios firmados", "Expedientes finalizados"),
-            (este_mes, "Firmados este mes", "Según fecha de entrega registrada"),
-            (con_anexos, "Con anexos", "Expedientes con documentación adicional"),
+
+        # Cada indicador conduce al listado correspondiente; no se confunden
+        # los ENVÍOS a firma con los documentos que REGRESARON firmados.
+        nombres_vista_firmados = {
+            "todos": "Archivo completo de oficios firmados",
+            "hoy": "Oficios enviados a firma hoy",
+            "semana": "Oficios enviados a firma esta semana",
+            "firmados": "Oficios recibidos firmados esta semana",
+        }
+        if st.session_state.get("firmados_kpi_filtro") not in nombres_vista_firmados:
+            st.session_state["firmados_kpi_filtro"] = "todos"
+
+        def _cambiar_vista_firmados(nueva_vista):
+            st.session_state["firmados_kpi_filtro"] = nueva_vista
+            # Reutilizar los filtros de búsqueda existentes, sin esconder datos
+            # por una consulta escrita en una vista anterior.
+            st.session_state["buscar_firmados"] = ""
+
+        indicadores = (
+            ("hoy", firmas_enviadas_hoy, "Enviados a firma hoy"),
+            ("semana", firmas_enviadas_semana, "Enviados a firma en la semana"),
+            ("firmados", len(firmados_semana_claves), "Oficios firmados en la semana"),
         )
-        for columna, (numero, titulo, detalle) in zip(st.columns(3, gap="large"), kpis):
+        for columna, (filtro, numero, titulo) in zip(st.columns(3, gap="large"), indicadores):
             with columna:
-                st.markdown(
-                    f'<div class="firm-kpi"><div class="number">{numero:02d}</div>'
-                    f'<div class="title">{html.escape(titulo)}</div>'
-                    f'<div class="desc">{html.escape(detalle)}</div></div>',
-                    unsafe_allow_html=True)
+                numero_texto = "—" if numero is None else f"{numero:02d}"
+                st.button(
+                    f"**{numero_texto}**  \n{titulo}",
+                    key=f"firm_kpi_{filtro}",
+                    use_container_width=True,
+                    type="primary" if st.session_state["firmados_kpi_filtro"] == filtro else "secondary",
+                    on_click=_cambiar_vista_firmados,
+                    args=(filtro,),
+                    help=f"Ver el listado de: {titulo.lower()}",
+                )
+        st.markdown(
+            f'<div class="firm-summary-foot">Semana del {lunes.strftime("%d/%m/%Y")} '
+            f'al {hoy.strftime("%d/%m/%Y")} · '
+            'Enviados: bitácora de autorización · Firmados: fecha de recepción registrada.</div>',
+            unsafe_allow_html=True)
+
+        vista_firmados = st.session_state["firmados_kpi_filtro"]
+        # El listado predeterminado es el archivo histórico ya firmado.
+        # Enviados hoy/semana incluye documentos que todavía están en firma.
+        if vista_firmados == "hoy":
+            lista = [r for r in registros if (
+                str(r.get("Folio", "")).strip(),
+                str(r.get("No. de oficio", "")).strip()
+            ) in claves_hoy]
+        elif vista_firmados == "semana":
+            lista = [r for r in registros if (
+                str(r.get("Folio", "")).strip(),
+                str(r.get("No. de oficio", "")).strip()
+            ) in claves_semana]
+        elif vista_firmados == "firmados":
+            lista = [r for r in lista if (
+                str(r.get("Folio", "")).strip(),
+                str(r.get("No. de oficio", "")).strip()
+            ) in firmados_semana_claves]
+
+        if vista_firmados in ("hoy", "semana"):
+            if firmas_enviadas_hoy is None:
+                st.warning("No hay información disponible de los envíos a firma "
+                           "porque no se pudo leer la bitácora.")
+            else:
+                ids_enviados = claves_hoy if vista_firmados == "hoy" else claves_semana
+                ids_vinculados = {
+                    (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
+                    for r in lista
+                }
+                sin_ficha = ids_enviados - ids_vinculados
+                if sin_ficha:
+                    st.info(f"{len(sin_ficha)} envío(s) registrado(s) en la bitácora "
+                            "no tienen una ficha vinculada en OFICIOS. "
+                            "El indicador incluye esos envíos, pero aquí solo se muestran "
+                            "expedientes disponibles para consulta.")
+
+        st.markdown(
+            '<div class="firm-vista-activa">'
+            f'Vista: {html.escape(nombres_vista_firmados[vista_firmados])}'
+            '</div>', unsafe_allow_html=True)
+        if vista_firmados != "todos":
+            st.button("← Ver todos los oficios firmados", key="firm_kpi_ver_todos",
+                      on_click=_cambiar_vista_firmados, args=("todos",))
 
         st.markdown('<div class="firm-label">CONSULTA DE EXPEDIENTES</div>',
                     unsafe_allow_html=True)
@@ -4073,106 +7065,115 @@ def _modulo_lateral_documentos(tipo):
             lista.sort(key=lambda r: (_fecha_firma(r) is None,
                                       _fecha_firma(r) or datetime.max.date()))
 
-        st.markdown('<div class="firm-label">ARCHIVO DE OFICIOS FIRMADOS</div>',
-                    unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="firm-label">{html.escape(nombres_vista_firmados[vista_firmados].upper())}</div>',
+            unsafe_allow_html=True)
         st.markdown(f'<div class="firm-caption">{len(lista)} expediente(s) · '
-                    'Selecciona uno para consultar su documentación vinculada</div>',
+                    'Firmado, Antecedentes y Anexos disponibles según sus vínculos</div>',
                     unsafe_allow_html=True)
         if not lista:
-            st.markdown('<div class="firm-empty">No se encontraron expedientes firmados '
-                        'con los filtros seleccionados.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="firm-empty">No se encontraron expedientes '
+                        'para este indicador o los filtros aplicados.</div>', unsafe_allow_html=True)
             return
 
-        for oficio in lista:
+        # UNA FILA POR OFICIO: nombre a la izquierda y tres accesos a la derecha.
+        # Con un solo enlace, abre directamente el archivo en Drive.
+        # Si una categoría contiene varios, permite escoger el archivo desde
+        # un popover pequeño, sin desplegar el expediente ni desplazar la lista.
+        for indice, oficio in enumerate(lista):
             folio = str(oficio.get("Folio", "")).strip()
             numero = str(oficio.get("No. de oficio", "")).strip()
-            asunto = str(oficio.get("Asunto", "") or "Sin asunto").strip()
-            documentos_firmados = leer_documentos(oficio.get("Firmado", ""))
-            # El título es el nombre registrado al recibir el documento firmado,
-            # no el número ni el asunto del oficio original.
-            nombre_firmado = (documentos_firmados[0]["nombre"]
-                              if documentos_firmados else f"Documento firmado · Folio {folio}")
-            titulo = f"▣  {nombre_firmado}"
-            if len(documentos_firmados) > 1:
-                titulo += f" (+{len(documentos_firmados) - 1})"
-            with st.expander(titulo, expanded=False):
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown(f"**Folio:** {html.escape(folio)}")
-                    st.markdown(f"**Responsable:** {html.escape(str(oficio.get('Responsable', '—')))}")
-                with col_b:
-                    fecha = _fecha_firma(oficio)
-                    st.markdown(f"**Fecha de firma/entrega:** {fecha.strftime('%d/%m/%Y') if fecha else 'No registrada'}")
-                    st.markdown("**Estatus:** Firmado")
-                # La edición de fecha se realiza aquí, en el expediente firmado.
-                # Se usa la misma función validada que guarda estatus y fecha en OFICIOS.
-                if puede_editar_responsable(oficio.get("Responsable", "")):
-                    with st.expander("✎ Editar fecha de entrega", expanded=False):
-                        with st.form(key=f"firm_fecha_form_{folio}_{numero}"):
-                            fecha_actual = _fecha_firma(oficio)
-                            fecha_nueva = st.date_input(
-                                "Fecha de firma / entrega",
-                                value=fecha_actual,
-                                format="DD/MM/YYYY",
-                                key=f"firm_fecha_input_{folio}_{numero}",
-                            )
-                            st.caption("Se actualizará la fecha de entrega del oficio en Google Sheets.")
-                            guardar_fecha = st.form_submit_button(
-                                "Guardar fecha", use_container_width=True)
-                        if guardar_fecha:
-                            if fecha_nueva is None:
-                                st.warning("Selecciona una fecha de entrega válida.")
-                            else:
-                                try:
-                                    actualizar_estatus_y_entrega(
-                                        folio, numero, "Firmado", fecha_nueva.isoformat())
-                                    st.success("Fecha actualizada correctamente.")
-                                    st.rerun()
-                                except Exception as error:
-                                    st.error(f"No se pudo actualizar la fecha: {error}")
-                st.markdown(f"**Asunto del oficio original:** {html.escape(asunto)}")
+            responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
+            documentos = {
+                "firmado": leer_documentos(oficio.get("Firmado", "")),
+                "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
+                "anexos": leer_documentos(oficio.get("Anexo", "")),
+            }
+            fecha = _fecha_firma(oficio)
+            firmado_realmente = normalizar_texto(oficio.get("Estatus", "")) == "firmado"
+            fecha_texto = fecha.strftime("%d/%m/%Y") if fecha else "Sin fecha registrada"
+            estado_texto = (f"Firmado: {fecha_texto}" if firmado_realmente else
+                            f"Estado: {str(oficio.get('Estatus', '')) or 'En trámite'}")
+            token = hashlib.sha256((folio + "|" + numero + "|" + str(indice)).encode("utf-8")).hexdigest()[:16]
 
-                # El documento firmado conserva su acceso a Drive, separado de
-                # la referencia sin enlace al oficio con el que se abrió el expediente.
-                if documentos_firmados:
-                    st.markdown("**Documento firmado**")
-                    for documento in documentos_firmados:
-                        st.link_button(
-                            f"Consultar en Google Drive ↗ · {documento['nombre']}",
-                            documento["url"], use_container_width=True)
-
-                st.markdown("**Documentación vinculada**")
-                columnas = st.columns(3, gap="small")
-                with columnas[0]:
-                    st.markdown("**Oficio original**")
+            with st.container(key=f"firm_reg_row_{token}"):
+                col_info, col_firmado, col_antecedentes, col_anexos = st.columns(
+                    [4.8, 1.2, 1.45, 1.1], gap="small")
+                with col_info:
                     st.markdown(
-                        '<div class="firm-original-ref">'
-                        f'{html.escape(numero or "Número no registrado")}'
-                        '</div>', unsafe_allow_html=True)
-                    st.caption("Referencia del expediente · sin enlace")
-                for col, etiqueta, campo in (
-                    (columnas[1], "Antecedentes", "Antecedente"),
-                    (columnas[2], "Anexos", "Anexo"),
-                ):
-                    with col:
-                        docs = leer_documentos(oficio.get(campo, ""))
-                        with st.expander(f"{etiqueta} ({len(docs)})", expanded=bool(docs)):
-                            if not docs:
-                                st.caption("Sin documentos vinculados.")
-                            for doc in docs:
-                                st.link_button(doc["nombre"], doc["url"],
-                                               use_container_width=True)
+                        f'<div class="firm-inline-file">'
+                        f'<div class="firm-inline-name">{html.escape(numero or f"Folio {folio}" or "Sin número")}</div>'
+                        f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
+                        f'· {html.escape(responsable)} · {html.escape(estado_texto)}</div>' 
+                        f'</div>', unsafe_allow_html=True)
+
+                acciones = (
+                    (col_firmado, "firmado", "Firmado"),
+                    (col_antecedentes, "antecedentes", "Antecedentes"),
+                    (col_anexos, "anexos", "Anexos"),
+                )
+                for columna, categoria, etiqueta in acciones:
+                    archivos = documentos[categoria]
+                    with columna:
+                        if len(archivos) == 1:
+                            st.link_button(
+                                etiqueta, archivos[0]["url"],
+                                use_container_width=True,
+                                help=f'Abrir en Drive: {archivos[0]["nombre"]}',
+                            )
+                        elif len(archivos) > 1:
+                            with st.popover(etiqueta, use_container_width=True):
+                                st.caption(f"{len(archivos)} archivos · {etiqueta}")
+                                for archivo in archivos:
+                                    st.link_button(
+                                        archivo["nombre"], archivo["url"],
+                                        use_container_width=True,
+                                    )
+                        else:
+                            st.button(
+                                etiqueta, key=f"firm_vacio_{categoria}_{token}",
+                                disabled=True, use_container_width=True,
+                                help="Sin documentos vinculados en esta categoría",
+                            )
+
+        # La edición autorizada de la fecha conserva su funcionalidad, pero
+        # queda fuera de las tres acciones principales de cada oficio.
+        editables = [r for r in lista if normalizar_texto(r.get("Estatus", "")) == "firmado"
+                     and puede_editar_responsable(r.get("Responsable", ""))]
+        if editables:
+            with st.expander("Administración · fecha de recepción del oficio firmado", expanded=False):
+                registros_editables = {
+                    f"{str(r.get('No. de oficio', '')).strip()} · Folio {str(r.get('Folio', '')).strip()}": r
+                    for r in editables
+                }
+                seleccion_edit = st.selectbox(
+                    "Seleccionar oficio", list(registros_editables), key="firmado_fecha_seleccion")
+                elegido_edit = registros_editables[seleccion_edit]
+                folio_edit = str(elegido_edit.get("Folio", "")).strip()
+                numero_edit = str(elegido_edit.get("No. de oficio", "")).strip()
+                fecha_edit = _fecha_firma(elegido_edit)
+                clave_edicion = hashlib.sha256((folio_edit + "|" + numero_edit).encode("utf-8")).hexdigest()[:14]
+                with st.form(key="firm_fecha_form_global"):
+                    nueva_fecha = st.date_input(
+                        "Fecha de firma / entrega", value=fecha_edit or hoy,
+                        format="DD/MM/YYYY", key=f"firm_fecha_input_global_{clave_edicion}")
+                    guardar_fecha = st.form_submit_button("Guardar fecha", use_container_width=True)
+                if guardar_fecha:
+                    try:
+                        exigir_permiso_edicion(elegido_edit.get("Responsable", ""))
+                        actualizar_estatus_y_entrega(
+                            folio_edit, numero_edit, "Firmado", nueva_fecha.isoformat())
+                        st.success("Fecha actualizada correctamente.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"No se pudo actualizar la fecha: {error}")
         return
 
-    # Módulo Urgentes: comparte la estética de Mis pendientes.
-    # La imagen es opcional; sin ella se conserva el fondo actual.
-    # Acepta PNG/JPG/JPEG/WEBP y variantes habituales de nombre.
-    candidatos = [
-        ASSETS_DIR / f"fondo_urgentes{ext}"
-        for ext in (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")
-    ]
-    fondo_urgentes = next((ruta for ruta in candidatos if ruta.is_file()), None)
-    css_fondo = ""
+    # MESA DE ATENCIÓN PRIORITARIA: solo presentación, mismas reglas y datos.
+    # Conserva el fondo ferroviario si está disponible en assets.
+    candidatos = [ASSETS_DIR / f"fondo_urgentes{ext}"
+                  for ext in (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")]
+    fondo_urgentes = next((p for p in candidatos if p.is_file()), None)
     if fondo_urgentes:
         tipos = {".png": "image/png", ".jpg": "image/jpeg",
                  ".jpeg": "image/jpeg", ".webp": "image/webp"}
@@ -4187,186 +7188,303 @@ def _modulo_lateral_documentos(tipo):
             'background-attachment:fixed !important;'
         )
     else:
-        css_fondo = (
-            'background:linear-gradient(135deg,#f5f1e9,#e9e5dd) !important;'
-        )
-    st.markdown(f"""
+        css_fondo = 'background:linear-gradient(135deg,#f5f1e9,#e9e5dd) !important;'
+    st.markdown(f'<style>[data-testid="stAppViewContainer"]:has(.urg-hero) {{{css_fondo}}}</style>',
+                unsafe_allow_html=True)
+    st.markdown("""
     <style>
-    [data-testid="stAppViewContainer"]:has(.urg-hero) {{
-        {css_fondo}
-    }}
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stMain"],
     [data-testid="stAppViewContainer"]:has(.urg-hero) > .main,
-    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stMain"] {{
-        background:transparent !important;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stHeader"] {{
-        background:transparent !important;
-    }}
-    .urg-hero {{
-        background:linear-gradient(115deg,#353431,#494742);
-        border:1px solid #b89a67;border-left:5px solid #b89a67;
-        border-radius:15px;padding:25px 30px;margin:8px 0 24px;
-        box-shadow:0 10px 24px rgba(36,33,29,.14);
-        color:#f8f5ef;
-    }}
-    /* Controles elegantes, limitados exclusivamente a Urgentes. */
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stHeader"] {
+        background:transparent!important;
+    }
+    /* La cabecera compartida conserva su altura real: no desplazarla bajo Chrome. */
+    [data-testid="stAppViewContainer"]:has(.urg-hero) .st-key-cabecera_documental {
+        margin-top:0!important;
+        margin-bottom:0!important;
+        top:10px!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+      [data-testid="stVerticalBlock"]:has(> [data-testid="stElementContainer"] .urg-hero) {
+        row-gap:4px!important;
+    }
+    /* El panel empieza tras el encabezado y no se monta sobre él. */
+    /* Encabezado: pequeño, identificable, y con identidad ferroviaria. */
+    .urg-hero {
+        position:relative;isolation:isolate;overflow:hidden;
+        background:linear-gradient(112deg,#362D2A 0%,#544036 100%);
+        border:1px solid #B88C5B;border-left:5px solid #D39C5C;
+        border-radius:13px;padding:18px 26px 18px 22px;margin:-10px 0 20px;
+        box-shadow:0 10px 25px rgba(42,34,32,.13);
+        min-height:126px;display:flex;align-items:center;justify-content:space-between;gap:22px;
+    }
+    .urg-hero .urg-copy {position:relative;z-index:2;max-width:59%;}
+    .urg-hero .eyebrow {font-size:10px;letter-spacing:1.7px;font-weight:800;color:#E5C399!important;}
+    [data-testid="stAppViewContainer"] .urg-hero h1 {
+        color:#FFF9F4!important;-webkit-text-fill-color:#FFF9F4!important;
+        margin:7px 0 3px!important;font-size:30px!important;
+        line-height:1.18!important;font-weight:800!important;
+    }
+    [data-testid="stAppViewContainer"] .urg-hero p {
+        font-size:12.5px!important;color:#EADFD6!important;
+        -webkit-text-fill-color:#EADFD6!important;margin:0!important;
+    }
+    .urg-hero .urg-count {
+        z-index:3;position:relative;flex:0 0 auto;text-align:center;
+        background:rgba(238,217,194,.12);border:1px solid rgba(234,200,156,.45);
+        border-radius:12px;padding:12px 16px;min-width:114px;
+    }
+    .urg-hero .urg-count strong {display:block;font-size:30px;line-height:1.05;color:#FCEAD8;}
+    .urg-hero .urg-count span {display:block;font-size:10px;letter-spacing:.65px;color:#EADFD6;}
+    /* Trazo dentro de una franja independiente, centrado y separado del contador. */
+    .urg-hero .urg-trazo {
+        position:absolute!important;
+        right:160px!important;
+        top:50%!important;
+        bottom:auto!important;
+        transform:translateY(-50%)!important;
+        width:34%!important;
+        height:110px!important;
+        max-height:75%!important;
+        opacity:.35!important;
+        pointer-events:none!important;
+        z-index:1!important;
+        overflow:visible!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 13%,#000 88%,transparent 100%);
+        mask-image:linear-gradient(90deg,transparent 0%,#000 13%,#000 88%,transparent 100%);
+    }
+    .urg-kpis-heading, .urg-seccion {
+        color:#815C3D!important;letter-spacing:1.5px;font-weight:850;
+        font-size:11px;margin:18px 0 10px;
+    }
+    /* Contadores: bandas de color sólidas, con contraste real en lugar de bordes débiles. */
+    .urg-kpi {
+        position:relative;isolation:isolate;overflow:hidden;
+        min-height:112px;
+        display:grid;grid-template-columns:78px minmax(0,1fr);
+        grid-template-rows:repeat(3,min-content);
+        column-gap:16px;align-content:center;
+        background:var(--urg-tint,#FFF8F3)!important;
+        border:1.5px solid var(--urg-border,#CDAF9B)!important;
+        border-radius:14px;padding:0 16px 0 0!important;
+        box-shadow:0 10px 20px rgba(50,36,32,.10);
+        margin:0 0 6px!important;
+    }
+    .urg-kpi--urgent {--urg-accent:#B44E37;--urg-tint:#FFF0E9;--urg-border:#D9A48E;}
+    .urg-kpi--soon {--urg-accent:#DA982F;--urg-tint:#FFF6E5;--urg-border:#E7C082;}
+    .urg-kpi--manual {--urg-accent:#607A5E;--urg-tint:#EEF5EB;--urg-border:#AABDA7;}
+    .urg-kpi .urg-kpi-icon {
+        grid-column:1;grid-row:1/4;width:78px;height:100%;min-height:110px;
+        display:grid;place-items:center;align-self:stretch;
+        color:#FFFFFF!important;background:var(--urg-accent)!important;
+        border-right:1px solid rgba(48,36,26,.09);
+        font-size:27px;font-weight:850;line-height:1;
+        text-shadow:0 1px 2px rgba(0,0,0,.15);
+    }
+    .urg-kpi .value {grid-column:2;grid-row:1;color:#322B2C!important;
+        font-size:27px;font-weight:850;line-height:1.08;align-self:end;}
+    .urg-kpi .label {grid-column:2;grid-row:2;color:#3E3434!important;
+        font-size:12px;font-weight:800;line-height:1.3;margin-top:3px;}
+    .urg-kpi .small {grid-column:2;grid-row:3;color:#736761!important;
+        font-size:10px;line-height:1.3;margin-top:2px;}
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+      [data-testid="stHorizontalBlock"]:has(.urg-kpi) {gap:22px!important; margin:6px 0 10px!important;}
+    .urg-section-row {
+        display:flex;justify-content:space-between;align-items:end;gap:14px;margin:34px 0 18px;
+    }
+    .urg-section-row .kicker {font-size:10px;letter-spacing:1.5px;color:#A2764E;font-weight:800;}
+    .urg-section-row h2 {font-size:21px!important;line-height:1.18!important;color:#44383E!important;margin:4px 0 0!important;}
+    .urg-section-row .urg-antiguedad {color:#755D4A;font-size:11px;background:#EDE3D7;border:1px solid #D5C3B0;border-radius:7px;padding:7px 10px;white-space:nowrap;}
+    /* Fichas con rail rojo ladrillo más luminoso, información bien separada y más aire. */
+    div[class*="st-key-urg_ficha_"] {
+        position:relative!important;isolation:isolate!important;
+        background:#FFFCF8!important;
+        border:1.5px solid #D1B39D!important;
+        border-radius:16px!important;
+        padding:0 0 14px!important;
+        margin:16px 0 34px!important;
+        box-shadow:0 12px 28px rgba(64,37,29,.12)!important;
+        overflow:hidden!important;
+    }
+    div[class*="st-key-urg_ficha_"]::before {content:none!important;display:none!important;}
+    .urg-ficha {
+        display:grid;grid-template-columns:158px minmax(0,1fr);
+        min-height:188px;color:#392F30;position:relative;z-index:1;
+    }
+    .urg-rail {
+        display:flex;flex-direction:column;justify-content:center;align-items:center;
+        gap:4px;background:linear-gradient(155deg,#B7472D 0%,#872819 100%);
+        color:#FFF8EE;padding:17px 12px;text-align:center;
+        border-right:2px solid #D6A470;
+    }
+    .urg-rail--manual {background:linear-gradient(145deg,#6A8365,#3C624B);}
+    .urg-rail .rail-kicker {font-size:9px;font-weight:820;letter-spacing:1.55px;color:#FFE1C9;}
+    .urg-rail .rail-number {font-size:43px;line-height:1.04;font-weight:880;letter-spacing:-1.2px;}
+    .urg-rail .rail-units {font-size:10px;font-weight:750;letter-spacing:.5px;}
+    .urg-rail .rail-type {margin-top:8px;border:1px solid rgba(255,234,207,.82);
+        border-radius:20px;padding:6px 12px;font-size:10px;font-weight:800;letter-spacing:.4px;}
+    .urg-ficha-content {padding:20px 26px 18px;min-width:0;}
+    .urg-ficha-head {display:flex;align-items:flex-start;justify-content:space-between;gap:16px;}
+    .urg-ficha-kicker {font-size:10px;font-weight:850;letter-spacing:1.4px;color:#AE573E;}
+    .urg-ficha-numero {margin:5px 0 2px;font-size:20px;font-weight:835;line-height:1.24;
+        overflow-wrap:anywhere;color:#312A31;}
+    .urg-ficha-folio {font-size:11px;color:#8A736C;}
+    .urg-status {font-size:10px;font-weight:780;color:#943E2E;background:#FCEBE4;
+        border:1px solid #D9A48D;border-radius:20px;padding:7px 11px;white-space:nowrap;}
+    .urg-ficha-asunto {background:#F8F4EC;border-left:3px solid #B85136;
+        border-radius:0 8px 8px 0;margin:14px 0 14px;
+        padding:10px 12px;color:#554744;font-size:12px;line-height:1.5;overflow-wrap:anywhere;}
+    .urg-ficha-grid {display:grid;grid-template-columns:1fr 1fr;gap:18px;
+        border-top:1px solid #E4D2C3;padding-top:12px;}
+    .urg-ficha-field .label {font-size:10px;font-weight:830;color:#A46950;letter-spacing:.75px;}
+    .urg-ficha-field .text {font-size:12px;font-weight:720;color:#3B3336;
+        margin-top:4px;overflow-wrap:anywhere;}
+    .urg-ficha-meta {font-size:11px;color:#866D59;margin:8px 16px 0;}
+    /* CTA sigue siendo el expander nativo, sin enlaces simulados. */
+    /* CTA nativo: abre los documentos dentro del mismo expediente.
+       No es un enlace decorativo ni altera la lógica de la consulta. */
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] {
+        margin:2px 16px 1px!important;border:0!important;border-radius:9px!important;
+        background:transparent!important;box-shadow:none!important;overflow:hidden!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] details {
+        border:1px solid #D2A275!important;border-radius:9px!important;
+        background:#FFFCF8!important;overflow:hidden!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary {
+        min-height:45px!important;padding:10px 17px!important;
+        background:linear-gradient(100deg,#793626,#522E28)!important;
+        color:#FFF8ED!important;border-radius:8px!important;
+        display:flex!important;align-items:center!important;
+        font-size:12px!important;font-weight:780!important;letter-spacing:.1px!important;
+        transition:background .16s,box-shadow .16s!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary:hover {
+        background:linear-gradient(100deg,#923F2B,#633228)!important;
+        box-shadow:inset 0 0 0 1px #D1AD7D!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary *,
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary svg {
+        color:#FFF8ED!important;fill:none!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero)
+    div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] details[open] summary {
+        border-radius:8px 8px 0 0!important;
+        border-bottom:1px solid #C8A77D!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stTextInput"] input,
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        background:#FFFCF8!important;border:1px solid #CDBDAC!important;
+        border-radius:9px!important;color:#453D40!important;
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stExpander"] {
+        background:rgba(253,250,245,.96)!important;
+        border:1px solid #D4C2B0!important;border-radius:9px!important;
+        box-shadow:0 2px 8px rgba(60,40,35,.04);
+    }
+    [data-testid="stAppViewContainer"]:has(.urg-hero) [data-testid="stExpander"] summary {color:#483C3C!important;}
     [data-testid="stAppViewContainer"]:has(.urg-hero)
     [class*="st-key-urgencia_guardar"] button,
     [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urg_retirar_"] button {{
-        background:linear-gradient(125deg,#41403b,#302f2c) !important;
-        border:1px solid #ae925f !important;
-        border-left:4px solid #c3a16a !important;
-        color:#fff !important;
-        border-radius:10px !important;
-        box-shadow:0 4px 12px rgba(38,42,43,.16) !important;
-        font-weight:700 !important;
-        padding:10px 18px !important;
-        transition:transform .16s ease,box-shadow .16s ease,background .16s ease !important;
-    }}
+    [class*="st-key-urg_retirar_"] button {
+        background:#483D3E!important;color:#FFF9F0!important;
+        border:1px solid #BF9870!important;border-radius:8px!important;font-weight:750!important;
+    }
     [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgencia_guardar"] button:hover,
+    [class*="st-key-urgentes_limpiar"] button {
+        background:#FCFAF5!important;color:#584B45!important;
+        border:1px solid #C8B7A5!important;border-radius:9px!important;
+    }
+    /* Scope native expanders specifically to urgent cards, not other module accordions. */
     [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urg_retirar_"] button:hover {{
-        background:#5a5142 !important;
-        transform:translateY(-1px);
-        box-shadow:0 7px 17px rgba(38,42,43,.22) !important;
-    }}
+    div[class*="st-key-urg_ficha_"] details > summary,
     [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgentes_limpiar"] button {{
-        background:rgba(250,248,243,.96) !important;
-        color:#3e3b35 !important;
-        border:1px solid #c9bbab !important;
-        border-radius:10px !important;
-        font-weight:650 !important;
-        box-shadow:0 3px 10px rgba(51,46,39,.07) !important;
-    }}
+    div[class*="st-key-urg_ficha_"] details > summary:hover {
+        background:#71382C!important;color:#FFF9ED!important;
+        border:1px solid #C7A075!important;
+    }
     [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgentes_limpiar"] button:hover {{
-        border-color:#aa8b58 !important;
-        color:#87683a !important;
-        background:#fffdf8 !important;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [data-testid="stExpander"] {{
-        border:1px solid #d8cebd !important;
-        border-radius:12px !important;
-        background:rgba(249,247,242,.94) !important;
-        box-shadow:0 3px 12px rgba(61,52,40,.055);
-        overflow:hidden;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [data-testid="stExpander"] summary {{
-        color:#2d3e47 !important;
-        font-weight:650 !important;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [data-testid="stTextInput"] input,
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [data-testid="stSelectbox"] [data-baseweb="select"] {{
-        border-radius:9px !important;
-        background:rgba(250,247,241,.98) !important;
-    }}
-    /* Selector de oficios: sin azul, a juego con la paleta grafito-marfil. */
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgencia_seleccion"] [data-baseweb="select"] > div {{
-        background:#f6f2ea !important;
-        border:1px solid #c8b9a2 !important;
-        border-radius:9px !important;
-        color:#34332f !important;
-        box-shadow:none !important;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgencia_seleccion"] [data-baseweb="select"] * {{
-        color:#34332f !important;
-        -webkit-text-fill-color:#34332f !important;
-    }}
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urgencia_guardar"] button p,
-    [data-testid="stAppViewContainer"]:has(.urg-hero)
-    [class*="st-key-urg_retirar_"] button p {{
-        color:#fffaf0 !important;
-        -webkit-text-fill-color:#fffaf0 !important;
-    }}
-    /* Corrección de contraste: los estilos globales no deben oscurecer el banner. */
-    [data-testid="stAppViewContainer"] .urg-hero h1,
-    [data-testid="stAppViewContainer"] .urg-hero h1 * {{
-        color:#fffaf1 !important;
-        -webkit-text-fill-color:#fffaf1 !important;
-        text-shadow:0 1px 2px rgba(0,0,0,.16);
-    }}
-    [data-testid="stAppViewContainer"] .urg-hero p,
-    [data-testid="stAppViewContainer"] .urg-hero p * {{
-        color:#f0e8dc !important;
-        -webkit-text-fill-color:#f0e8dc !important;
-    }}
-    [data-testid="stAppViewContainer"] .urg-hero .eyebrow {{
-        color:#e4c58e !important;
-        -webkit-text-fill-color:#e4c58e !important;
-    }}
-    [data-testid="stAppViewContainer"] .urg-label {{
-        color:#634b2d !important;
-        font-weight:800 !important;
-        text-shadow:0 1px 0 rgba(255,255,255,.75);
-    }}
-    [data-testid="stAppViewContainer"] .urg-kpi .number,
-    [data-testid="stAppViewContainer"] .urg-kpi .title {{
-        color:#193242 !important;
-        -webkit-text-fill-color:#193242 !important;
-    }}
-    [data-testid="stAppViewContainer"] .urg-kpi .desc {{
-        color:#5e5a52 !important;
-        -webkit-text-fill-color:#5e5a52 !important;
-    }}
-    [data-testid="stAppViewContainer"] .urg-kpi {{
-        box-shadow:0 7px 19px rgba(51,45,35,.10) !important;
-    }}
-    .urg-hero .eyebrow {{font-size:11px;letter-spacing:2px;color:#e1c28d;font-weight:750}}
-    .urg-hero h1 {{font-size:37px;color:#fff;margin:8px 0 4px;line-height:1.15}}
-    .urg-hero p {{font-size:14px;color:#e7e2d8;margin:0}}
-    .urg-label {{color:#80653b;font-weight:750;letter-spacing:2px;
-                  font-size:12px;margin:17px 0 10px}}
-    .urg-kpi {{background:#f7f4ee;border:1px solid #ddd4c7;border-left:4px solid #b99a65;
-               border-radius:12px;padding:17px 20px;min-height:119px;
-               box-shadow:0 5px 14px rgba(61,52,40,.08)}}
-    .urg-kpi .number {{font-size:33px;font-weight:800;color:#20394a;line-height:1.12}}
-    .urg-kpi .title {{font-size:14px;font-weight:750;color:#20394a;margin-top:3px}}
-    .urg-kpi .desc {{font-size:12px;color:#777269;margin-top:4px}}
-    .urg-doc {{background:#f7f4ee;border:1px solid #ded7ca;border-left:4px solid #b99a65;
-               border-radius:10px;padding:15px 19px;margin:10px 0 4px;
-               box-shadow:0 3px 10px rgba(61,52,40,.07)}}
-    .urg-doc strong {{color:#21394a}}
-    .urg-doc .meta {{color:#696b69;font-size:13px;line-height:1.8}}
-    .urg-doc .tag {{display:inline-block;background:#f4dfae;color:#705222;
-                    border-radius:30px;padding:3px 11px;font-size:11px;font-weight:700}}
-    .urg-empty {{text-align:center;background:#f7f4ee;border:1px dashed #d5cbbd;
-                 border-radius:14px;padding:44px 20px;color:#263d4b;margin-top:16px}}
-    /* Ornamentación de alineamiento exclusiva de Urgentes */
-    .urg-hero {{position:relative;overflow:hidden;isolation:isolate;}}
-    .urg-hero > .eyebrow,.urg-hero > h1,.urg-hero > p {{position:relative;z-index:2;max-width:67%;}}
-    .urg-hero .urg-ornament {{position:absolute;right:23px;top:12px;width:33%;height:calc(100% - 25px);opacity:.83;pointer-events:none;z-index:1;}}
-    .urg-hero .urg-signature {{position:absolute;right:30px;bottom:15px;font-size:9px;letter-spacing:2px;color:#ddc18e;font-weight:700;z-index:2;}}
-    @media(max-width:800px){{.urg-hero .urg-ornament{{opacity:.22;width:45%;right:0}}.urg-hero > .eyebrow,.urg-hero > h1,.urg-hero > p{{max-width:92%}}.urg-hero .urg-signature{{display:none}}}}
+    div[class*="st-key-urg_ficha_"] details > summary p {
+        color:#FFF9ED!important;font-size:12px!important;font-weight:770!important;
+    }
+    @media(max-width:800px) {
+        .urg-ficha {grid-template-columns:108px minmax(0,1fr);}
+        .urg-rail .rail-number{font-size:31px;}
+        .urg-ficha-content{padding:14px 14px 12px;}
+        .urg-ficha-grid{grid-template-columns:1fr 1fr;}
+        .urg-kpi{grid-template-columns:49px minmax(0,1fr);column-gap:9px;min-height:95px;padding-right:8px!important;}
+        .urg-kpi .urg-kpi-icon{display:grid;width:49px;min-height:94px;font-size:20px;}
+        .urg-kpi .value,.urg-kpi .label,.urg-kpi .small{grid-column:2;}
+        .urg-kpi .value{font-size:22px;}
+    }
+    @media(max-width:520px) {
+        .urg-ficha {grid-template-columns:1fr;}
+        .urg-rail {flex-direction:row;justify-content:flex-start;gap:10px;padding:11px 15px;}
+        .urg-rail .rail-number{font-size:21px;}
+        .urg-rail .rail-type{margin:0 0 0 auto;}
+    }
+    .urg-empty {background:#FFFDF8;border:1px dashed #CAB5A2;color:#67554D;
+        border-radius:11px;padding:30px 16px;text-align:center;margin:13px 0 22px;}
+    .urg-empty strong {display:block;font-size:14px;color:#493E41;}
+    .urg-empty p {font-size:12px;color:#81736D;margin-top:4px;}
+    @media(max-width:900px){
+        .urg-hero {padding:18px 18px;min-height:126px;margin-top:-4px!important;}
+        .urg-hero .urg-trazo {
+            right:116px!important;
+            top:50%!important;
+            bottom:auto!important;
+            width:31%!important;
+            height:95px!important;
+            transform:translateY(-50%)!important;
+            opacity:.24!important;
+        }
+        .urg-hero .urg-copy {max-width:72%;}
+        .urg-hero h1 {font-size:26px!important;}
+        .urg-section-row {align-items:flex-start;}
+    }
+    @media(max-width:620px){
+        .urg-hero {gap:10px;}
+        .urg-hero .urg-count {padding:9px 11px;min-width:73px;}
+        .urg-hero .urg-count strong {font-size:24px;}
+        .urg-hero .urg-copy {max-width:74%;}
+        .urg-hero .eyebrow {font-size:8px;}
+        .urg-hero .urg-trazo {display:none!important;}
+        .urg-ficha-grid {grid-template-columns:1fr 1fr;}
+        .urg-section-row {display:block;}
+        .urg-section-row .urg-antiguedad {display:inline-block;margin-top:8px;}
+    }
     </style>
-    <div class="urg-hero">
-      <div class="eyebrow">MESA DE DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
-      <h1>Urgentes</h1>
-      <p>Oficios prioritarios · días transcurridos desde la recepción</p>
-      <svg class="urg-ornament" viewBox="0 0 360 155" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-        <g stroke="#b6ab92" stroke-width=".8" fill="none" opacity=".26">
-          <path d="M22 29H346M22 62H346M22 95H346M22 128H346"/>
-          <path d="M54 13L26 141M105 13L77 141M156 13L128 141M207 13L179 141M258 13L230 141M309 13L281 141"/>
-        </g>
-        <path d="M20 120C93 116 113 43 194 44S294 85 344 35" fill="none" stroke="#d7b477" stroke-width="2.8"/>
-        <path d="M20 130C93 126 113 53 194 54S294 95 344 45" fill="none" stroke="#e2d2b4" stroke-width="1.5" opacity=".7"/>
-        <path d="M20 110C93 106 113 33 194 34S294 75 344 25" fill="none" stroke="#c1a477" stroke-width="1" stroke-dasharray="5 6" opacity=".65"/>
-        <circle cx="194" cy="44" r="6" fill="#45423b" stroke="#d7b477" stroke-width="2"/>
-        <path d="M194 25V35M194 53V63M175 44H185M203 44H213" stroke="#d7b477" stroke-width="1.2"/>
-        <circle cx="290" cy="70" r="3" fill="#d7b477"/>
-      </svg>
-      <span class="urg-signature">PRIORIDAD · SEGUIMIENTO · CONTROL</span>
-    </div>
     """, unsafe_allow_html=True)
+
+    # Imágenes opcionales. Sin archivos extra, se usan los trazos CSS/SVG.
+    # Se insertan después de los estilos base para que su visibilidad sea predecible.
+    _imagen_hero_urg = ASSETS_DIR / "banner_urgentes.png"
+    _imagen_ficha_urg = ASSETS_DIR / "tarjeta_urgentes.png"
+    if _imagen_hero_urg.is_file():
+        _url_hero_urg = "data:image/png;base64," + base64.b64encode(_imagen_hero_urg.read_bytes()).decode("ascii")
+        st.markdown(
+            '<style>.urg-hero{background-image:'
+            'linear-gradient(90deg,rgba(61,56,56,.98) 0%,rgba(64,55,53,.92) 42%,rgba(64,55,53,.58) 58%,rgba(64,55,53,.22) 100%),'
+            f'url("{_url_hero_urg}")!important;'
+            'background-position:left top,right center!important;'
+            'background-size:100% 100%, 42% auto!important;'
+            'background-repeat:no-repeat,no-repeat!important;}'
+            '.urg-hero .urg-trazo{display:none!important;}'
+            '</style>', unsafe_allow_html=True)
+    if _imagen_ficha_urg.is_file():
+        _url_ficha_urg = "data:image/png;base64," + base64.b64encode(_imagen_ficha_urg.read_bytes()).decode("ascii")
+        st.markdown(
+            '<style>div[class*="st-key-urg_ficha_"]::before{'
+            f'background-image:url("{_url_ficha_urg}")!important;'
+            'background-size:contain!important;background-position:right top!important;'
+            'background-repeat:no-repeat!important;opacity:.23!important;}'
+            '</style>', unsafe_allow_html=True)
 
     try:
         registros = _leer_registros_oficios()
@@ -4375,8 +7493,7 @@ def _modulo_lateral_documentos(tipo):
         st.error(f"No se pudo consultar el registro: {_mensaje_error_sheets(error)}")
         return
 
-    # Regla institucional: días naturales completos; urgente al superar 5 días.
-    # Los registros finalizados no generan alertas nuevas ni aparecen en esta bandeja.
+    # Mismas reglas institucionales: urgente después de 5 días naturales o marca manual.
     UMBRAL_URGENCIA_DIAS = 5
     ESTADOS_TERMINADOS = {"firmado", "firmados", "cerrado", "cerrados", "archivado", "archivados",
                           "concluido", "concluidos", "cancelado", "cancelados"}
@@ -4396,47 +7513,65 @@ def _modulo_lateral_documentos(tipo):
     lista = [r for r in registros if _prioridad_urgencia(r)["urgente"]]
     lista.sort(key=lambda r: (_prioridad_urgencia(r)["dias"] is not None,
                               _prioridad_urgencia(r)["dias"] or -1), reverse=True)
-    antiguedades = [_prioridad_urgencia(r)["dias"] for r in lista]
-    antiguedades = [d for d in antiguedades if d is not None]
-    automaticos = sum(_prioridad_urgencia(r)["automatico"] for r in lista)
-    manuales = sum(_prioridad_urgencia(r)["manual"] and not _prioridad_urgencia(r)["automatico"] for r in lista)
+    antiguedades = [d for r in lista if (d := _prioridad_urgencia(r)["dias"]) is not None]
+    manuales = sum(_prioridad_urgencia(r)["manual"] for r in lista)
     proximos = sum(4 <= d <= 5 for r in registros if not _finalizado_urgencia(r)
                   if (d := _dias_desde_recepcion(r.get("Fecha de recepción"))) is not None)
-    # Criterio accesible pero visualmente secundario: no desplaza el tablero.
-    st.caption("Criterio: urgente desde el día 6 natural · próximo a urgente: días 4 y 5 · prioridad manual disponible.")
-    with st.expander("Consultar criterio de prioridad", expanded=False):
-        st.markdown(
-            "Los oficios **activos** se consideran urgentes automáticamente cuando "
-            "han transcurrido **más de 5 días naturales** desde su recepción. "
-            "Los días 4 y 5 se muestran como próximos a urgente. "
-            "Se pueden marcar casos especiales de forma manual."
-        )
-        st.caption(
-            "Los oficios firmados, cerrados, archivados, concluidos o cancelados "
-            "no aparecen en esta bandeja. La prioridad se calcula al consultar "
-            "la página y no altera el estatus registrado en Google Sheets."
-        )
-    st.markdown('<div class="urg-label">RESUMEN DE PRIORIDADES</div>', unsafe_allow_html=True)
+    max_antiguedad = max(antiguedades) if antiguedades else None
+
+    # No se usa imagen adicional: este trazo SVG se integra en el encabezado.
+    st.markdown(f"""
+    <div class="urg-hero">
+      <svg class="urg-trazo" viewBox="0 0 600 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <g fill="none" stroke="#D8C6B4" stroke-width=".7" opacity=".43">
+          <path d="M2 24H600M2 55H600M2 86H600M2 117H600M2 148H600"/>
+          <path d="M30 10L5 155M95 10L70 155M160 10L135 155M225 10L200 155M290 10L265 155M355 10L330 155M420 10L395 155M485 10L460 155M550 10L525 155"/>
+        </g>
+        <path d="M0 139C128 137 164 115 235 82S364 20 600 22" fill="none" stroke="#D7B477" stroke-width="2.3"/>
+        <path d="M0 152C128 150 164 128 235 95S364 33 600 35" fill="none" stroke="#D7B477" stroke-width="1"/>
+        <path d="M0 125C128 123 164 101 235 68S364 6 600 8" fill="none" stroke="#D7B477" stroke-dasharray="4 7" stroke-width="1"/>
+        <circle cx="235" cy="82" r="4" fill="#F0D6A7"/>
+        <circle cx="450" cy="26" r="4" fill="#F0D6A7"/>
+      </svg>
+      <div class="urg-copy">
+        <div class="eyebrow">DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
+        <h1>Atención prioritaria</h1>
+        <p>Identifica y consulta los oficios que necesitan trámite rápido.</p>
+      </div>
+      <div class="urg-count"><strong>{len(lista):02d}</strong><span>Urgentes activos</span></div>
+    </div>
+    """, unsafe_allow_html=True)
+
     kpis = (
-        (len(lista), "Urgentes activos", "Automáticos y manuales"),
-        (automaticos, "Urgencia automática", "Desde el día 6 natural"),
-        (proximos, "Próximos a urgente", "Entre 4 y 5 días"),
+        (len(lista), "Urgentes activos", "En seguimiento prioritario", "urgent"),
+        (proximos, "Próximos a urgente", "Entre 4 y 5 días naturales", "soon"),
+        (manuales, "Prioridad manual", "Casos especiales marcados", "manual"),
     )
-    for columna, (numero, titulo, detalle) in zip(st.columns(3, gap="large"), kpis):
+    for columna, (numero, titulo, detalle, tipo_kpi) in zip(st.columns(3, gap="medium"), kpis):
         with columna:
             st.markdown(
-                f'<div class="urg-kpi"><div class="number">{numero:02d}</div>'
-                f'<div class="title">{html.escape(titulo)}</div>'
-                f'<div class="desc">{html.escape(detalle)}</div></div>',
-                unsafe_allow_html=True)
-    st.caption(f"Mayor antigüedad: {max(antiguedades)} días · Prioridades manuales adicionales: {manuales}"
-               if antiguedades else f"Prioridades manuales adicionales: {manuales}")
-    st.markdown('<div style="height:14px" aria-hidden="true"></div>', unsafe_allow_html=True)
+                f'<div class="urg-kpi urg-kpi--{tipo_kpi}">'
+                f'<span class="urg-kpi-icon" aria-hidden="true">{ {"urgent":"!","soon":"◷","manual":"✓"}[tipo_kpi] }</span>'
+                f'<div class="value">{numero:02d}</div>'
+                f'<div class="label">{html.escape(titulo)}</div>'
+                f'<div class="small">{html.escape(detalle)}</div>'
+                '</div>', unsafe_allow_html=True)
 
+    with st.expander("Criterios de prioridad · 6 días / 4–5 días / marca manual", expanded=False):
+        st.markdown(
+            "Los oficios **activos** se consideran urgentes automáticamente cuando han transcurrido "
+            "**más de 5 días naturales** desde su recepción. Los días 4 y 5 se muestran "
+            "como próximos a urgente. También pueden marcarse casos especiales de forma manual."
+        )
+        st.caption(
+            "Los oficios firmados, cerrados, archivados, concluidos o cancelados no aparecen. "
+            "Este indicador no altera el estatus registrado en Google Sheets."
+        )
+
+    # Gestión administrativa existente, siempre separada de las fichas de consulta.
     if es_administrador():
-        with st.expander("Gestionar prioridad manual (casos especiales)", expanded=False):
-            st.caption("La prioridad automática no puede desactivarse mientras el oficio activo supere 5 días. "
-                       "Retirar la marca manual no elimina la urgencia por antigüedad.")
+        with st.expander("Prioridad manual · casos especiales", expanded=False):
+            st.caption("La urgencia por antigüedad no puede desactivarse retirando una marca manual.")
             opciones = {f"{r.get('Folio', '')} · {r.get('No. de oficio', '')} · {str(r.get('Asunto', ''))[:75]}": r
                         for r in registros if not _finalizado_urgencia(r)}
             if opciones:
@@ -4456,11 +7591,18 @@ def _modulo_lateral_documentos(tipo):
                     except Exception as error:
                         st.error(str(error))
 
-    st.markdown('<div class="urg-label">CONSULTA DE OFICIOS URGENTES</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="urg-section-row"><div>'
+        '<div class="kicker">EXPEDIENTES PRIORITARIOS</div>'
+        '<h2>Requieren atención</h2></div>'
+        f'<div class="urg-antiguedad">Mayor antigüedad: '
+        f'{str(max_antiguedad) + " días" if max_antiguedad is not None else "—"}'
+        '</div></div>', unsafe_allow_html=True)
+
+    # Se conservan el filtro por estatus y la búsqueda existente.
     col_buscar, col_estado, col_limpiar = st.columns([5, 2, 1.4], gap="small")
     with col_buscar:
-        consulta = st.text_input("Buscar", placeholder="Folio, número de oficio, asunto o responsable...",
+        consulta = st.text_input("Buscar", placeholder="Folio, oficio, asunto o responsable...",
                                  key="buscar_urgentes")
     estados = sorted({str(r.get("Estatus", "")).strip() for r in lista
                       if str(r.get("Estatus", "")).strip()})
@@ -4481,49 +7623,72 @@ def _modulo_lateral_documentos(tipo):
                 d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
     if estado != "Todos":
         filtrados = [r for r in filtrados if str(r.get("Estatus", "")).strip() == estado]
-    st.markdown('<div class="urg-label">EXPEDIENTES PRIORITARIOS</div>', unsafe_allow_html=True)
     st.caption(f"{len(filtrados)} expediente(s) · Ordenados del más antiguo al más reciente")
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
     if not filtrados:
         mensaje = ("No hay oficios activos con urgencia automática o manual."
                    if not lista else "No se encontraron oficios con estos filtros.")
         st.markdown(
-            f'<div class="urg-empty"><div style="font-size:28px">▤</div>'
-            f'<strong>{html.escape(mensaje)}</strong><p>Los expedientes prioritarios aparecerán aquí.</p></div>',
+            f'<div class="urg-empty"><strong>{html.escape(mensaje)}</strong>'
+            '<p>Los expedientes prioritarios aparecerán aquí.</p></div>',
             unsafe_allow_html=True)
         return
+
     for indice, oficio in enumerate(filtrados):
         folio = str(oficio.get("Folio", "")).strip()
         numero = str(oficio.get("No. de oficio", "")).strip()
-        dias = _dias_desde_recepcion(oficio.get("Fecha de recepción", ""))
+        prioridad = _prioridad_urgencia(oficio)
+        dias = prioridad["dias"]
         fecha = str(oficio.get("Fecha de recepción", "")).strip() or "No registrada"
         estatus = str(oficio.get("Estatus", "")).strip() or "Sin estado"
         asunto = str(oficio.get("Asunto", "")).strip() or "Sin asunto"
         responsable = str(oficio.get("Responsable", "")).strip() or "No asignado"
-        automatico = dias is not None and dias > UMBRAL_URGENCIA_DIAS
-        razon = "POR ANTIGÜEDAD" if automatico else "PRIORIDAD MANUAL"
-        dias_etiqueta = f"{dias} días naturales" if dias is not None else "Fecha por verificar"
-        st.markdown(
-            '<div class="urg-doc" style="padding:17px 20px;margin:12px 0 5px;">'
-            '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">'
-            f'<div><strong style="font-size:16px;">{html.escape(numero or folio or "Expediente")}</strong>'
-            f'<span class="tag" style="margin-left:12px;">{razon}</span></div>'
-            f'<strong style="font-size:14px;color:#8a6735;">{html.escape(dias_etiqueta)}</strong></div>'
-            f'<div class="meta" style="margin-top:7px;">{html.escape(asunto[:160])}</div>'
-            '<div class="meta" style="margin-top:8px;padding-top:7px;border-top:1px solid #ded8cc;">'
-            f'Folio {html.escape(folio or "—")} &nbsp; · &nbsp; Recepción: {html.escape(fecha)}'
-            f' &nbsp; · &nbsp; {html.escape(estatus)} &nbsp; · &nbsp; {html.escape(responsable)}</div>'
-            '</div>', unsafe_allow_html=True)
-        with st.expander(f"Abrir expediente · {numero or folio}", expanded=False):
-            st.markdown(f"**Asunto:** {asunto}")
-            st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
-            _documentos_seccion(oficio)
-            if es_administrador():
-                if marcas.get((folio, numero), False) and st.button("Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
-                    try:
-                        _actualizar_urgencia(folio, numero, False)
-                        st.rerun()
-                    except Exception as error:
-                        st.error(str(error))
+        es_manual = not prioridad["automatico"]
+        motivo = "PRIORIDAD MANUAL" if es_manual else "URGENTE"
+        edad = f"{dias} días naturales" if dias is not None else "Fecha por verificar"
+        con_marca = prioridad["manual"] and prioridad["automatico"]
+        # Rail de antigüedad + información; datos y permisos de origen intactos.
+        rail_label = str(dias) if dias is not None else "—"
+        rail_unidad = "DÍAS NATURALES" if dias is not None else "SIN FECHA"
+        rail_clase = "urg-rail--manual" if es_manual else ""
+        with st.container(key=f"urg_ficha_{'manual_' if es_manual else ''}{indice}"):
+            st.markdown(
+                '<div class="urg-ficha">'
+                f'<div class="urg-rail {rail_clase}">'
+                '<div class="rail-kicker">ANTIGÜEDAD</div>'
+                f'<div class="rail-number">{html.escape(rail_label)}</div>'
+                f'<div class="rail-units">{rail_unidad}</div>'
+                f'<div class="rail-type">{motivo}</div>'
+                '</div>'
+                '<div class="urg-ficha-content">'
+                '<div class="urg-ficha-head"><div>'
+                '<div class="urg-ficha-kicker">EXPEDIENTE PRIORITARIO</div>'
+                f'<div class="urg-ficha-numero">{html.escape(numero or folio or "Sin número")}</div>'
+                f'<div class="urg-ficha-folio">Folio {html.escape(folio or "—")}</div>'
+                '</div>'
+                f'<span class="urg-status">{html.escape(estatus)}</span>'
+                '</div>'
+                f'<div class="urg-ficha-asunto">{html.escape(asunto[:230])}</div>'
+                '<div class="urg-ficha-grid">'
+                f'<div class="urg-ficha-field"><div class="label">RESPONSABLE</div>'
+                f'<div class="text">{html.escape(responsable)}</div></div>'
+                f'<div class="urg-ficha-field"><div class="label">RECEPCIÓN</div>'
+                f'<div class="text">{html.escape(fecha)}</div></div>'
+                '</div></div></div>'
+                + ('<div class="urg-ficha-meta">También marcado como prioridad manual</div>' if con_marca else '')
+                , unsafe_allow_html=True)
+            with st.expander("▣ Consultar expediente y documentos", expanded=False):
+                st.markdown(f"**Asunto:** {asunto}")
+                st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
+                _documentos_seccion(oficio)
+                if es_administrador():
+                    if marcas.get((folio, numero), False) and st.button(
+                            "Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
+                        try:
+                            _actualizar_urgencia(folio, numero, False)
+                            st.rerun()
+                        except Exception as error:
+                            st.error(str(error))
 
 
 # =========================================================
@@ -4531,260 +7696,198 @@ def _modulo_lateral_documentos(tipo):
 # =========================================================
 
 if st.session_state.menu_activo == "home":
-    aplicar_fondo()
-    mostrar_sesion()
-
-    def imagen_menu_base64(nombre):
-        ruta = Path(__file__).parent / "assets" / nombre
-        if ruta.is_file():
-            return "data:image/png;base64," + base64.b64encode(ruta.read_bytes()).decode("ascii")
-        return ""
-
-    imagen_oficios = imagen_menu_base64("menu_oficios.png")
-    imagen_ingenieria = imagen_menu_base64("menu_ingenieria.png")
-    if not imagen_oficios or not imagen_ingenieria:
-        faltantes = [
-            nombre for nombre, valor in (
-                ("menu_oficios.png", imagen_oficios),
-                ("menu_ingenieria.png", imagen_ingenieria),
-            ) if not valor
-        ]
-        st.warning("Faltan imágenes en la carpeta assets: " + ", ".join(faltantes))
-
-    st.html(
-        """
-        <style>
-        .home-hero {
-            text-align: center;
-            padding: 12px 0 24px;
-            color: #10283b;
-        }
-
-        .home-kicker {
-            font-size: 10px;
-            font-weight: 750;
-            letter-spacing: 2.5px;
-            color: #95743c;
-        }
-
-        .home-title {
-            font-size: clamp(34px, 4vw, 48px);
-            font-weight: 850;
-            letter-spacing: 2px;
-            line-height: 1.05;
-            margin: 10px 0 5px;
-        }
-
-        .home-subtitle {
-            font-size: clamp(18px, 2.5vw, 26px);
-            font-weight: 350;
-            letter-spacing: 7px;
-        }
-
-        .home-line {
-            width: 170px;
-            height: 2px;
-            background: #b39258;
-            margin: 18px auto 0;
-        }
-
-        .home-module-label {
-            font-size: 11px;
-            letter-spacing: 2px;
-            color: #536574;
-            font-weight: 750;
-            margin-bottom: 12px;
-        }
-
-        .stMainBlockContainer:has(.home-hero) {
-            max-width: 1120px !important;
-            padding-top: 1rem !important;
-        }
-
-        /* TARJETAS DEL MENÚ PRINCIPAL */
-
-        .st-key-home_oficios button,
-        .st-key-home_diseno button {
-            position: relative !important;
-            display: flex !important;
-            flex-direction: column !important;
-            justify-content: center !important;
-            align-items: flex-start !important;
-
-            width: 100% !important;
-            height: 205px !important;
-            min-height: 205px !important;
-
-            padding: 22px 20px 22px 51% !important;
-            border: 1px solid rgba(185,154,101,0.65) !important;
-            border-radius: 12px !important;
-
-            background-color: #10283b !important;
-            background-repeat: no-repeat !important;
-            background-size: auto 100% !important;
-            background-position: left center !important; 
-
-            box-shadow: 0 10px 24px rgba(13,36,52,.17) !important;
-            text-align: left !important;
-            overflow: hidden !important;
-            white-space: normal !important;
-            transition: transform .2s, box-shadow .2s !important;
-        }
-
-        .st-key-home_diseno button {
-            background-color: #284653 !important;
-        }
-
-        /* Integración suave entre ilustración y fondo */
-
-        .st-key-home_oficios button::before,
-        .st-key-home_diseno button::before {
-            content: "";
-            position: absolute;
-            z-index: 0;
-            inset: 0;
-            pointer-events: none;
-
-            background: linear-gradient(
-                90deg,
-                rgba(7, 20, 34, 0.10) 0%,
-                rgba(12, 36, 54, 0.15) 38%,
-                rgba(12, 36, 54, 0.90) 68%,
-                rgba(12, 36, 54, 0.98) 100%
-            );
-        }
-
-        .st-key-home_diseno button::before {
-            background: linear-gradient(
-                90deg,
-                rgba(7, 20, 34, 0.08) 0%,
-                rgba(33, 67, 79, 0.15) 38%,
-                rgba(33, 67, 79, 0.90) 68%,
-                rgba(33, 67, 79, 0.98) 100%
-            );
-        }
-
-        /* Títulos */
-        .st-key-home_oficios button p,
-        .st-key-home_diseno button p {
-            position: relative !important;
-            z-index: 1 !important;
-
-            width: 100% !important;
-            margin: 0 !important;
-
-            color: #ffffff !important;
-            font-size: clamp(14px, 1.15vw, 17px) !important;
-            font-weight: 800 !important;
-            line-height: 1.35 !important;
-            text-align: left !important;
-            white-space: normal !important;
-        }
-
-        /* Descripciones */
-        .st-key-home_oficios button::after,
-        .st-key-home_diseno button::after {
-            position: relative;
-            z-index: 1;
-            display: block;
-            width: 100%;
-            margin-top: 10px;
-            font-size: 11px;
-            line-height: 1.5;
-            font-weight: 400;
-            color: #d8e2e8;
-            text-align: left;
-        }
-
-        .st-key-home_oficios button::after {
-            content: "Consulta, registro y seguimiento documental";
-        }
-
-        .st-key-home_diseno button::after {
-            content: "Fase I · Documentación técnica del proyecto";
-        }
-
-        /* Interacción */
-        .st-key-home_oficios button:hover,
-        .st-key-home_diseno button:hover {
-            transform: translateY(-3px) !important;
-            box-shadow: 0 16px 30px rgba(13,36,52,.23) !important;
-            border-color: #d3ad67 !important;
-        }
-
-        /* Pie de página */
-        .home-footer {
-            text-align: center;
-            color: #526778;
-            font-size: 12px;
-            margin-top: 30px;
-            letter-spacing: 1px;
-        }
-
-        /* Pantallas pequeñas */
-        @media (max-width: 760px) {
-            .home-hero {
-                padding: 10px 0 18px;
-            }
-
-            .st-key-home_oficios button,
-            .st-key-home_diseno button {
-                height: 180px !important;
-                min-height: 180px !important;
-                padding: 14px 12px 14px 50% !important;
-                background-size: auto 100% !important;
-            }
-
-            .st-key-home_oficios button p,
-            .st-key-home_diseno button p {
-                font-size: 13px !important;
-            }
-        }
-        </style>
-        <section class="home-hero">
-        <div class="home-kicker">MESA DE DISEÑO GEOMÉTRICO DE VÍA FÉRREA</div>
-        <div class="home-title">CONTROL</div>
-        <div class="home-subtitle">DOCUMENTAL</div>
-        <div class="home-line"></div>
-        </section>
-        """,
+    # Portada de Diseño Geométrico con el mismo lenguaje visual del selector de áreas.
+    # Los módulos reales y sus permisos permanecen intactos.
+    fondo_home = _imagen_selector("fondo_ferroviario.png")
+    logo_home = _imagen_selector("logo_selector.png")
+    foto_oficios = _imagen_selector("menu_oficios.png") or _imagen_selector("tarjeta_diseno.png")
+    foto_ingenieria = _imagen_selector("menu_ingenieria.png") or _imagen_selector("tarjeta_diseno.png")
+    fondo_home_css = (
+        f'url("{fondo_home}")'
+        if fondo_home else 'linear-gradient(130deg,#eef3f6,#fafafa)'
     )
+    st.markdown('<div class="home-institutional-marker"></div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <style>
+    [data-testid="stAppViewContainer"] {{
+       background-image:{fondo_home_css} !important;
+       background-size:cover !important;background-position:center center !important;
+       background-attachment:fixed !important;
+    }}
+    [data-testid="stHeader"] {{height:0!important;min-height:0!important;background:transparent!important;}}
+    #MainMenu, footer {{visibility:hidden;}}
+    [data-testid="stToolbar"] {{display:none!important;}}
+    .block-container:has(.home-institutional-marker) {{
+       max-width:1480px!important;padding-top:0!important;padding-bottom:0!important;
+       margin-top:0!important;
+    }}
 
-    estilos_imagenes = "<style>"
-    if imagen_oficios:
-        estilos_imagenes += (
-            '.st-key-home_oficios button {'
-            f'background-image: url("{imagen_oficios}") !important;'
-            '}'
-        )
-    if imagen_ingenieria:
-        estilos_imagenes += (
-            '.st-key-home_diseno button {'
-            f'background-image: url("{imagen_ingenieria}") !important;'
-            '}'
-        )
-    estilos_imagenes += "</style>"
-    st.html(estilos_imagenes)
+    /* La fila COMPLETA del encabezado es fija, no un fondo separado. */
+    .home-institutional-marker {{height:104px;}}
+    [data-testid="stHorizontalBlock"]:has(.home-brand) {{
+        position:fixed!important;top:0!important;left:0!important;right:0!important;
+        width:100%!important;height:104px!important;
+        padding:0 clamp(26px,5.4vw,108px)!important;
+        box-sizing:border-box!important;
+        background:linear-gradient(110deg,#102235,#20374a)!important;
+        border-bottom:1px solid rgba(200,164,96,.35)!important;
+        z-index:999!important;align-items:center!important;gap:16px!important;
+    }}
+    [data-testid="stHorizontalBlock"]:has(.home-brand) > [data-testid="stColumn"] {{
+        min-width:0!important;align-self:center!important;
+    }}
+    [data-testid="stHorizontalBlock"]:has(.home-brand) [data-testid="stVerticalBlock"] {{
+        justify-content:center!important;gap:0!important;
+    }}
+    [data-testid="stHorizontalBlock"]:has(.home-brand) [data-testid="stMarkdownContainer"] p {{margin:0!important;}}
+    
+    .home-brand {{height:90px;display:flex;align-items:center;gap:17px;position:relative;z-index:1;color:white;}}
+    .home-brand img {{height:58px;width:65px;object-fit:contain;}}
+    .home-brand-name {{border-left:1px solid #caa45e;padding-left:19px;}}
+    .home-brand-name strong {{font-size:23px;letter-spacing:1.3px;color:#fff;display:block;line-height:1.1;}}
+    .home-brand-name span {{font-size:10px;letter-spacing:3.3px;color:#d5dce3;display:block;margin-top:8px;}}
+    .home-user {{color:#fff;text-align:right;font-size:12px;height:90px;display:flex;flex-direction:column;
+       justify-content:center;position:relative;z-index:1;}}
+    .home-user strong {{display:block;font-size:14px;margin-top:5px;color:white;}}
+    [class*="st-key-home_cambiar_area"], [class*="st-key-home_cerrar_sesion"] {{
+       display:flex;align-items:center;height:90px;position:relative;z-index:1;
+    }}
+    [class*="st-key-home_cambiar_area"] button, [class*="st-key-home_cerrar_sesion"] button {{
+       min-height:43px!important;border:1px solid #caa45e!important;
+       border-radius:9px!important;color:white!important;background:transparent!important;
+       font-weight:650!important;font-size:12px!important;
+    }}
+    [class*="st-key-home_cambiar_area"] button:hover, [class*="st-key-home_cerrar_sesion"] button:hover {{
+       background:#344a5c!important;color:white!important;
+    }}
+    .home-institutional-hero {{text-align:center;margin:4px auto 28px;}}
+    .home-institutional-kicker {{font-size:11px;letter-spacing:3px;font-weight:800;color:#a87b34;}}
+    .home-institutional-rule {{width:48px;height:2px;background:#b8893e;margin:12px auto;}}
+    .home-institutional-title {{color:#10283b;font-size:clamp(30px,3vw,41px);font-weight:850;
+       line-height:1.16;letter-spacing:-.8px;}}
+    .home-institutional-subtitle {{color:#657688;font-size:15px;margin-top:11px;}}
+    .home-institutional-card {{background:linear-gradient(150deg,#214a55,#173340);border:1px solid #62858e;
+       border-radius:19px;box-shadow:0 10px 28px rgba(13,33,49,.14);overflow:hidden;
+       height:257px;transition:transform .2s,box-shadow .2s;}}
+    .home-institutional-card.featured {{background:linear-gradient(145deg,#1d4057,#102c41);border-color:#6b99ab;}}
+    .home-institutional-card:hover {{transform:translateY(-3px);box-shadow:0 17px 34px rgba(13,33,49,.19);}}
+    .home-institutional-photo {{height:112px;background-size:cover;background-position:center;
+       position:relative;background-color:#243c53;}}
+    .home-institutional-photo::after {{content:"";position:absolute;inset:0;
+       background:linear-gradient(90deg,rgba(13,35,54,.56),rgba(18,38,57,.12));}}
+    .home-institutional-status {{position:absolute;z-index:1;top:16px;left:18px;
+       background:#d3a75d;color:#10283b;border-radius:7px;padding:9px 13px;
+       letter-spacing:1px;font-size:11px;font-weight:800;}}
+    .home-institutional-card:not(.featured) .home-institutional-status {{background:#a9c4bd;color:#13303c;}}
+    .home-institutional-content {{padding:20px 25px 12px;position:relative;}}
+    .home-institutional-icon {{position:absolute;top:-27px;left:24px;width:54px;height:54px;
+       display:flex;align-items:center;justify-content:center;color:#d3a75d;
+       background:#172f46;border:2px solid #d3a75d;border-radius:13px;
+       font-size:24px;box-shadow:0 5px 14px rgba(9,28,44,.23);}}
+    .home-institutional-name {{font-size:21px;font-weight:800;color:#ffffff;margin-top:12px;line-height:1.2;}}
+    .home-institutional-description {{font-size:14px;color:#d2e0e6;line-height:1.4;margin-top:11px;}}
+    [class*="st-key-home_oficios"] button,[class*="st-key-home_diseno"] button {{
+       min-height:43px!important;border-radius:9px!important;font-size:13px!important;
+       font-weight:750!important;margin-top:3px!important;
+    }}
+    [class*="st-key-home_oficios"] button {{background:#24546a!important;color:white!important;border:1px solid #608da0!important;}}
+    [class*="st-key-home_oficios"] button:hover {{background:#306b83!important;color:white!important;}}
+    [class*="st-key-home_diseno"] button {{background:#2d5b60!important;color:white!important;border:1px solid #79a39e!important;}}
+    [class*="st-key-home_diseno"] button:hover {{background:#397379!important;color:#fff!important;}}
+    .home-institutional-footer {{text-align:center;font-size:11px;color:#637585;margin-top:5px;}}
+    /* Encabezado y tarjetas visibles sin desplazamiento a tamaño de escritorio. */
+    [data-testid="stAppViewContainer"]:has(.home-institutional-marker) {{overflow-y:auto!important;}}
+    [data-testid="stMainBlockContainer"]:has(.home-institutional-marker) {{padding-top:0!important;margin-top:0!important;}}
+    [data-testid="stMainBlockContainer"]:has(.home-institutional-marker) > div {{gap:.55rem!important;}}
+    .block-container:has(.home-institutional-marker) [data-testid="stVerticalBlock"] {{gap:.55rem!important;}}
+    .block-container:has(.home-institutional-marker) [data-testid="stHorizontalBlock"] {{align-items:center;}}
+    .block-container:has(.home-institutional-marker) .selector-pie {{display:none!important;}}
+    /* El aviso de acceso exclusivo pertenece solamente al selector de áreas. */
+    @media (min-width:1000px) and (min-height:680px) {{
+       [data-testid="stAppViewContainer"]:has(.home-institutional-marker) {{overflow-y:hidden!important;}}
+    }}
+    @media(max-height:780px) and (min-width:901px) {{
+       .home-institutional-hero {{margin:8px auto 21px;}}
+       .home-institutional-card {{height:238px;}}
+       .home-institutional-photo {{height:102px;}}
+       .home-institutional-description {{margin-top:8px;}}
+    }}
+    @media(max-width:900px) {{
+       .home-brand-name strong {{font-size:17px;}}
+       .home-brand-name span {{font-size:9px;letter-spacing:1px;}}
+       .home-brand img {{width:48px;}}
+       .home-institutional-card {{height:280px;}}
+       .home-institutional-photo {{height:115px;}}
+    }}
+    @media(max-width:760px) {{
+       [data-testid="stHorizontalBlock"]:has(.home-brand) {{height:auto!important;min-height:100px!important;padding:8px 16px!important;flex-wrap:wrap!important;}}
+       .home-institutional-marker {{height:124px;}}
+    }}
+    @media(max-width:640px) {{
+       .home-brand-name strong {{font-size:13px;}}
+       .home-brand-name span {{font-size:8px;}}
+       .home-institutional-hero {{margin:15px auto 25px;}}
+       .home-institutional-card {{height:260px;}}
+       [data-testid="stAppViewContainer"]:has(.home-institutional-marker) {{overflow-y:auto!important;}}
+    }}
+    </style>
+    """, unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="home-module-label">SELECCIONA UN MÓDULO</div>',
-        unsafe_allow_html=True,
-    )
-    col_oficios, col_diseno = st.columns([1, 1], gap="medium")
+    # El encabezado muestra el nombre exacto de la cuenta y evita la traducción
+    # automática que convierte la abreviatura «Tte.» en «Señora».
+    if identificador_sesion() == "alondra":
+        nombre_home = "Tte. Alondra Barajas"
+    else:
+        nombre_home = str(st.session_state.get("usuario_actual") or "Usuario")
+    nombre_home = html.escape(nombre_home)
+    cab_logo = f'<img src="{logo_home}" alt="Logotipo institucional">' if logo_home else '<span style="font-size:35px;color:#d3a75d">▰</span>'
+    col_marca, col_usuario, col_cambiar, col_cerrar = st.columns([4.4,1.65,1.25,1.2], gap="medium", vertical_alignment="center")
+    with col_marca:
+        st.markdown(f"""<div class="home-brand">{cab_logo}<div class="home-brand-name">
+           <strong>CONTROL DOCUMENTAL</strong><span>INFRAESTRUCTURA FERROVIARIA</span>
+           </div> </div>""", unsafe_allow_html=True)
+    with col_usuario:
+        st.markdown(f'<div class="home-user">Sesión:<strong class="notranslate" translate="no" lang="es-MX">{nombre_home}</strong></div>', unsafe_allow_html=True)
+    with col_cambiar:
+        if len(autorizadas) == 2:
+            if st.button("⇄ Cambiar de área", key="home_cambiar_area", use_container_width=True):
+                st.session_state.area_actual = None
+                st.session_state.menu_activo = "home"
+                st.session_state.pop("pend_bandeja", None)
+                st.rerun()
+    with col_cerrar:
+        if st.button("↪ Cerrar sesión", key="home_cerrar_sesion", use_container_width=True):
+            cerrar_sesion_selector()
+
+    st.markdown("""<div class="home-institutional-hero">
+      <div class="home-institutional-kicker">MESA DE DISEÑO GEOMÉTRICO DE VÍA FÉRREA</div>
+      <div class="home-institutional-rule"></div>
+      <div class="home-institutional-title">Selecciona tu módulo de trabajo</div>
+      <div class="home-institutional-subtitle">Elige el módulo que deseas consultar.</div>
+     </div>""", unsafe_allow_html=True)
+
+    _, col_oficios, col_ingenieria, _ = st.columns([.4, 4.8, 4.8, .4], gap="large")
     with col_oficios:
-        if st.button(
-            "OFICIOS EN TRÁMITE", key="home_oficios", use_container_width=True
-        ):
+        imagen = f'background-image:url(\'{foto_oficios}\')' if foto_oficios else 'background:linear-gradient(120deg,#1d3d56,#547a8d)'
+        st.markdown(f"""<div class="home-institutional-card featured">
+          <div class="home-institutional-photo" style="{imagen}"><div class="home-institutional-status">✓ &nbsp; GESTIÓN DOCUMENTAL</div></div>
+          <div class="home-institutional-content"><div class="home-institutional-icon">▤</div>
+            <div class="home-institutional-name">Oficios en trámite</div>
+            <div class="home-institutional-description">Consulta, registro y seguimiento de oficios, revisiones y firmas.</div>
+          </div> </div>""", unsafe_allow_html=True)
+        if st.button("Ingresar a Oficios en trámite  →", key="home_oficios", use_container_width=True):
             navegar_a("oficios")
-    with col_diseno:
-        if st.button(
-            "INGENIERÍA DE DETALLE", key="home_diseno", use_container_width=True
-        ):
+    with col_ingenieria:
+        imagen = f'background-image:url(\'{foto_ingenieria}\')' if foto_ingenieria else 'background:linear-gradient(120deg,#284657,#567688)'
+        st.markdown(f"""<div class="home-institutional-card">
+          <div class="home-institutional-photo" style="{imagen}"><div class="home-institutional-status">⌁ &nbsp; INGENIERÍA</div></div>
+          <div class="home-institutional-content"><div class="home-institutional-icon">◩</div>
+            <div class="home-institutional-name">Ingeniería de detalle</div>
+            <div class="home-institutional-description">Fase I · Documentación técnica y desarrollo del proyecto.</div>
+          </div> </div>""", unsafe_allow_html=True)
+        if st.button("Ingresar a Ingeniería de detalle  →", key="home_diseno", use_container_width=True):
             navegar_a("diseno")
-    st.markdown(
-        '<div class="home-footer">TRAZO &nbsp;·&nbsp; ALINEAMIENTO &nbsp;·&nbsp; RASANTE</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="home-institutional-footer">TRAZO · ALINEAMIENTO · RASANTE</div>', unsafe_allow_html=True)
 
 # =========================================================
 # MÓDULO OFICIOS EN TRÁMITE
@@ -4814,9 +7917,10 @@ elif st.session_state.menu_activo == "pendientes":
     # El menú lateral se dibuja una sola vez para ambos módulos.
     # No volver a crear sus widgets al cambiar de pantalla.
 
-    st.markdown("""
-    <style>
-    /* Solo Mis pendientes: conserva la identidad visual institucional. */
+    # CSS final único: se aplica antes de renderizar tarjetas y evita la
+    # aparición momentánea de estilos antiguos de Mis pendientes.
+    st.markdown("""<style>
+/* Solo Mis pendientes: conserva la identidad visual institucional. */
     .stMainBlockContainer:has(.pend-hero) {
         max-width: 1240px !important;
         padding-top: 2rem !important;
@@ -5231,13 +8335,7 @@ elif st.session_state.menu_activo == "pendientes":
         margin-top:13px;border-top:1px solid #e6d3b1;padding-top:12px;
         color:#536c7b;font-size:12px;line-height:1.5;
     }
-
-    </style>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <style>
-    /* Rediseño 2026: solo se aplica al módulo Mis pendientes. */
+/* Rediseño 2026: solo se aplica al módulo Mis pendientes. */
     .stMainBlockContainer:has(.pend-hero) {max-width:1500px !important;padding-left:30px !important;padding-right:30px !important}
     .stMainBlockContainer:has(.pend-hero) > div {gap:1.1rem}
     .pend-hero {background:rgba(245,249,252,.89);color:#142e43;box-shadow:none;
@@ -5287,12 +8385,7 @@ elif st.session_state.menu_activo == "pendientes":
       .pend-kpi {padding:14px;gap:10px}
       .pend-kpi-icon {width:36px;height:40px;font-size:23px}
     }
-    </style>
-    """, unsafe_allow_html=True)
-    # Ajustes visuales de Mis pendientes: no modifican el flujo ni las credenciales.
-    st.markdown("""
-    <style>
-    /* Ancho real de trabajo y fondo con menor protagonismo. */
+/* Ancho real de trabajo y fondo con menor protagonismo. */
     .stMainBlockContainer:has(.pend-hero) {
         max-width: 1580px !important;
         width: 96% !important;
@@ -5427,13 +8520,7 @@ elif st.session_state.menu_activo == "pendientes":
         .pend-hero-title {font-size:28px !important;}
         .st-key-pend_editor {padding:16px !important;}
     }
-    </style>
-    """, unsafe_allow_html=True)
-    # Acabado visual del seguimiento: gris grafito, borde dorado y jerarquía compacta.
-    # Solo afecta a las tarjetas documentales de este módulo.
-    st.markdown("""
-    <style>
-    div[class*="st-key-revisor_expediente_"] {
+div[class*="st-key-revisor_expediente_"] {
         background:linear-gradient(145deg,#e5e7e8 0%,#d9dcde 100%) !important;
         border:1px solid #b8bdc0 !important;
         border-left:4px solid #bd9553 !important;
@@ -5477,13 +8564,7 @@ elif st.session_state.menu_activo == "pendientes":
         .doc-summary-status {grid-column:1/-1;}
         div[class*="st-key-revisor_expediente_"] .rev-compact-head {flex-wrap:wrap !important;}
     }
-    </style>
-    """, unsafe_allow_html=True)
-    # Acabado final: mismo lenguaje visual que Oficios en trámite.
-    # Estas reglas están deliberadamente al final para prevalecer sobre el CSS previo.
-    st.markdown("""
-    <style>
-    /* No sustituir la imagen ferroviaria del módulo: solo quitar el velo que la borraba. */
+/* No sustituir la imagen ferroviaria del módulo: solo quitar el velo que la borraba. */
     [data-testid="stAppViewContainer"]:has(.pend-hero) {
         background-color:transparent !important;
         background-blend-mode:normal !important;
@@ -5563,12 +8644,7 @@ elif st.session_state.menu_activo == "pendientes":
         .pend-hero {min-height:150px !important;padding:24px !important;}
         .pend-hero-title {font-size:27px !important;}
     }
-    </style>
-    """,unsafe_allow_html=True)
-    # Corrección puntual de contraste: selectores directos que sí coinciden
-    # con los contenedores reales de Streamlit (sin depender de :has()).
-    st.markdown("""<style>
-    /* Expedientes de revisión final: quitar el azul en todos los estados. */
+/* Expedientes de revisión final: quitar el azul en todos los estados. */
     div[class*="st-key-tte_expediente_"] .tte-file-top {background:#44423d !important;border-top-color:#c69a55 !important;}
     div[class*="st-key-tte_expediente_"] .tte-file-label {color:#f4c781 !important;}
     div[class*="st-key-tte_expediente_"] .tte-file-title,
@@ -5612,15 +8688,7 @@ elif st.session_state.menu_activo == "pendientes":
     div[class*="st-key-tte_expediente_"] [data-testid="stCaptionContainer"],
     div[class*="st-key-tte_expediente_"] [data-testid="stCaptionContainer"] * {color:#4d453a !important;}
     div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {background:#4c4840 !important;color:#fffaf0 !important;border:1px solid #b98c4f !important;}
-    </style>""",unsafe_allow_html=True)
-    mostrar_mis_pendientes()
-
-    # Ajustes visuales finales de Mis pendientes y Centro de autorizaciones.
-    # Se mantienen intactos los procesos, permisos, versiones y conexiones.
-    # Los fondos se cargan desde assets/ mediante el código existente.
-    st.markdown("""
-    <style>
-    /* Encabezado principal: grafito con acento cobre, sin azul ni morado. */
+/* Encabezado principal: grafito con acento cobre, sin azul ni morado. */
     .pend-hero {
         background:linear-gradient(112deg,#30312f 0%,#484843 70%,#625a4e 100%) !important;
         border-left:4px solid #c69a53 !important;
@@ -5683,15 +8751,7 @@ elif st.session_state.menu_activo == "pendientes":
         .tte-summary-card {min-height:88px !important;padding:12px 6px !important;}
         .tte-summary-value {font-size:20px !important;}
     }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-    # Paleta integral exclusiva de Mis pendientes. Se inyecta al final para
-    # sustituir estilos azules de componentes y formularios sin tocar lógica.
-    st.markdown("""
-    <style>
-    /* Solo el módulo de pendientes; los otros módulos quedan intactos. */
+/* Solo el módulo de pendientes; los otros módulos quedan intactos. */
     [data-testid="stAppViewContainer"]:has(.pend-hero) {
         --pend-carbon:#41413d; --pend-carbon-hover:#5c574e;
         --pend-stone:#e9e5de; --pend-ivory:#f7f4ee;
@@ -5887,8 +8947,992 @@ elif st.session_state.menu_activo == "pendientes":
     .stMainBlockContainer:has(.pend-hero) .pend-kpi-number,
     .stMainBlockContainer:has(.pend-hero) .pend-kpi-title {color:#243b48 !important;}
     .stMainBlockContainer:has(.pend-hero) .pend-kpi-desc {color:#6f6b62 !important;}
+.stMainBlockContainer:has(.pend-hero) {
+        --pg-ink:#493B46; --pg-deep:#332B35; --pg-copper:#BC936B;
+        --pg-ivory:#F5F0E8; --pg-cream:#FFFDF9; --pg-muted:#756D72;
+        max-width:1320px!important;
+    }
+    /* Cabecera: imagen transparente a la derecha, texto siempre por encima. */
+    .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        isolation:isolate!important;
+        position:relative!important;
+        min-height:177px!important;
+        padding:26px 36px 25px 38px!important;
+        overflow:hidden!important;
+        background:linear-gradient(112deg,#342C36 0%,#493B46 61%,#514149 100%)!important;
+        border:1px solid rgba(171,123,91,.55)!important;
+        border-left:4px solid #C59269!important;
+        border-radius:14px!important;
+        box-shadow:0 15px 30px rgba(57,39,46,.18)!important;
+        color:#FFFDF9!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero::before {
+        content:""!important;
+        display:block!important;
+        position:absolute!important;
+        inset:auto 0 0 auto!important;
+        width:75%!important;
+        height:100%!important;
+        background:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA4NjAgMjQwIiBmaWxsPSJub25lIj48ZyBzdHJva2U9IiNDNzlCNzIiIG9wYWNpdHk9Ii4zMiIgc3Ryb2tlLXdpZHRoPSIuOCI+PHBhdGggZD0iTS0yMCAyMzBDMjA4IDIyNiAyOTkgMTcxIDQyMSAxNTNTNjcwIDY5IDkxMS05Ii8+PHBhdGggZD0iTS0yMCAyNDJDMjEyIDIzNyAzMDQgMTgzIDQyNCAxNjVTNjc3IDgxIDkxMyAzIi8+PHBhdGggZD0iTS0yMCAyNTZDMjE2IDI1MiAzMDkgMTk3IDQyOCAxNzdTNjgyIDk1IDkxOSAxNyIvPjxwYXRoIGQ9Ik0tMjAgMjY4QzIyMCAyNjIgMzE1IDIwOSA0MzQgMTkxUzY4OCAxMTAgOTI1IDMyIi8+PC9nPjxnIHN0cm9rZT0iI0U2QzRBMSIgb3BhY2l0eT0iLjE5IiBzdHJva2Utd2lkdGg9Ii43Ij48cGF0aCBkPSJNMCAyMDVIODYwTTAgMTY1SDg2ME0wIDEyNUg4NjBNMCA4NUg4NjBNMCA0NUg4NjBNMTAwIDBWMjQwTTIyMCAwVjI0ME0zNDAgMFYyNDBNNDYwIDBWMjQwTTU4MCAwVjI0ME03MDAgMFYyNDBNODIwIDBWMjQwIi8+PHBhdGggZD0iTTMwMCAwTDc3MCAyNDBNMzkyIDBMODUwIDI0MCIvPjwvZz48ZyBmaWxsPSIjQ0VBNDdBIj48Y2lyY2xlIGN4PSI0MjAiIGN5PSIxNTMiIHI9IjMiIG9wYWNpdHk9Ii43MiIvPjxjaXJjbGUgY3g9IjU5MCIgY3k9IjEwOSIgcj0iMyIgb3BhY2l0eT0iLjY4Ii8+PGNpcmNsZSBjeD0iNzE4IiBjeT0iNTciIHI9IjMiIG9wYWNpdHk9Ii42OCIvPjwvZz48L3N2Zz4=") right bottom / contain no-repeat!important;
+        opacity:.55!important;
+        z-index:0!important;
+        pointer-events:none!important;
+        transform:none!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero::after {
+        content:""!important;
+        display:block!important;
+        position:absolute!important;
+        right:0!important;left:auto!important;top:0!important;bottom:0!important;
+        width:63%!important;
+        height:100%!important;
+        background-image:var(--pend-trazo,none)!important;
+        background-position:right center!important;
+        background-size:contain!important;
+        background-repeat:no-repeat!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 32%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 32%)!important;
+        opacity:.64!important;
+        z-index:1!important;
+        transform:none!important;
+        filter:none!important;
+        pointer-events:none!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {
+        position:relative!important;
+        z-index:2!important;
+        max-width:58%!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-kicker {
+        color:#E3B58D!important;
+        font-size:10px!important;
+        font-weight:800!important;
+        letter-spacing:2.05px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-title {
+        color:#FFFBF8!important;
+        font-family:inherit!important;
+        font-size:clamp(28px,2.7vw,40px)!important;
+        line-height:1.1!important;
+        margin:15px 0 7px!important;
+        font-weight:800!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-desc {
+        color:#E8DDE0!important;font-size:14px!important;
+        line-height:1.45!important;margin:0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-line {
+        display:block!important;
+        width:54px!important;height:3px!important;
+        margin:16px 0 0!important;
+        background:#CB9871!important;
+        border-radius:10px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-hero-track {
+        position:absolute!important;right:26px!important;bottom:18px!important;
+        z-index:2!important;color:#E5BA99!important;
+        font-size:9px!important;letter-spacing:1.4px!important;
+        text-shadow:0 1px 4px #302630!important;
+    }
+    /* Bandejas: tarjetas editoriales, sin botón grande dentro de un recuadro. */
+    .stMainBlockContainer:has(.pend-hero) .pend-nav-head {
+        display:flex!important;justify-content:space-between!important;
+        align-items:center!important;margin:7px 1px 2px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-nav-head span {
+        font-size:11px!important;letter-spacing:2px!important;
+        font-weight:850!important;color:#765247!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-nav-head small {
+        font-size:9px!important;letter-spacing:1.45px!important;
+        color:#8B777B!important;font-weight:750!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] {
+        box-sizing:border-box!important;
+        min-height:158px!important;
+        padding:17px 19px 13px!important;
+        background:linear-gradient(148deg,#FFFEFB,#F5F0EB)!important;
+        border:1px solid #D7C9C0!important;
+        border-radius:13px!important;
+        box-shadow:0 8px 18px rgba(66,49,52,.09)!important;
+        transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"]:hover {
+        border-color:#BC936B!important;
+        transform:translateY(-2px)!important;
+        box-shadow:0 11px 22px rgba(66,49,52,.15)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] {
+        background:linear-gradient(150deg,#FFFDF9,#EFE6DD)!important;
+        border-color:#B98865!important;
+        box-shadow:inset 3px 0 0 #BA8C68,0 8px 18px rgba(66,49,52,.12)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-head {
+        display:flex!important;gap:12px!important;align-items:center!important;
+        min-height:49px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-icon {
+        width:43px!important;height:43px!important;flex-shrink:0!important;
+        display:inline-flex!important;align-items:center!important;justify-content:center!important;
+        background:#F0DDD0!important;
+        color:#775342!important;font-size:25px!important;font-weight:750!important;
+        border-radius:50%!important;border:1px solid rgba(185,137,101,.15)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_2"] .pend-tile-icon {
+        background:#E1E7DC!important;color:#526456!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_3"] .pend-tile-icon {
+        background:#F3E8D8!important;color:#94724E!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-body {
+        display:flex!important;flex-direction:column!important;gap:2px!important;
+        min-width:0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-body strong {
+        color:#41333C!important;font-size:16px!important;
+        font-weight:800!important;line-height:1.2!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-sub {
+        color:#A16D50!important;font-size:11px!important;
+        line-height:1.2!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {
+        color:#746B70!important;font-size:11px!important;
+        line-height:1.4!important;margin:11px 0 9px!important;
+        min-height:31px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] button[kind="secondary"],
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] [data-testid="stBaseButton-secondary"] {
+        background:transparent!important;background-color:transparent!important;
+        color:#995C42!important;-webkit-text-fill-color:#995C42!important;
+        border:0!important;border-top:1px solid #E3D8CE!important;
+        border-radius:0!important;box-shadow:none!important;
+        height:28px!important;min-height:28px!important;
+        width:100%!important;text-align:right!important;
+        justify-content:flex-end!important;
+        padding:5px 0 0!important;
+        font-weight:800!important;font-size:11px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] button * {
+        color:#995C42!important;-webkit-text-fill-color:#995C42!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] button:hover {
+        background:#F8EFE8!important;color:#78452F!important;
+    }
+    /* Centro de autorizaciones: un único panel claro con línea de trazo. */
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-header {
+        isolation:isolate!important;
+        position:relative!important;
+        overflow:hidden!important;
+        min-height:112px!important;
+        margin:16px 0 9px!important;
+        padding:21px 26px 18px 27px!important;
+        border:1px solid #D4C3B4!important;
+        border-left:4px solid #BA8C66!important;
+        border-radius:12px!important;
+        box-shadow:0 8px 18px rgba(66,49,52,.07)!important;
+        background:linear-gradient(115deg,#FFFEFA 4%,#EEE6DD 100%)!important;
+        color:#43323D!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-header::after {
+        content:""!important;display:block!important;
+        position:absolute!important;right:0!important;bottom:0!important;
+        width:52%!important;height:100%!important;
+        background:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA4NjAgMjQwIiBmaWxsPSJub25lIj48ZyBzdHJva2U9IiNDNzlCNzIiIG9wYWNpdHk9Ii4zMiIgc3Ryb2tlLXdpZHRoPSIuOCI+PHBhdGggZD0iTS0yMCAyMzBDMjA4IDIyNiAyOTkgMTcxIDQyMSAxNTNTNjcwIDY5IDkxMS05Ii8+PHBhdGggZD0iTS0yMCAyNDJDMjEyIDIzNyAzMDQgMTgzIDQyNCAxNjVTNjc3IDgxIDkxMyAzIi8+PHBhdGggZD0iTS0yMCAyNTZDMjE2IDI1MiAzMDkgMTk3IDQyOCAxNzdTNjgyIDk1IDkxOSAxNyIvPjxwYXRoIGQ9Ik0tMjAgMjY4QzIyMCAyNjIgMzE1IDIwOSA0MzQgMTkxUzY4OCAxMTAgOTI1IDMyIi8+PC9nPjxnIHN0cm9rZT0iI0U2QzRBMSIgb3BhY2l0eT0iLjE5IiBzdHJva2Utd2lkdGg9Ii43Ij48cGF0aCBkPSJNMCAyMDVIODYwTTAgMTY1SDg2ME0wIDEyNUg4NjBNMCA4NUg4NjBNMCA0NUg4NjBNMTAwIDBWMjQwTTIyMCAwVjI0ME0zNDAgMFYyNDBNNDYwIDBWMjQwTTU4MCAwVjI0ME03MDAgMFYyNDBNODIwIDBWMjQwIi8+PHBhdGggZD0iTTMwMCAwTDc3MCAyNDBNMzkyIDBMODUwIDI0MCIvPjwvZz48ZyBmaWxsPSIjQ0VBNDdBIj48Y2lyY2xlIGN4PSI0MjAiIGN5PSIxNTMiIHI9IjMiIG9wYWNpdHk9Ii43MiIvPjxjaXJjbGUgY3g9IjU5MCIgY3k9IjEwOSIgcj0iMyIgb3BhY2l0eT0iLjY4Ii8+PGNpcmNsZSBjeD0iNzE4IiBjeT0iNTciIHI9IjMiIG9wYWNpdHk9Ii42OCIvPjwvZz48L3N2Zz4=") right bottom / cover no-repeat!important;
+        opacity:.32!important;pointer-events:none!important;z-index:0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-eyebrow,
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-heading,
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-description,
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-rail {position:relative!important;z-index:1!important;}
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-eyebrow {
+        color:#A47457!important;font-size:10px!important;
+        font-weight:800!important;letter-spacing:1.65px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-heading {
+        color:#40323C!important;font-size:24px!important;font-weight:800!important;
+        line-height:1.2!important;margin-top:6px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-description {
+        color:#756D71!important;font-size:12px!important;line-height:1.35!important;
+        margin-top:5px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-rail {
+        position:absolute!important;right:22px!important;bottom:17px!important;
+        font-size:9px!important;letter-spacing:1.4px!important;
+        color:#97847E!important;
+    }
+    /* Resumen con iconografía, números y borde cobre. No son botones. */
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card,
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card--final {
+        box-sizing:border-box!important;
+        min-height:100px!important;
+        padding:16px!important;
+        display:flex!important;flex-direction:row!important;
+        justify-content:flex-start!important;align-items:center!important;
+        gap:14px!important;
+        border:1px solid #DACCC0!important;
+        border-left:3px solid #C09A75!important;
+        border-radius:12px!important;
+        background:linear-gradient(145deg,#FFFDF9,#F2ECE5)!important;
+        box-shadow:0 6px 15px rgba(66,49,52,.085)!important;
+        text-align:left!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-glyph {
+        display:flex!important;align-items:center!important;justify-content:center!important;
+        width:50px!important;height:50px!important;flex-shrink:0!important;
+        border-radius:50%!important;background:#F3DECF!important;
+        color:#8A644A!important;font-size:25px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card:nth-child(2) .tte-summary-glyph {
+        background:#DFE7D9!important;color:#60705C!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-data {
+        display:flex!important;flex-direction:column!important;gap:4px!important;min-width:0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-value,
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card--final .tte-summary-value {
+        color:#41333C!important;font-size:28px!important;
+        font-weight:850!important;line-height:1.03!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card--final .tte-summary-value {font-size:23px!important;}
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-label {
+        color:#776A70!important;font-size:12px!important;
+        font-weight:700!important;line-height:1.3!important;
+    }
+    @media(max-width:950px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {max-width:73%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero::after {width:57%!important;opacity:.40!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-rail {display:none!important;}
+    }
+    @media(max-width:650px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {padding:21px!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero::after {opacity:.22!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-track {display:none!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-nav-head small {display:none!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-summary-card {padding:12px!important;gap:9px!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-summary-glyph {width:38px!important;height:38px!important;font-size:19px!important;}
+    }
+
+    /* ===========================================================
+       CORRECCIÓN PENDIENTES / DISTRIBUCIÓN Y BOTONES
+       Solo interviene en esta pantalla; no cambia permisos ni callbacks.
+       =========================================================== */
+    @media (min-width: 1050px) {
+      /* Recupera el espacio superior que ocupan los bloques CSS de Streamlit,
+         manteniendo la cabecera institucional en su posición aprobada. */
+      .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        /* La distancia hasta la cabecera queda en aprox. la mitad. */
+        margin-top:16px!important;
+      }
+    }
+    @media (min-width: 720px) and (max-width:1049px) {
+      .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        margin-top:14px!important;
+      }
+    }
+    @media (max-width:719px) {
+      .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        margin-top:0!important;
+      }
+    }
+    /* Solamente las tarjetas padre. La clave de los botones ahora es
+       pend_action_*, para que NUNCA hereden estilos de tarjetas. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"],
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] {
+      min-height:150px!important;
+      height:auto!important;
+      padding:15px 17px 12px!important;
+      border-radius:12px!important;
+      box-shadow:0 6px 15px rgba(66,49,52,.075)!important;
+      display:flex!important;
+      flex-direction:column!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] {
+      box-shadow:inset 3px 0 0 #BA8C68,0 6px 15px rgba(66,49,52,.085)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"] > [data-testid="stVerticalBlock"],
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] > [data-testid="stVerticalBlock"] {
+      gap:5px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-nav-head {
+      margin:8px 1px 6px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-head {
+      min-height:40px!important;
+      gap:10px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-icon {
+      width:39px!important;height:39px!important;font-size:22px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-body strong {
+      font-size:15px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {
+      min-height:29px!important;
+      margin:7px 0 3px!important;
+      line-height:1.35!important;
+      font-size:11px!important;
+    }
+    /* El control real ocupa una sola franja compacta al pie de cada tarjeta. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] button,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"] [data-testid="stBaseButton-secondary"],
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] [data-testid="stBaseButton-secondary"] {
+      display:flex!important;
+      justify-content:center!important;
+      align-items:center!important;
+      box-sizing:border-box!important;
+      width:100%!important;
+      min-height:35px!important;
+      height:35px!important;
+      padding:6px 12px!important;
+      background:#F5EEE7!important;
+      background-color:#F5EEE7!important;
+      border:1px solid #DCC5B4!important;
+      border-radius:8px!important;
+      box-shadow:none!important;
+      color:#81523F!important;
+      -webkit-text-fill-color:#81523F!important;
+      font-size:12px!important;
+      font-weight:750!important;
+      line-height:1.1!important;
+      text-align:center!important;
+      transform:none!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"] button *,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] button * {
+      color:inherit!important;
+      -webkit-text-fill-color:inherit!important;
+      background:transparent!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] button {
+      background:#705245!important;
+      background-color:#705245!important;
+      color:#FFF9F2!important;
+      -webkit-text-fill-color:#FFF9F2!important;
+      border-color:#705245!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"] button:hover {
+      background:#EAD9C9!important;
+      background-color:#EAD9C9!important;
+      border-color:#BD987D!important;
+      color:#6E4436!important;
+      -webkit-text-fill-color:#6E4436!important;
+    }
+    /* Defensivo: un contenedor de botón no puede parecer otra tarjeta. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_action_"] {
+      min-height:0!important;height:auto!important;padding:0!important;
+      background:transparent!important;border:0!important;
+      border-radius:0!important;box-shadow:none!important;transform:none!important;
+    }
+    @media (max-width:900px) {
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_normal"],
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] {
+        min-height:0!important;
+      }
+    }
+/* ALCANCE ESTRICTO: MIS PENDIENTES (NO AFECTA DISEÑO GEOMÉTRICO/SETF). */
+    .stMainBlockContainer:has(.pend-hero) {
+      --revision-ivory:#F5F1E8;
+      --revision-sand:#EFE8DC;
+      --revision-inner:#FAF7F2;
+      --revision-stroke:#C8B79C;
+      --revision-gold:#B68A3A;
+      --revision-terra:#A86C4A;
+      --revision-olive:#6E7F57;
+      --revision-graphite:#5E5A54;
+      --revision-text:#34312F;
+    }
+
+    /* EXPEDIENTE: contorno más visible sobre el fondo de planos. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] {
+      background:linear-gradient(145deg,#F5F1E8 0%,#EFE8DC 100%)!important;
+      border:2px solid #B9A789!important;
+      border-left:5px solid #B68A3A!important;
+      border-radius:14px!important;
+      box-shadow:0 12px 30px rgba(67,51,40,.13),0 2px 8px rgba(67,51,40,.055)!important;
+      color:#34312F!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-file-top {
+      background:linear-gradient(108deg,#4B463F,#5E574D)!important;
+      border:1px solid #B68A3A!important;
+      border-bottom:0!important;
+      border-top:3px solid #C8A066!important;
+      border-radius:10px 10px 0 0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-file-label {
+      color:#F3D4A6!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-file-title,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step-badge strong,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-decision-title {
+      color:#3E3934!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-file-meta,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step-badge,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-decision-sub {
+      color:#786E63!important;
+    }
+    /* PROCESO DE TRES ETAPAS: distinto relleno y borde por situación. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-timeline {
+      background:#FAF7F2!important;
+      border:2px solid #C8B79C!important;
+      border-radius:12px!important;
+      padding:9px!important;
+      box-shadow:inset 0 1px 3px rgba(73,59,40,.04)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step {
+      box-sizing:border-box!important;
+      background:#F0E9DD!important;
+      color:#61574A!important;
+      border:2px solid #BAADA0!important;
+      border-top:3px solid #A86C4A!important;
+      border-radius:9px!important;
+      min-height:46px!important;
+      font-weight:750!important;
+      gap:8px!important;
+      box-shadow:0 2px 6px rgba(56,47,39,.045)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step span {
+      background:#DCCABC!important;
+      color:#584736!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.done {
+      background:#E9EEDF!important;
+      color:#3F5236!important;
+      border:2px solid #81916A!important;
+      border-top:3px solid #6E7F57!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.done span {
+      background:#6E7F57!important;color:#FFFFFF!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.current {
+      background:#F2E1C2!important;
+      color:#674B21!important;
+      border:2px solid #B68A3A!important;
+      border-top:3px solid #A57927!important;
+      box-shadow:0 3px 9px rgba(182,138,58,.15)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-step.current span {
+      background:#A67B32!important;color:#FFFFFF!important;
+    }
+    /* ÚLTIMA VERSIÓN: verde salvia. Claramente diferente del historial terracota. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-document-line {
+      background:linear-gradient(105deg,#E8EFE3 0%,#F3F6ED 100%)!important;
+      border:2px solid #889B79!important;
+      border-left:5px solid #647B55!important;
+      border-radius:10px!important;
+      padding:13px 16px!important;
+      box-shadow:0 3px 12px rgba(60,80,48,.11)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-document-line strong {
+      color:#32472E!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-document-line small {
+      font-size:11px!important;font-weight:800!important;letter-spacing:.35px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-document-line small {
+      color:#766C60!important;
+    }
+
+    /* WORD / PDF: pertenecen al documento VIGENTE, con acentos oliva/cobre. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_word_panel"] {
+      background:linear-gradient(145deg,#F9FBF5,#EBF1E5)!important;
+      border:2px solid #A5B397!important;
+      border-left:5px solid #70865F!important;
+      border-radius:11px!important;
+      box-shadow:0 5px 14px rgba(69,52,38,.075)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-revision_formatos_"][class*="_pdf_panel"] {
+      background:linear-gradient(145deg,#F9FBF5,#EDF2E7)!important;
+      border:2px solid #B2BB9B!important;
+      border-left:5px solid #81916A!important;
+      border-radius:11px!important;
+      box-shadow:0 5px 14px rgba(69,52,38,.075)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .revision-file-name,
+    .stMainBlockContainer:has(.pend-hero) .revision-file-heading {color:#443D36!important;}
+    .stMainBlockContainer:has(.pend-hero) [class*="st-key-revision_formatos_"] .revision-file-symbol {
+      background:#DFE9D8!important;border-color:#A2B397!important;color:#516A46!important;
+    }
+    /* HISTÓRICOS: terracota/gris cálido y filas compactas. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-hist_pdf_version_"] {
+      background:linear-gradient(115deg,#F2E6DD,#F8F2ED)!important;
+      border:1.5px solid #C7A38E!important;
+      border-left:4px solid #A56547!important;
+      border-radius:9px!important;
+      padding:8px 12px!important;
+      margin:5px 0!important;
+      box-shadow:0 2px 6px rgba(65,49,40,.055)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-version-title {
+      color:#583C30!important;
+      border-bottom:none!important;
+      padding-bottom:0!important;
+      margin-bottom:2px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-version-date,
+    .stMainBlockContainer:has(.pend-hero) .hist-version-empty {color:#766B60!important;}
+    .stMainBlockContainer:has(.pend-hero) .hist-feedback {
+      padding:7px 10px!important;margin:5px 0!important;
+      background:#F3E3D5!important;
+      border:1px solid #D4AB8D!important;
+      border-left:4px solid #A86C4A!important;
+      border-radius:7px!important;
+      box-shadow:0 2px 8px rgba(83,53,38,.045)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-feedback.aprobado {
+      background:#EEF1E8!important;
+      border:1px solid #A6B398!important;
+      border-left:4px solid #6E7F57!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-feedback-title {color:#664831!important;}
+    .stMainBlockContainer:has(.pend-hero) .hist-feedback-body {color:#3C352F!important;}
+    .stMainBlockContainer:has(.pend-hero) .hist-feedback-meta {color:#70675D!important;}
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-hist_pdf_version_"] [data-testid="stToggle"] {
+      padding:1px 0 0!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-pdf-open {
+      background:#FAF1E9!important;border-color:#B8876E!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .hist-quick-summary {color:#70594D!important;}
+
+    /* DECISIÓN / CIERRE: marco grafito cálido. */
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] {
+      background:#FAF7F2!important;
+      border:2px solid #C8B79C!important;
+      border-left:5px solid #5E5A54!important;
+      border-radius:12px!important;
+      box-shadow:0 3px 11px rgba(66,53,39,.05)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stExpander"] {
+      background:#F5F1E8!important;
+      border:1.5px solid #C8B79C!important;
+      border-radius:9px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] textarea,
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stForm"] [data-baseweb="textarea"] > div {
+      background:#FFFEFA!important;
+      color:#3A352F!important;
+      border:1.5px solid #BFAF99!important;
+      border-radius:8px!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button {
+      background:#5E5A54!important;
+      border:1.5px solid #B68A3A!important;
+      border-left:4px solid #CDA460!important;
+      color:#FFFFFF!important;
+      box-shadow:0 3px 10px rgba(54,47,41,.13)!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] [data-testid="stFormSubmitButton"] button:hover {
+      background:#514A41!important;border-color:#C79B56!important;
+    }
+    /* CENTRO DE AUTORIZACIONES: contraste claro y coherente con la nueva ficha. */
+    .stMainBlockContainer:has(.pend-hero) .tte-queue-header {
+      background:linear-gradient(125deg,#FAF7F2,#EFE8DC)!important;
+      border:2px solid #C8B79C!important;
+      border-left:5px solid #B68A3A!important;
+    }
+    .stMainBlockContainer:has(.pend-hero) .tte-summary-card {
+      background:linear-gradient(145deg,#FAF7F2,#EEE5D8)!important;
+      border:2px solid #C8B79C!important;
+      border-left:5px solid #B68A3A!important;
+    }
+    @media(max-width:700px) {
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-tte_expediente_"] .tte-timeline {padding:7px!important;}
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-hist_pdf_version_"] {padding:10px 11px!important;}
+    }
+</style>""", unsafe_allow_html=True)
+
+    # Estilo final de las bandejas con ilustraciones, SIN modificar los procesos.
+    # El CSS se coloca antes de construir la página para evitar el estilo intermedio.
+    st.markdown("""
+    <style>
+      /* Respetar un espacio institucional entre cabecera y módulo. */
+      @media (min-width:1050px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {margin-top:16px!important;}
+      }
+      @media (min-width:720px) and (max-width:1049px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {margin-top:14px!important;}
+      }
+      @media(max-width:719px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {margin-top:12px!important;}
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        border-radius:14px!important;
+        overflow:hidden!important;
+        background:linear-gradient(107deg,#372D39 0%,#4A3945 66%,#433443 100%)!important;
+        box-shadow:0 8px 22px rgba(49,37,48,.11)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero::after {
+        width:57%!important; opacity:.80!important;
+        background-position:right center!important;
+        background-size:cover!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 42%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 42%)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {max-width:67%!important;}
+
+      /* Bandejas con espacio propio, encabezados alineados y fotografía editorial. */
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"],
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] {
+        position:relative!important;isolation:isolate!important;
+        overflow:hidden!important;
+        min-height:184px!important;
+        padding:20px 22px 14px!important;
+        border:1.5px solid #D1B8A4!important;
+        border-left:4px solid #BB8C68!important;
+        border-radius:14px!important;
+        background:linear-gradient(112deg,#FFFCF8 0%,#F5EBE1 100%)!important;
+        box-shadow:0 7px 18px rgba(51,40,46,.095)!important;
+        transition:transform .18s ease,box-shadow .18s ease!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] {
+        border-color:#B8C6B7!important;
+        border-left-color:#72907A!important;
+        background:linear-gradient(112deg,#FFFEFA 0%,#EDF2EB 100%)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"]:hover,
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"]:hover {
+        transform:translateY(-2px)!important;
+        box-shadow:0 10px 22px rgba(51,40,46,.14)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_activo"] {
+        box-shadow:inset 3px 0 0 #C69869,0 8px 22px rgba(51,40,46,.11)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-art {
+        display:block!important;
+        position:absolute!important;
+        top:0!important;right:0!important;
+        width:47%!important;height:76%!important;
+        background-size:cover!important;
+        background-position:right center!important;
+        background-repeat:no-repeat!important;
+        opacity:.45!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 52%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 52%)!important;
+        pointer-events:none!important;
+        z-index:0!important;
+        border-top-right-radius:14px;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-head,
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-copy {
+        position:relative!important;z-index:1!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-head {
+        display:flex!important;align-items:center!important;gap:13px!important;
+        min-height:59px!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-icon {
+        width:48px!important;height:48px!important;
+        border:1px solid #D8BFAA!important;
+        background:#EDD9C9!important;
+        color:#7C5742!important;font-size:24px!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="_firma_"] .pend-tile-icon {
+        border-color:#BDCFBC!important;
+        background:#DCE8D8!important;color:#4A6455!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-body strong {
+        font-size:17px!important;line-height:1.2!important;
+        font-weight:800!important;color:#3F333B!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-sub {
+        font-size:11px!important;font-weight:720!important;
+        color:#9A6D50!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {
+        max-width:70%!important;
+        min-height:25px!important;
+        font-size:11px!important;
+        line-height:1.4!important;
+        margin:5px 0 12px!important;
+        color:#635C5B!important;
+      }
+      /* Franja de acción sin cajas anidadas ni desalineaciones. */
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"] button,
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] button {
+        width:100%!important;
+        min-height:42px!important;height:42px!important;
+        padding:8px 15px!important;
+        border:1px solid #A87D5A!important;border-radius:8px!important;
+        background:#906B48!important;
+        color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;
+        font-size:12px!important;font-weight:730!important;
+        display:flex!important;align-items:center!important;
+        justify-content:center!important;text-align:center!important;
+        box-shadow:0 2px 5px rgba(84,57,36,.12)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"] button *,
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] button * {
+        color:inherit!important;-webkit-text-fill-color:inherit!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] button {
+        background:#355C50!important;border-color:#355C50!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"] button:hover {background:#765637!important;}
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] button:hover {background:#294B42!important;}
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] [data-testid="stVerticalBlock"] {gap:4px!important;}
+
+      /* Centro de autorizaciones: ilustración propia, no invade el título. */
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-header {
+        min-height:126px!important;
+        background:linear-gradient(112deg,#FFFCF8 0%,#F1E6DA 100%)!important;
+        border:1px solid #C7B19B!important;
+        border-left:5px solid #B88B55!important;
+        box-shadow:0 6px 18px rgba(60,45,38,.08)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-header::after {
+        content:""!important;
+        background:var(--pend-queue-art,none) right center / cover no-repeat!important;
+        width:55%!important;height:100%!important;right:0!important;
+        opacity:.50!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 45%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 45%)!important;
+        pointer-events:none!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-description {max-width:57%!important;}
+
+      /* Indicadores: superficie editorial y motivos de plano discretos. */
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-card {
+        position:relative!important;isolation:isolate!important;overflow:hidden!important;
+        min-height:108px!important;padding:18px 20px!important;
+        background:linear-gradient(120deg,#FFFCF7 0%,#F1E8DB 100%)!important;
+        border:1.5px solid #CBBAA4!important;
+        border-left:5px solid #B68A56!important;
+        border-radius:12px!important;
+        box-shadow:0 6px 14px rgba(51,41,34,.08)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-card--weekly {
+        border-left-color:#9AAB92!important;
+        background:linear-gradient(120deg,#FFFEFA,#EDF2EB)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-card--total {
+        border-left-color:#A77362!important;
+        background:linear-gradient(120deg,#FFFEFB,#F5E9E2)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-card::after {
+        content:"";position:absolute;right:-9px;top:10px;
+        width:102px;height:83px;opacity:.22;pointer-events:none;
+        background:repeating-linear-gradient(0deg,transparent 0 12px,#B39C81 12.5px 13px),
+          repeating-linear-gradient(90deg,transparent 0 16px,#B39C81 16.5px 17px);
+        -webkit-mask-image:linear-gradient(90deg,transparent,#000);
+        mask-image:linear-gradient(90deg,transparent,#000);
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-value {
+        font-size:30px!important;font-weight:840!important;color:#42363B!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-summary-label {
+        font-size:12px!important;font-weight:730!important;line-height:1.35!important;
+        color:#52494A!important;
+      }
+      @media(max-width:930px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-art {opacity:.27!important;width:43%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {max-width:85%!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-header::after {width:49%!important;opacity:.34!important;}
+      }
+      @media(max-width:650px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero::after {opacity:.22!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-description {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-header::after {opacity:.20!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-art {opacity:.17!important;}
+      }
+
+      /* ===== AJUSTES FINALES · PENDIENTES Y BANDEJAS · 2026-10-23 ===== */
+      /* No mover el panel sobre la cabecera institucional. */
+      .stMainBlockContainer:has(.pend-hero) .pend-hero {
+        margin-top:18px!important;
+        margin-bottom:10px!important;
+        min-height:178px!important;
+        padding:26px 36px 25px!important;
+        border-radius:14px!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero::after {
+        display:none!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero-illustration {
+        position:absolute!important;
+        top:0!important;right:0!important;bottom:0!important;
+        width:60%!important;
+        display:block!important;
+        z-index:1!important;
+        background-position:right center!important;
+        background-size:cover!important;
+        background-repeat:no-repeat!important;
+        opacity:.78!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 36%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 36%)!important;
+        pointer-events:none!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {
+        z-index:2!important;position:relative!important;
+        max-width:65%!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-hero-track {
+        z-index:3!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-nav-head {
+        margin:7px 2px 8px!important;
+      }
+      /* Two real work cards. Their title/subtitle occupy separate rows. */
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_revision_"],
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"][class*="_firma_"] {
+        padding:17px 19px 16px!important;
+        min-height:190px!important;
+        isolation:isolate!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-head {
+        display:grid!important;
+        grid-template-columns:50px minmax(0,1fr)!important;
+        gap:14px!important;
+        align-items:center!important;
+        margin-bottom:7px!important;
+        min-height:56px!important;
+        max-width:75%!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-body {
+        display:flex!important;
+        flex-direction:column!important;
+        justify-content:center!important;
+        align-items:flex-start!important;
+        gap:5px!important;
+        min-width:0!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-body .pend-tile-name {
+        display:block!important;
+        font-size:17px!important;
+        font-weight:800!important;
+        line-height:1.15!important;
+        letter-spacing:0!important;
+        margin:0!important;
+        padding:0!important;
+        color:#41333C!important;
+        text-align:left!important;
+        white-space:normal!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-body .pend-tile-sub {
+        display:block!important;
+        font-size:11px!important;
+        font-weight:650!important;
+        line-height:1.35!important;
+        color:#956D51!important;
+        margin:0!important;
+        padding:0!important;
+        white-space:normal!important;
+        text-align:left!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="_firma_"] .pend-tile-sub {
+        color:#577460!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-copy {
+        display:block!important;
+        max-width:69%!important;
+        min-height:25px!important;
+        font-size:11px!important;
+        line-height:1.45!important;
+        margin:3px 0 12px!important;
+        color:#625A59!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .pend-tile-art {
+        z-index:0!important;
+        width:49%!important;
+        height:83%!important;
+        opacity:.66!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 45%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 45%)!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] [data-testid="stButton"] {
+        position:relative!important;
+        z-index:2!important;
+        margin-top:auto!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] button {
+        width:100%!important;
+        min-height:40px!important;
+      }
+      /* Authorization banner illustration on right: actual image layer. */
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-header {
+        isolation:isolate!important;
+        position:relative!important;
+        overflow:hidden!important;
+        min-height:126px!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-header::after {
+        display:none!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-illustration {
+        position:absolute!important;
+        z-index:1!important;
+        inset:0 0 0 auto!important;
+        width:59%!important;
+        height:100%!important;
+        display:block!important;
+        background-position:center right!important;
+        background-size:cover!important;
+        background-repeat:no-repeat!important;
+        opacity:.85!important;
+        -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 40%)!important;
+        mask-image:linear-gradient(90deg,transparent 0%,#000 40%)!important;
+        pointer-events:none!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-content {
+        position:relative!important;
+        z-index:2!important;
+        max-width:60%!important;
+      }
+      .stMainBlockContainer:has(.pend-hero) .tte-queue-rail {
+        z-index:3!important;
+      }
+      @media(max-width:900px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {margin-top:14px!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-head {max-width:88%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {max-width:86%!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-content {max-width:70%!important;}
+      }
+      @media(max-width:650px) {
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-illustration {opacity:.35!important;width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-hero-copy {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-head {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-copy {max-width:100%!important;}
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-art {opacity:.23!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-illustration {opacity:.3!important;}
+        .stMainBlockContainer:has(.pend-hero) .tte-queue-content {max-width:100%!important;}
+      }
     </style>
     """, unsafe_allow_html=True)
+
+    # Ajustes visuales de Mis pendientes: no modifican el flujo ni las credenciales.
+    # Acabado visual del seguimiento: gris grafito, borde dorado y jerarquía compacta.
+    # Solo afecta a las tarjetas documentales de este módulo.
+    # Acabado final: mismo lenguaje visual que Oficios en trámite.
+    # Estas reglas están deliberadamente al final para prevalecer sobre el CSS previo.
+    # Corrección puntual de contraste: selectores directos que sí coinciden
+    # con los contenedores reales de Streamlit (sin depender de :has()).
+    # La interfaz se muestra solo tras inyectar todos sus estilos definitivos.
+
+    # Ajustes visuales finales de Mis pendientes y Centro de autorizaciones.
+    # Se mantienen intactos los procesos, permisos, versiones y conexiones.
+    # Los fondos se cargan desde assets/ mediante el código existente.
+
+
+    # Paleta integral exclusiva de Mis pendientes. Se inyecta al final para
+    # sustituir estilos azules de componentes y formularios sin tocar lógica.
+
+
+    # ============================================================
+    # DISEÑO MIS PENDIENTES · GRAFITO CIRUELA Y COBRE (V3)
+    # Presentación exclusiva; sin cambios a los flujos de gestión.
+    # ============================================================
+
+    # Pulido cromático final del área Mis pendientes / revisión de la Tte.
+    # Estas reglas solo modifican superficies, bordes y jerarquía visual.
+    # No se cambia ningún callback de Streamlit ni el acceso a Drive/Sheets.
+
+    mostrar_mis_pendientes()
 
 elif st.session_state.menu_activo == "oficios":
 
@@ -5975,8 +10019,8 @@ elif st.session_state.menu_activo == "oficios":
             .encabezado-oficios {
                 position: relative;
                 width: 100%;
-                min-height: 178px;
-                padding: 30px 38px;
+                min-height: 162px;
+                padding: 24px 38px;
                 overflow: hidden;
 
                 display: flex;
@@ -6086,7 +10130,7 @@ elif st.session_state.menu_activo == "oficios":
                 <div class="encabezado-texto">
 
                     <span class="etiqueta">
-                        CONTROL DOCUMENTAL / MESA DE DISEÑO GEOMÉTRICO
+                        MESA DE DISEÑO GEOMÉTRICO · GESTIÓN DE OFICIOS
                     </span>
 
                     <h1 class="titulo">
@@ -6181,7 +10225,7 @@ elif st.session_state.menu_activo == "oficios":
         </body>
         </html>
         """,
-        height=200,
+        height=178,
         scrolling=False
     )
 
@@ -6212,8 +10256,8 @@ elif st.session_state.menu_activo == "oficios":
         ===================================================== */
 
         .of-panel-header {
-            margin-top: 4px;
-            margin-bottom: 12px;
+            margin-top: 0;
+            margin-bottom: 8px;
         }
 
         .of-eyebrow {
@@ -6371,11 +10415,11 @@ elif st.session_state.menu_activo == "oficios":
 
         .kpi {
             position: relative;
-            height: 122px;
-            padding: 17px 19px;
-            background: #FFFFFF;
-            border: 1px solid #DFE5E9;
-            border-radius: 12px;
+            height: 120px;
+            padding: 16px 19px;
+            background: #F2F7FA;
+            border: 1.7px solid #C6A36D;
+            border-radius: 13px;
             box-shadow: 0 4px 13px rgba(16, 40, 59, 0.07);
             overflow: hidden;
         }
@@ -6433,21 +10477,21 @@ elif st.session_state.menu_activo == "oficios":
             line-height: 1.3;
         }
 
-        .revision::before {
-            background: #C6A36D;
-        }
+        .revision {border-color:#C6A36D;background:#F8F5ED;}
+        .revision::before { background: #C6A36D; }
+        .revision .icono {color:#8B642C;background:#FBF3E6;border-color:#EAD5B7;}
 
-        .firma::before {
-            background: #6887A0;
-        }
+        .firma {border-color:#6887A0;background:#F0F6FA;}
+        .firma::before { background: #6887A0; }
+        .firma .icono {color:#3F698A;background:#EEF4F8;border-color:#CDDFEA;}
 
-        .concluidos::before {
-            background: #4F927B;
-        }
+        .concluidos {border-color:#4F927B;background:#F0F8F4;}
+        .concluidos::before { background: #4F927B; }
+        .concluidos .icono {color:#317A60;background:#EDF8F1;border-color:#CDE7D7;}
 
-        .pendientes::before {
-            background: #B77D61;
-        }
+        .pendientes {border-color:#B77D61;background:#FBF3EF;}
+        .pendientes::before { background: #B77D61; }
+        .pendientes .icono {color:#A05E45;background:#FFF1EA;border-color:#EBCFBD;}
 
         @media (max-width: 650px) {
             .kpi-grid {
@@ -6463,7 +10507,7 @@ elif st.session_state.menu_activo == "oficios":
             <div class="kpi revision">
                 <div class="kpi-top">
                     <div class="numero">__REVISION__</div>
-                    <div class="icono">R</div>
+                    <div class="icono">◷</div>
                 </div>
                 <div class="nombre">En revisión</div>
                 <div class="detalle">Documentación en análisis</div>
@@ -6472,7 +10516,7 @@ elif st.session_state.menu_activo == "oficios":
             <div class="kpi firma">
                 <div class="kpi-top">
                     <div class="numero">__FIRMA__</div>
-                    <div class="icono">F</div>
+                    <div class="icono">✎</div>
                 </div>
                 <div class="nombre">En firma</div>
                 <div class="detalle">Pendiente de formalización</div>
@@ -6511,7 +10555,7 @@ elif st.session_state.menu_activo == "oficios":
 
     components.html(
         html_kpis,
-        height=145,
+        height=137,
         scrolling=False
     )
 
@@ -6519,164 +10563,10 @@ elif st.session_state.menu_activo == "oficios":
     # CONSULTA DE EXPEDIENTES
     # =========================================================
 
-    st.markdown(
-        textwrap.dedent("""
-        <div class="consulta-panel">
-            <div class="consulta-encabezado">
-                <div class="consulta-icono">⌕</div>
-                <div>
-                    <div class="consulta-titulo">Consulta de expedientes</div>
-                    <div class="consulta-subtitulo">
-                        Localiza un expediente por folio, número, asunto o nombre del oficio firmado
-                    </div>
-                </div>
-            </div>
-        </div>
-        """),
-        unsafe_allow_html=True
-    )
+    # Estilos del expediente: una sola inyección antes de la búsqueda.
+    # Evita que Streamlit reserve espacios entre los widgets y la ficha.
+    st.markdown("""<style>
 
-
-    # ---------------------------------------------------------
-    # BARRA DE BÚSQUEDA
-    # ---------------------------------------------------------
-
-    col_busqueda, col_boton_buscar, col_nuevo = st.columns(
-        [5.4, 1.45, 2.35],
-        gap="small"
-    )
-
-    with col_busqueda:
-
-        consulta = st.text_input(
-            "Buscar oficio",
-            placeholder="Folio, número, asunto o nombre del oficio firmado...",
-            label_visibility="collapsed",
-            key="consulta_oficio"
-        )
-
-
-    with col_boton_buscar:
-
-        buscar_oficio = st.button(
-            "⌕  Buscar",
-            key="btn_buscar_oficio",
-            type="primary",
-            use_container_width=True
-        )
-
-
-    with col_nuevo:
-
-        if st.button(
-            "＋  Registrar nuevo oficio",
-            key="btn_nuevo_oficio_consulta",
-            use_container_width=True
-        ):
-            st.session_state.mostrar_registro = True
-            st.rerun()
-
-    st.write("")
-
-
-    # =========================================================
-    # BUSCAR RESULTADO
-    # =========================================================
-
-    oficio_encontrado = None
-
-    if consulta.strip() and not df_oficios.empty:
-        consulta_normalizada = normalizar_texto(consulta)
-        coincidencias = []
-
-        for _, fila in df_oficios.iterrows():
-            # El nombre se obtiene de la columna Firmado, que contiene
-            # los vínculos registrados como {"nombre": ..., "url": ...}.
-            # No se busca en el enlace: el usuario introduce el nombre visible.
-            nombres_firmados = [
-                normalizar_texto(documento.get("nombre", ""))
-                for documento in leer_documentos(fila.get("Firmado", ""))
-            ]
-            campos = [
-                normalizar_texto(fila.get("Folio", "")),
-                normalizar_texto(fila.get("No. de oficio", "")),
-                normalizar_texto(fila.get("Asunto", "")),
-                *nombres_firmados,
-            ]
-            if any(consulta_normalizada in campo for campo in campos):
-                # Priorizar coincidencias exactas para no abrir otro expediente
-                # cuando un nombre o número es parte de otro.
-                exacta = any(consulta_normalizada == campo for campo in campos)
-                coincidencias.append((exacta, fila))
-
-        if coincidencias:
-            coincidencias.sort(key=lambda elemento: not elemento[0])
-            oficio_encontrado = coincidencias[0][1]
-            if len(coincidencias) > 1:
-                st.caption(
-                    f"Se encontraron {len(coincidencias)} expedientes coincidentes. "
-                    "Se muestra primero la coincidencia más precisa; "
-                    "agrega más palabras para afinar la búsqueda."
-                )
-
-    # =========================================================
-    # MOSTRAR EXPEDIENTE ÚNICAMENTE SI EXISTE
-    # =========================================================
-
-    if oficio_encontrado is not None:
-
-        # =====================================================
-        # DATOS DEL EXPEDIENTE
-        # =====================================================
-
-        folio_resultado = str(
-            oficio_encontrado.get("Folio", "")
-        )
-
-        numero_resultado = str(
-            oficio_encontrado.get("No. de oficio", "")
-        )
-
-        proyecto_resultado = str(
-            oficio_encontrado.get("Proyecto", "")
-        )
-
-        responsable_resultado = str(
-            oficio_encontrado.get("Responsable", "")
-        )
-
-        estatus_resultado = str(
-            oficio_encontrado.get("Estatus", "")
-        )
-
-        fecha_resultado = str(
-            oficio_encontrado.get("Fecha de recepción", "")
-        )
-
-        asunto_resultado = str(
-            oficio_encontrado.get("Asunto", "")
-        )
-
-
-        # Detalle institucional del expediente
-        from html import escape
-
-        def dato_visible(valor, defecto="—"):
-            valor = str(valor or "").strip()
-            return escape(valor if valor and valor.lower() != "nan" else defecto)
-
-        estado = estatus_resultado.strip().lower()
-        if estado in ("concluido", "firmado", "finalizado"):
-            paso = 4
-        elif estado in ("en firma", "en espera de firma", "en proceso de firma"):
-            paso = 3
-        elif estado in ("en revisión", "en revision", "en proceso"):
-            paso = 2
-        else:
-            paso = 1
-
-        st.markdown("""
-        <style>
         .exp-titulo {margin:18px 0 13px}
         .exp-titulo strong {font-size:19px;color:#172F40}
         .exp-titulo p {margin:5px 0 0;font-size:12px;color:#728693}
@@ -6718,12 +10608,8 @@ elif st.session_state.menu_activo == "oficios":
           .exp-etapa-nombre {font-size:10px}
           .exp-etapa-nota {font-size:9px}
         }
-        </style>
-        """, unsafe_allow_html=True)
+        
 
-        # Presentación compacta: solo modifica la apariencia de las celdas editables.
-        st.markdown("""
-        <style>
         .exp-titulo {margin:13px 0 10px}
         .exp-cabecera {padding:17px 22px!important}
         .exp-numero {font-size:20px!important;margin-top:6px!important}
@@ -6823,12 +10709,8 @@ elif st.session_state.menu_activo == "oficios":
                 min-height:70px;
             }
         }
-        </style>
-        """, unsafe_allow_html=True)
+        
 
-        # Refinamiento compacto del expediente: estilos aislados a esta sección.
-        st.markdown("""
-        <style>
         .exp-titulo {margin:17px 0 10px!important;border-left:2px solid #B89A63;padding-left:12px}
         .exp-titulo strong {font-size:19px!important;color:#172F40!important;font-weight:780!important}
         .exp-titulo p {font-size:11px!important;color:#526471!important;margin-top:2px!important}
@@ -6883,13 +10765,8 @@ elif st.session_state.menu_activo == "oficios":
           .exp-etapa-nombre {font-size:10px!important}
           .exp-etapa-nota {font-size:9px!important}
         }
-        </style>
-        """, unsafe_allow_html=True)
+        
 
-        # Ajuste final de proporciones: evita las alturas forzadas de estilos
-        # anteriores y mantiene legible el contenido en pantallas estrechas.
-        st.markdown("""
-        <style>
         .st-key-expediente_campos {
             padding: 12px 14px 14px !important;
             background: #FBFAF7 !important;
@@ -6950,14 +10827,8 @@ elif st.session_state.menu_activo == "oficios":
                 padding: 9px 10px !important;
             }
         }
-        </style>
-        """, unsafe_allow_html=True)
+        
 
-        # Corrección estructural: Streamlit separa los widgets del encabezado y
-        # del valor con un gap vertical propio. Se elimina SOLO en estas tarjetas.
-        # Las reglas anteriores se mantienen por compatibilidad con el resto de la UI.
-        st.markdown("""
-        <style>
         .st-key-expediente_campos [class*="st-key-exp_celda_"] {
             min-height: 0 !important;
             padding: 10px 13px 11px !important;
@@ -7006,9 +10877,653 @@ elif st.session_state.menu_activo == "oficios":
         .st-key-expediente_campos [class*="st-key-exp_celda_"] [data-testid="stButton"] {
             margin: 0 !important;
         }
-        </style>
-        """, unsafe_allow_html=True)
+        
 
+        /* Únicamente la ficha de expediente de la consulta principal. */
+        .st-key-exp_integral {
+            border:1px solid #C9D4D9!important;
+            border-radius:14px!important;
+            overflow:hidden!important;
+            background:rgba(251,252,250,.975)!important;
+            box-shadow:0 17px 43px rgba(20,42,58,.15)!important;
+            padding:0!important;
+            margin-top:18px!important;
+        }
+        .st-key-exp_integral > [data-testid="stVerticalBlock"] {
+            gap:0!important;
+        }
+        .st-key-exp_integral [data-testid="stMarkdownContainer"] p {
+            margin-bottom:0!important;
+        }
+        .exp-int-hero {
+            position:relative;isolation:isolate;
+            display:grid;grid-template-columns:minmax(0,1fr) minmax(215px,.40fr);
+            min-height:175px;
+            padding:25px 27px 25px 37px;
+            gap:18px;
+            background:linear-gradient(108deg,#122C40,#1A4358 70%,#234E5E)!important;
+            color:#fff!important;
+            border-bottom:3px solid #C49B55;
+            overflow:hidden;
+        }
+        .exp-int-hero:before {
+            content:"";position:absolute;left:18px;top:25px;bottom:25px;width:5px;
+            border-radius:2px;background:#D7AB63;z-index:2;
+        }
+        .exp-int-hero:after {
+            content:"";position:absolute;right:0;top:0;bottom:0;width:60%;
+            opacity:.17;z-index:0;pointer-events:none;
+            background-size:cover;background-position:right center;background-repeat:no-repeat;
+        }
+        .exp-int-hero > div {z-index:1;position:relative;min-width:0}
+        .exp-int-overline {
+            font-size:10px;letter-spacing:2.05px;color:#E9BC72;
+            font-weight:800;text-transform:uppercase;margin-bottom:12px;
+        }
+        .exp-int-number {
+            font-size:clamp(22px,2.15vw,31px);line-height:1.25;
+            letter-spacing:.1px;font-weight:800;color:#FFFFFF;
+            overflow-wrap:anywhere;
+        }
+        .exp-int-project {
+            margin-top:10px;color:#E1EAF0;font-size:12px;
+            line-height:1.55;overflow-wrap:anywhere;
+        }
+        .exp-int-summary {display:flex;flex-direction:column;align-items:flex-end;gap:19px}
+        .exp-int-status {
+            display:inline-flex;align-items:center;justify-content:center;
+            gap:9px;max-width:100%;padding:9px 16px;
+            border-radius:7px;border:1px solid #C6D0CB;
+            color:#FAFEFE;background:rgba(255,255,255,.11);
+            text-transform:uppercase;letter-spacing:.6px;font-size:13px;
+            font-weight:800;text-align:center;
+        }
+        .exp-int-status:before {content:"●";font-size:11px;color:#DCC188}
+        .exp-int-status.exp-int-firmado {
+            color:#F5FFFA;background:rgba(77,132,115,.35);
+            border-color:#A1C9B8;
+        }
+        .exp-int-status.exp-int-firmado:before {content:"✓";font-size:15px;color:#D2EEDF}
+        .exp-int-status.exp-int-proceso {background:rgba(89,126,146,.35);border-color:#BACED8}
+        .exp-int-meta {display:flex;gap:28px;text-align:right;max-width:100%}
+        .exp-int-meta span {
+            display:block;color:#C5D6DF;font-size:9px;font-weight:800;
+            letter-spacing:1.4px;text-transform:uppercase;margin-bottom:5px;
+        }
+        .exp-int-meta strong {font-size:13px;color:#FFF;font-weight:800;overflow-wrap:anywhere}
+        [class*="st-key-exp_int_seccion_"] {
+            background:rgba(252,252,250,.98)!important;
+            padding:21px 27px 23px!important;
+            border-bottom:1px solid #D8D8D1!important;
+        }
+        .exp-int-section:nth-of-type(even) {background:rgba(248,250,250,.96)!important}
+        .exp-int-heading {
+            display:flex;align-items:center;gap:17px;
+            margin-bottom:18px;position:relative;
+        }
+        .exp-int-index {
+            font-size:34px;font-weight:500;color:#C19C58;
+            line-height:1;font-family:Georgia,serif;
+            padding-right:17px;border-right:2px solid #C39E5B;
+            letter-spacing:-1.7px;
+        }
+        .exp-int-section-title {font-size:15px;letter-spacing:1.4px;color:#122C40;font-weight:850}
+        .exp-int-section-desc {font-size:11px;color:#71838C;margin-top:3px}
+        .exp-int-tagline {
+            margin-left:auto;letter-spacing:1.4px;font-size:9px;
+            color:#6C8792;font-weight:700;white-space:nowrap;
+        }
+        .exp-int-subline {
+            margin:0 0 9px 0;color:#A17D43;font-size:9px;
+            letter-spacing:1.5px;font-weight:800;text-transform:uppercase;
+        }
+        .st-key-exp_integral [class*="st-key-exp_celda_"] {
+            background:#F8FAFA!important;
+            border:1px solid #D6E1E4!important;
+            border-left:2px solid #B6C7CE!important;
+            border-radius:6px!important;
+            min-height:64px!important;
+            padding:9px 12px 10px!important;
+            box-shadow:none!important;
+            transition:background .18s,border-color .18s!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_celda_"]:hover {
+            background:#FFFFFF!important;border-color:#BEA16B!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_celda_"] .exp-label {
+            color:#597182!important;font-size:9px!important;letter-spacing:1.15px!important;
+            text-transform:uppercase;font-weight:800!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_celda_"] .exp-value {
+            color:#132E40!important;font-size:12px!important;
+            line-height:1.45!important;font-weight:720!important;
+            overflow-wrap:anywhere;
+        }
+        .st-key-exp_integral [class*="st-key-exp_editar_"] button {
+            background:#F8F1E4!important;color:#8C6D37!important;
+            border:1px solid #D5B578!important;border-radius:5px!important;
+            width:28px!important;height:27px!important;min-height:27px!important;
+            padding:0!important;font-size:13px!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_editar_"] button:hover {
+            background:#EFDDBA!important;border-color:#B68948!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_celda_"] [data-testid="stExpander"] {
+            border:1px solid #C7D7DF!important;border-radius:6px!important;
+            background:#FFFFFF!important;
+        }
+        .exp-int-photo {
+            min-height:240px;height:100%;border:1px solid #B7CBD3;
+            border-radius:6px;display:flex;flex-direction:column;
+            justify-content:flex-end;position:relative;overflow:hidden;
+            background:linear-gradient(135deg,#274A5D,#112C3D);
+            background-position:center;background-size:cover;
+            box-shadow:inset 0 0 0 1px rgba(255,255,255,.16);
+        }
+        .exp-int-photo:before {
+            content:"";position:absolute;inset:0;pointer-events:none;
+            background:linear-gradient(180deg,transparent 40%,rgba(13,32,46,.72));
+        }
+        .exp-int-photo-label {position:relative;padding:15px;color:#F1F5F5}
+        .exp-int-photo-label strong {
+            display:block;font-size:12px;letter-spacing:1.25px;font-weight:800;
+        }
+        .exp-int-photo-label span {
+            display:block;font-size:9px;letter-spacing:1.05px;margin-top:5px;color:#D6E4EB;
+        }
+        .exp-int-photo-line {position:relative;height:3px;background:#C79B53;width:32px;margin-top:7px}
+        /* Documentos en tres módulos rectangulares, sin pestañas. */
+        .st-key-exp_integral [class*="st-key-exp_int_doc_"] {
+            padding:8px 12px 9px!important;
+            border:1px solid #D2DDE1!important;
+            border-left:3px solid #C49B55!important;
+            border-radius:6px!important;
+            background:rgba(255,255,255,.93)!important;
+            box-shadow:0 4px 12px rgba(19,46,64,.055)!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_int_doc_"] [data-testid="stExpander"] {
+            border:0!important;background:transparent!important;
+        }
+        .st-key-exp_integral [class*="st-key-exp_int_doc_"] [data-testid="stExpander"] summary {
+            color:#142F43!important;font-weight:800!important;
+        }
+        .exp-int-timeline {padding:10px 12px 5px;border-top:0!important}
+        .exp-int-timeline .exp-etapas:before {
+            height:2px!important;background:#D1DFE1!important;top:14px!important;
+        }
+        .exp-int-timeline .exp-punto {
+            width:30px!important;height:30px!important;
+            border:2px solid #D4DFE2!important;
+            background:#F3F6F6!important;
+            color:#667F8C!important;
+            border-radius:50%!important;
+        }
+        .exp-int-timeline .exp-etapa.completa .exp-punto,
+        .exp-int-timeline .exp-etapa.actual .exp-punto {
+            background:#417765!important;color:#FFFFFF!important;
+            border-color:#417765!important;
+        }
+        .exp-int-timeline .exp-etapa.actual:not(.completa) .exp-punto {
+            background:#B99557!important;border-color:#B99557!important;
+        }
+        .exp-int-timeline .exp-etapa-nombre {color:#1A364A!important;font-weight:800!important;font-size:12px!important}
+        .exp-int-timeline .exp-etapa-nota {color:#738794!important;font-size:10px!important}
+        .st-key-exp_int_admin {
+            background:#163247!important;color:#fff!important;
+            padding:12px 20px!important;border:0!important;
+            border-radius:0!important;
+        }
+        .st-key-exp_int_admin [data-testid="stExpander"] {
+            border:1px solid rgba(216,180,116,.38)!important;
+            background:rgba(255,255,255,.055)!important;border-radius:6px!important;
+        }
+        .st-key-exp_int_admin [data-testid="stExpander"] summary,
+        .st-key-exp_int_admin [data-testid="stExpander"] summary p {
+            color:#FFF!important;font-weight:750!important;
+        }
+        .exp-int-admin-readonly {
+            font-size:11px;color:#D3E0E6;
+            letter-spacing:.7px;
+        }
+        @media(max-width:1150px) {
+            .exp-int-tagline {display:none}
+            .exp-int-hero {grid-template-columns:minmax(0,1fr) minmax(170px,.4fr)}
+            .exp-int-meta {gap:14px}
+        }
+        @media(max-width:720px) {
+            .exp-int-hero {grid-template-columns:1fr;padding:22px 18px 20px 30px}
+            .exp-int-summary {align-items:flex-start;gap:12px}
+            .exp-int-meta {text-align:left;gap:25px}
+            .exp-int-section {padding:18px 13px 20px!important}
+            .exp-int-heading {gap:10px}
+            .exp-int-index {font-size:28px;padding-right:11px}
+            .exp-int-section-title {font-size:13px}
+            .exp-int-photo {min-height:180px}
+            .exp-int-timeline .exp-etapa-nombre {font-size:10px!important}
+        }
+        
+
+/* Expediente integral compacto / ajustes 2026-10-23 */
+.st-key-exp_integral { margin-top: 3px!important; }
+.st-key-exp_integral .exp-int-hero {
+    min-height: 0!important; padding:16px 22px 16px 30px!important;
+    gap:12px!important; align-items:center!important;
+}
+.st-key-exp_integral .exp-int-hero:before {
+    top:16px!important; bottom:16px!important;left:16px!important;width:4px!important;
+}
+/* El trazo ocupa de verdad el espacio ENTRE el título y el estatus. */
+.st-key-exp_integral .exp-int-hero:after {content:none!important;display:none!important;}
+.st-key-exp_integral .exp-int-hero > .exp-int-artwork {
+    position:absolute!important;
+    top:0!important;
+    bottom:0!important;
+    left:37%!important;
+    width:44%!important;
+    z-index:0!important;
+    overflow:hidden!important;
+    pointer-events:none!important;
+    background-size:contain!important;
+    background-repeat:no-repeat!important;
+    background-position:center center!important;
+    opacity:.87!important;
+    -webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 20%,#000 83%,transparent 100%)!important;
+    mask-image:linear-gradient(90deg,transparent 0%,#000 20%,#000 83%,transparent 100%)!important;
+}
+.st-key-exp_integral .exp-int-hero > div:not(.exp-int-artwork) {
+    z-index:2!important;
+    position:relative!important;
+}
+.st-key-exp_integral .exp-int-overline {
+    font-size:9px!important; margin-bottom:5px!important; letter-spacing:1.4px!important;
+}
+.st-key-exp_integral .exp-int-number {
+    font-size:clamp(19px,1.9vw,27px)!important; line-height:1.15!important;
+}
+.st-key-exp_integral .exp-int-project {
+    font-size:11px!important;line-height:1.35!important;margin-top:5px!important;
+}
+.st-key-exp_integral .exp-int-summary {
+    gap:8px!important;
+    align-self:start!important;
+}
+.st-key-exp_integral .exp-int-status {
+    padding:6px 11px!important;font-size:11px!important;
+}
+.st-key-exp_integral .exp-int-meta {gap:16px!important;}
+.st-key-exp_integral .exp-int-meta span {
+    font-size:8px!important;letter-spacing:1px!important;margin-bottom:2px!important;
+}
+.st-key-exp_integral .exp-int-meta strong {font-size:11px!important;}
+.st-key-exp_integral [class*="st-key-exp_int_seccion_"] {
+    padding:10px 18px 12px!important;
+}
+.st-key-exp_integral .exp-int-heading {
+    gap:10px!important;margin-bottom:8px!important;min-height:29px!important;
+}
+.st-key-exp_integral .exp-int-index {
+    font-size:25px!important;padding-right:10px!important;
+}
+.st-key-exp_integral .exp-int-section-title {
+    font-size:12px!important;letter-spacing:1.1px!important;
+}
+.st-key-exp_integral .exp-int-section-desc {font-size:10px!important;margin-top:1px!important;}
+.st-key-exp_integral .exp-int-tagline {font-size:8px!important;}
+.st-key-exp_int_seccion_1 [data-testid="stHorizontalBlock"] {
+    gap:10px!important;
+}
+/* Tarjetas más compactas y centradas: placa técnica ligera */
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] {
+    position:relative!important;
+    box-sizing:border-box!important;
+    min-height:76px!important;
+    padding:10px 13px 10px!important;
+    background:linear-gradient(160deg,#FEFFFF 0%,#F5F8F9 100%)!important;
+    border:1px solid #B6C8CF!important;
+    border-top:2px solid #C39B5B!important;
+    border-radius:8px 8px 4px 4px!important;
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.95), 0 2px 8px rgba(26,56,70,.045)!important;
+    overflow:hidden!important;
+    transition:background .18s ease,border-color .18s ease,box-shadow .18s ease!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"]::after {
+    content:"";
+    position:absolute;bottom:0;left:14px;
+    width:34px;height:2px;
+    background:linear-gradient(90deg,#C8A164,rgba(200,161,100,0));
+    pointer-events:none;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"]:hover {
+    background:linear-gradient(150deg,#FFFFFF,#F8FBFB)!important;
+    border-color:#B69255!important;
+    box-shadow:0 4px 12px rgba(21,53,69,.08)!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] > [data-testid="stVerticalBlock"] {
+    display:flex!important;
+    flex-direction:column!important;
+    justify-content:center!important;
+    align-items:stretch!important;
+    min-height:52px!important;
+    gap:2px!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] [data-testid="stHorizontalBlock"] {
+    margin:0!important;
+    align-items:center!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] .exp-label {
+    color:#5B7381!important;
+    font-size:8px!important;
+    letter-spacing:1.15px!important;
+    line-height:1.2!important;
+    font-weight:800!important;
+    text-transform:uppercase!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] .exp-value {
+    color:#173448!important;
+    font-size:11px!important;
+    font-weight:720!important;
+    line-height:1.35!important;
+    text-align:center!important;
+    margin:1px 0 0!important;
+    padding:1px 3px 3px!important;
+    overflow-wrap:anywhere!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_editar_"] button {
+    width:24px!important;height:24px!important;min-height:24px!important;
+    background:#F9F1E4!important;
+    border:1px solid #CAA76E!important;
+    border-radius:7px!important;
+    color:#7D5C32!important;
+    box-shadow:0 1px 3px rgba(65,56,38,.045)!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [data-testid="stExpander"] {
+    border:1px solid #B8CBD2!important;
+    border-radius:8px!important;
+    background:rgba(249,252,252,.94)!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [data-testid="stExpander"] summary {
+    min-height:32px!important;
+    padding:5px 9px!important;
+    border-radius:8px!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 [data-testid="stExpander"] summary p {
+    color:#294A5A!important;font-size:11px!important;font-weight:700!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 .exp-int-photo {
+    height:100%!important;
+    min-height:173px!important;
+    border:1px solid #AFC2C9!important;
+    border-radius:7px!important;
+    background-size:cover!important;
+    background-position:center!important;
+    box-shadow:0 5px 14px rgba(18,45,61,.12)!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 .exp-int-photo-label {
+    padding:12px!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 .exp-int-photo-label strong {
+    font-size:10px!important;line-height:1.2!important;
+}
+.st-key-exp_integral .st-key-exp_int_seccion_1 .exp-int-photo-label span {
+    font-size:8px!important;line-height:1.3!important;
+}
+.st-key-exp_integral [class*="st-key-exp_int_doc_"] {
+    padding:3px 6px 4px!important;box-shadow:none!important;
+}
+.st-key-exp_integral .exp-int-timeline {padding:2px 6px 0!important;}
+.st-key-exp_integral .exp-int-timeline .exp-punto {
+    width:24px!important;height:24px!important;margin-bottom:6px!important;
+}
+.st-key-exp_integral .exp-int-timeline .exp-etapas:before {top:11px!important;}
+.st-key-exp_integral .exp-int-timeline .exp-etapa-nombre {font-size:10px!important;}
+.st-key-exp_integral .exp-int-timeline .exp-etapa-nota {font-size:9px!important;margin-top:2px!important;}
+.st-key-exp_int_admin {padding:7px 14px!important;}
+@media(max-width:960px) {
+    .st-key-exp_integral .exp-int-hero > .exp-int-artwork {left:37%!important;width:43%!important;opacity:.72!important;}
+    .st-key-exp_integral .st-key-exp_int_seccion_1 .exp-int-photo {min-height:165px!important;}
+}
+@media(max-width:850px) {
+    .st-key-exp_integral .exp-int-hero {padding:17px 13px 17px 27px!important;}
+    .st-key-exp_integral .exp-int-hero:before {left:11px!important;}
+    .st-key-exp_integral [class*="st-key-exp_int_seccion_"] {padding:13px!important;}
+}
+@media(max-width:720px) {
+    .st-key-exp_integral .st-key-exp_int_seccion_1 [class*="st-key-exp_celda_"] {
+        min-height:72px!important;
+        padding:9px 10px 10px!important;
+    }
+}
+    </style>""", unsafe_allow_html=True)
+
+
+    # Trazos del Centro: SVG codificado como imagen de fondo CSS. En Streamlit
+    # el SVG como etiqueta dentro de st.markdown no siempre se presenta.
+    dibujo_centro_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="750" height="185" viewBox="0 0 750 185">
+      <defs>
+        <linearGradient id="dg" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="#CDAE71" stop-opacity="0.05"/>
+          <stop offset="0.38" stop-color="#D7B980" stop-opacity="0.58"/>
+          <stop offset="1" stop-color="#E6C98F" stop-opacity="0.92"/>
+        </linearGradient>
+        <linearGradient id="ag" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0" stop-color="#B8CFDA" stop-opacity="0.02"/>
+          <stop offset="0.45" stop-color="#B8CFDA" stop-opacity="0.42"/>
+          <stop offset="1" stop-color="#DFEDF3" stop-opacity="0.70"/>
+        </linearGradient>
+      </defs>
+      <g fill="none" stroke="#8BA9B9" stroke-width="0.8" opacity="0.30">
+        <path d="M0 25H750 M0 69H750 M0 113H750 M0 157H750"/>
+        <path d="M68 0V185 M160 0V185 M252 0V185 M344 0V185 M436 0V185 M528 0V185 M620 0V185 M712 0V185"/>
+      </g>
+      <g fill="none" stroke-linecap="round">
+        <path d="M-30 161 C105 144 150 88 280 108 S473 153 780 22" stroke="url(#ag)" stroke-width="1.5"/>
+        <path d="M-30 146 C108 130 160 71 285 93 S480 132 780 8" stroke="url(#dg)" stroke-width="2.5"/>
+        <path d="M-30 133 C104 117 162 55 283 79 S479 113 780 -6" stroke="url(#ag)" stroke-width="1.1"/>
+        <path d="M66 155 C194 161 235 44 368 59 S547 116 710 43" stroke="#DAB675" opacity="0.65" stroke-width="1.1" stroke-dasharray="4 7"/>
+        <path d="M282 35V142 M448 30V146 M617 8V108" stroke="#E0EAF0" opacity="0.43" stroke-width="1" stroke-dasharray="3 6"/>
+      </g>
+      <g fill="#E1C185" stroke="#1E4859" stroke-width="1.3">
+        <circle cx="285" cy="93" r="4.2"/><circle cx="463" cy="130" r="4.2"/><circle cx="635" cy="68" r="4.2"/>
+      </g>
+    </svg>"""
+    dibujo_centro_uri = "data:image/svg+xml;base64," + base64.b64encode(
+        dibujo_centro_svg.encode("utf-8")
+    ).decode("ascii")
+
+    st.markdown(
+        textwrap.dedent(f"""
+        <div class="centro-exp-head" style="background-image:url('{dibujo_centro_uri}'),linear-gradient(105deg,#142B3F,#244B5A);background-size:53% 100%,100% 100%;background-position:right center,center center;background-repeat:no-repeat;">
+            <div class="centro-exp-icon">⌕</div>
+            <div>
+                <div class="centro-exp-kicker">MESA DE DISEÑO GEOMÉTRICO · GESTIÓN DOCUMENTAL</div>
+                <div class="centro-exp-title">Centro de expedientes</div>
+                <div class="centro-exp-desc">Búsqueda, consulta y seguimiento de los oficios registrados</div>
+            </div>
+        </div>
+        <div class="centro-exp-search-label">LOCALIZAR UN EXPEDIENTE</div>
+        """),
+        unsafe_allow_html=True
+    )
+
+
+    st.markdown("""
+    <style>
+      .centro-exp-head {display:flex;align-items:center;gap:17px;padding:20px 25px;
+        background:linear-gradient(105deg,#142B3F,#244B5A);border:1px solid #567083;
+        border-left:5px solid #C9A35E;border-radius:14px 14px 10px 10px;
+        box-shadow:0 9px 22px rgba(18,42,59,.14);margin:23px 0 0;color:white}
+
+      /* El grabado técnico está integrado directamente como fondo SVG.
+         No depende de pseudo-elementos ni etiquetas SVG procesadas por Markdown. */
+      .centro-exp-head {
+          position:relative!important;
+          overflow:hidden!important;
+      }
+      .centro-exp-icon {display:flex;justify-content:center;align-items:center;
+        width:55px;height:55px;flex-shrink:0;border:1px solid #C9A35E;border-radius:12px;
+        background:rgba(255,255,255,.09);font-size:30px;color:#E4BD76}
+      .centro-exp-kicker {font-size:10px;letter-spacing:2px;color:#D7B579;font-weight:750}
+      .centro-exp-title {font-size:27px;line-height:1.25;font-weight:800;color:#FFF;margin:5px 0}
+      .centro-exp-desc {font-size:12px;color:#D4E1E7}
+      .centro-exp-search-label {background:#EDF3F5;border:1px solid #CBD8DE;border-bottom:0;
+        border-radius:11px 11px 0 0;color:#254559;font-size:11px;font-weight:800;
+        letter-spacing:1.4px;padding:12px 18px;margin-top:13px}
+      .st-key-consulta_oficio input {background:#F8FBFC!important;border:1.5px solid #9CB6C5!important;
+        border-radius:9px!important;min-height:43px!important}
+      .st-key-btn_buscar_oficio button {background:#1F5269!important;border-color:#1F5269!important}
+      .st-key-btn_nuevo_oficio_consulta button {border:1px solid #BA9656!important;
+        color:#173A4B!important;background:#F9F5ED!important}
+      div[data-testid="stTabs"] [data-baseweb="tab-list"] {gap:9px;background:#EAF1F4;
+        border:1px solid #D0DBE0;border-radius:11px;padding:7px;margin:13px 0 16px}
+      div[data-testid="stTabs"] button[role="tab"] {font-weight:700;border-radius:8px;padding:10px 14px}
+      div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+        background:#1D455A!important;color:#FFFFFF!important}
+      .exp-titulo {margin-top:14px!important}
+      .st-key-expediente_campos {background:#EFF5F7!important;border:1px solid #B9CED9!important;
+        border-radius:12px!important;padding:16px!important}
+      .st-key-expediente_campos [class*="st-key-exp_celda_"] {border:1px solid #C4D6DF!important;
+        background:#FFFFFF!important;border-radius:9px!important}
+      @media(max-width:700px) {.centro-exp-head{padding:15px;gap:11px}
+        .centro-exp-title{font-size:21px}.centro-exp-kicker{font-size:8px}}
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ---------------------------------------------------------
+    # BARRA DE BÚSQUEDA
+    # ---------------------------------------------------------
+
+    col_busqueda, col_boton_buscar, col_nuevo = st.columns(
+        [5.4, 1.45, 2.35],
+        gap="small"
+    )
+
+    with col_busqueda:
+
+        consulta = st.text_input(
+            "Buscar oficio",
+            placeholder="Folio, número, asunto o nombre del oficio firmado...",
+            label_visibility="collapsed",
+            key="consulta_oficio"
+        )
+
+
+    with col_boton_buscar:
+
+        buscar_oficio = st.button(
+            "⌕  Buscar",
+            key="btn_buscar_oficio",
+            type="primary",
+            use_container_width=True
+        )
+
+
+    with col_nuevo:
+
+        if st.button(
+            "＋  Registrar nuevo oficio",
+            key="btn_nuevo_oficio_consulta",
+            use_container_width=True
+        ):
+            st.session_state.mostrar_registro = True
+            st.rerun()
+
+    # =========================================================
+    # BUSCAR RESULTADO
+    # =========================================================
+
+    oficio_encontrado = None
+
+    if consulta.strip() and not df_oficios.empty:
+        consulta_normalizada = normalizar_texto(consulta)
+        coincidencias = []
+
+        for _, fila in df_oficios.iterrows():
+            # El nombre se obtiene de la columna Firmado, que contiene
+            # los vínculos registrados como {"nombre": ..., "url": ...}.
+            # No se busca en el enlace: el usuario introduce el nombre visible.
+            nombres_firmados = [
+                normalizar_texto(documento.get("nombre", ""))
+                for documento in leer_documentos(fila.get("Firmado", ""))
+            ]
+            campos = [
+                normalizar_texto(fila.get("Folio", "")),
+                normalizar_texto(fila.get("No. de oficio", "")),
+                normalizar_texto(fila.get("Asunto", "")),
+                *nombres_firmados,
+            ]
+            if any(consulta_normalizada in campo for campo in campos):
+                # Priorizar coincidencias exactas para no abrir otro expediente
+                # cuando un nombre o número es parte de otro.
+                exacta = any(consulta_normalizada == campo for campo in campos)
+                coincidencias.append((exacta, fila))
+
+        if coincidencias:
+            coincidencias.sort(key=lambda elemento: not elemento[0])
+            oficio_encontrado = coincidencias[0][1]
+            if len(coincidencias) > 1:
+                st.caption(
+                    f"Se encontraron {len(coincidencias)} expedientes coincidentes. "
+                    "Se muestra primero la coincidencia más precisa; "
+                    "agrega más palabras para afinar la búsqueda."
+                )
+
+    # =========================================================
+    # MOSTRAR EXPEDIENTE ÚNICAMENTE SI EXISTE
+    # =========================================================
+
+    if oficio_encontrado is not None:
+
+        # =====================================================
+        # DATOS DEL EXPEDIENTE
+        # =====================================================
+
+        folio_resultado = str(
+            oficio_encontrado.get("Folio", "")
+        )
+
+        numero_resultado = str(
+            oficio_encontrado.get("No. de oficio", "")
+        )
+
+        proyecto_resultado = str(
+            oficio_encontrado.get("Proyecto", "")
+        )
+
+        responsable_resultado = str(
+            oficio_encontrado.get("Responsable", "")
+        )
+
+        estatus_resultado = str(
+            oficio_encontrado.get("Estatus", "")
+        )
+
+        fecha_resultado = str(
+            oficio_encontrado.get("Fecha de recepción", "")
+        )
+
+        asunto_resultado = str(
+            oficio_encontrado.get("Asunto", "")
+        )
+
+
+        # Detalle institucional del expediente
+        from html import escape
+
+        def dato_visible(valor, defecto="—"):
+            valor = str(valor or "").strip()
+            return escape(valor if valor and valor.lower() != "nan" else defecto)
+
+        estado = estatus_resultado.strip().lower()
+        if estado in ("concluido", "firmado", "finalizado"):
+            paso = 4
+        elif estado in ("en firma", "en espera de firma", "en proceso de firma"):
+            paso = 3
+        elif estado in ("en revisión", "en revision", "en proceso"):
+            paso = 2
+        else:
+            paso = 1
+
+        # Estilos cargados al inicio de la consulta para evitar espacios en blanco.
         campos = [
             ("folio", "Folio", "Folio", folio_resultado),
             ("responsable", "Responsable", "Responsable", responsable_resultado),
@@ -7145,127 +11660,218 @@ elif st.session_state.menu_activo == "oficios":
                 f'<div class="exp-etapa-nota">{dato_visible(nota)}</div></div>'
             )
 
-        # Únicamente el estatus exacto "Firmado" utiliza fondo verde.
-        # Todos los demás estatus (incluidas revisiones, firma y correcciones)
-        # utilizan fondo rojo, sin modificar el estado real del expediente.
-        estado_cabecera = str(estatus_resultado or "").strip().casefold()
-        if estado_cabecera == "firmado":
-            clase_cabecera = "exp-cabecera-firmado"
+        # ============================================================
+        # EXPEDIENTE INTEGRAL: NUEVA PRESENTACIÓN, MISMA LÓGICA
+        # Conserva editar_campo(), _panel_gestion_vinculos(), etapas_html,
+        # permisos, validaciones y operaciones sobre Sheets y Drive.
+        # ============================================================
+        estado_etiqueta = str(estatus_resultado or "").strip().casefold()
+        if estado_etiqueta == "firmado":
+            clase_estado = "exp-int-firmado"
+        elif "firma" in estado_etiqueta or "revisi" in estado_etiqueta:
+            clase_estado = "exp-int-proceso"
         else:
-            clase_cabecera = "exp-cabecera-pendiente"
+            clase_estado = "exp-int-otro"
 
-        st.markdown("""
-        <style>
-        .exp-cabecera.exp-cabecera-firmado {
-            background:linear-gradient(112deg,#205743,#307357)!important;
-            border-left-color:#B9D9B7!important;
-        }
-        .exp-cabecera.exp-cabecera-pendiente {
-            background:linear-gradient(112deg,#8D3437,#AD4548)!important;
-            border-left-color:#E6B2A7!important;
-        }
-        .exp-cabecera .exp-estado {
-            font-size:15px!important;
-            font-weight:800!important;
-            padding:8px 17px!important;
-            background:rgba(255,255,255,.13)!important;
-            border:1px solid rgba(255,255,255,.55)!important;
-            color:#FFFFFF!important;
-            letter-spacing:.2px;
-        }
-        @media(max-width:650px) {
-            .exp-cabecera .exp-estado {font-size:14px!important;padding:7px 13px!important}
-        }
-        </style>
-        """, unsafe_allow_html=True)
+        # Recursos decorativos locales. No se necesitan servicios externos.
+        # "trazo_expediente.png": PNG con transparencia, 1400 x 500.
+        # "tarjeta_diseno.png": imagen fotográfica existente del selector.
+        def _imagen_integral_data_uri(nombre):
+            ruta = ASSETS_DIR / nombre
+            if not ruta.is_file():
+                return ""
+            if ruta.stat().st_size > 7 * 1024 * 1024:
+                return ""  # Evita incrustar imágenes excesivamente pesadas.
+            tipo = "image/png" if ruta.suffix.lower() == ".png" else "image/jpeg"
+            return "data:" + tipo + ";base64," + base64.b64encode(ruta.read_bytes()).decode("ascii")
 
-        st.markdown(f"""
-        <div class="exp-titulo"><strong>Detalle del expediente</strong>
-          <p>Información general · Seguimiento documental</p></div>
-        <div class="exp-panel" style="border-bottom:0;border-radius:10px 10px 0 0">
-          <div class="exp-cabecera {clase_cabecera}"><div class="exp-cabecera-fila">
-            <div><div class="exp-eyebrow">CONTROL DOCUMENTAL / EXPEDIENTE</div>
-              <div class="exp-numero">{dato_visible(numero_resultado or folio_resultado)}</div>
-              <div class="exp-proyecto">{dato_visible(proyecto_resultado, 'Proyecto no especificado')}</div>
-            </div><div class="exp-estado">{dato_visible(estatus_resultado, 'Sin estatus')}</div>
-          </div></div>
-        </div>
-        """, unsafe_allow_html=True)
+        imagen_trazo = _imagen_integral_data_uri("trazo_expediente.png")
+        imagen_tramo = _imagen_integral_data_uri("tarjeta_diseno.png")
 
-        if not puede_editar_responsable(responsable_resultado):
-            if es_administrador():
-                st.error("No se pudo habilitar la edición. Vuelve a iniciar sesión y verifica el rol configurado.")
-            else:
-                st.info(
-                    "Consulta de solo lectura: este oficio pertenece a "
-                    f"{responsable_resultado or 'un responsable sin identificar'}. "
-                    "Para editarlo debes tenerlo asignado en tu cuenta o acceder con un rol administrador."
-                )
-        else:
-            st.caption("Para editar un dato, utiliza el icono ✎ junto al nombre del campo.")
+        # La ilustración de trazo suele traer espacio vacío a la izquierda
+        # (y, en algunas exportaciones, fondo negro). Aislamos sus líneas y
+        # recortamos ese espacio para situarlas donde el usuario las quiere.
+        # Esto no modifica el PNG original en assets.
+        if imagen_trazo:
+            try:
+                from PIL import Image, ImageChops
+                dibujo = Image.open(ASSETS_DIR / "trazo_expediente.png").convert("RGBA")
+                r, g, b, a = dibujo.split()
+                luminosidad = ImageChops.lighter(ImageChops.lighter(r, g), b)
+                # Un fondo negro se vuelve transparente; en un PNG con alfa
+                # genuino, se respeta su transparencia original.
+                mascara_luz = luminosidad.point(lambda v: max(0, min(255, (v - 15) * 5)))
+                nuevo_alfa = ImageChops.multiply(a, mascara_luz)
+                dibujo.putalpha(nuevo_alfa)
+                limites = nuevo_alfa.point(lambda v: 255 if v > 25 else 0).getbbox()
+                if limites:
+                    margen = max(8, int(dibujo.width * .012))
+                    x0 = max(0, limites[0] - margen)
+                    y0 = max(0, limites[1] - margen)
+                    x1 = min(dibujo.width, limites[2] + margen)
+                    y1 = min(dibujo.height, limites[3] + margen)
+                    dibujo = dibujo.crop((x0, y0, x1, y1))
+                    salida = BytesIO()
+                    dibujo.save(salida, format="PNG", optimize=True)
+                    imagen_trazo = "data:image/png;base64," + base64.b64encode(salida.getvalue()).decode("ascii")
+            except Exception:
+                # El PNG original sigue siendo válido si Pillow no está disponible.
+                pass
 
-        # Distribución jerárquica: tres datos breves, dos datos descriptivos
-        # y asunto a todo el ancho. Conserva cada widget y su clave original.
-        with st.container(key="expediente_campos"):
-            fila_identificacion = st.columns(3, gap="small")
-            for columna_st, campo in zip(fila_identificacion, campos[:3]):
-                with columna_st:
-                    editar_campo(*campo)
-
-            fila_contexto = st.columns([1, 2], gap="small")
-            with fila_contexto[0]:
-                editar_campo(*campos[3])  # Fecha de recepción
-            with fila_contexto[1]:
-                editar_campo(*campos[4])  # Proyecto
-
-            # El asunto no compite por espacio con las demás tarjetas.
-            editar_campo(*campos[5])
-
-        st.markdown(f"""
-        <div class="exp-panel" style="border-radius:9px;border:1px solid #DEDAD1;margin-top:12px">
-          <div class="exp-seguimiento"><div class="exp-seguimiento-label">SEGUIMIENTO DEL TRÁMITE</div>
-            <div class="exp-etapas">{etapas_html}</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        # Acciones administrativas al final del resumen, sin alterar sus permisos.
-        if es_administrador():
-            with st.expander("⚙ Acciones administrativas · Eliminar oficio", expanded=False):
-                _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
-
-        # =====================================================
-        # DOCUMENTOS DEL EXPEDIENTE
-        # =====================================================
-
-        antecedentes_resultado = leer_documentos(
-            oficio_encontrado.get("Antecedente", "")
+        # Gráfico de respaldo por si la imagen no está en assets.
+        trazo_svg_respaldo = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 180">
+        <g fill="none" stroke="#D9BA80" stroke-width="1.5" opacity=".7">
+        <path d="M-20 156C150 152 180 64 320 86S492 132 608 28"/>
+        <path d="M-20 141C150 135 180 49 320 70S492 118 608 12"/>
+        <path d="M-20 170C150 165 180 80 320 101S492 146 608 43" stroke="#C2D8E2"/>
+        </g><g fill="none" stroke="#AEC8D6" opacity=".3" stroke-width=".7">
+        <path d="M0 50H580 M0 100H580 M0 150H580 M100 0V180 M200 0V180 M300 0V180 M400 0V180 M500 0V180"/>
+        </g></svg>"""
+        if not imagen_trazo:
+            imagen_trazo = "data:image/svg+xml;base64," + base64.b64encode(
+                trazo_svg_respaldo.encode("utf-8")
+            ).decode("ascii")
+        fondo_fotografia = (
+            f"background-image:linear-gradient(180deg,rgba(13,34,47,.06),rgba(13,34,47,.82)),url('{imagen_tramo}');"
+            if imagen_tramo else ""
         )
 
-        anexos_resultado = leer_documentos(
-            oficio_encontrado.get("Anexo", "")
-        )
+        with st.container(key="exp_integral"):
+            st.markdown(f"""
+            <div class="exp-int-hero">
+              <div class="exp-int-artwork" style="background-image:url('{imagen_trazo}');" aria-hidden="true"></div>
+              <div>
+                <div class="exp-int-overline">MESA DE DISEÑO GEOMÉTRICO / EXPEDIENTE TÉCNICO</div>
+                <div class="exp-int-number">{dato_visible(numero_resultado or folio_resultado)}</div>
+                <div class="exp-int-project">{dato_visible(proyecto_resultado, 'Proyecto no especificado')}</div>
+              </div>
+              <div class="exp-int-summary">
+                <div class="exp-int-status {clase_estado}">{dato_visible(estatus_resultado, 'Sin estatus')}</div>
+                <div class="exp-int-meta">
+                  <div><span>Folio</span><strong>{dato_visible(folio_resultado)}</strong></div>
+                  <div><span>Fecha de recepción</span><strong>{dato_visible(fecha_resultado)}</strong></div>
+                </div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-        firmado_resultado = leer_documentos(
-            oficio_encontrado.get("Firmado", "")
-        )
+            # Autorización ya existente. No se altera cómo se guarda información.
+            if not puede_editar_responsable(responsable_resultado):
+                if es_administrador():
+                    st.error("No se pudo habilitar la edición. Vuelve a iniciar sesión y verifica el rol configurado.")
+                else:
+                    st.info(
+                        "Consulta de solo lectura: este oficio pertenece a "
+                        f"{responsable_resultado or 'un responsable sin identificar'}. "
+                        "Para editarlo debes tenerlo asignado en tu cuenta o acceder con un rol administrador."
+                    )
 
-        st.markdown(
-            """<div style="border-top:1px solid #E1E7EA; padding-top:13px; margin-top:5px; margin-bottom:9px;"><div style="color:#10283B; font-size:13px; font-weight:750;">◇ &nbsp; Documentación vinculada</div><div style="color:#87959F; font-size:9px; margin-left:23px; margin-top:2px;">Consulta los documentos relacionados con este oficio</div></div>""",
-            unsafe_allow_html=True
-        )
+            with st.container(key="exp_int_seccion_1"):
+                st.markdown(f"""
+                <div class="exp-int-heading">
+                  <div class="exp-int-index">01</div>
+                  <div><div class="exp-int-section-title">INFORMACIÓN GENERAL</div>
+                    <div class="exp-int-section-desc">Datos del oficio y su contexto técnico</div></div>
+                  <div class="exp-int-tagline">TRAZO / ALINEAMIENTO / RASANTE</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-        col_doc1, col_doc2, col_doc3 = st.columns(3, gap="small")
-        clave_expediente = re.sub(r"[^a-zA-Z0-9_]", "_", f"{folio_resultado}_{numero_resultado}")
-        with col_doc1:
-            _panel_gestion_vinculos(oficio_encontrado, "Antecedente", "Antecedentes",
-                                   "▤", f"{clave_expediente}_antecedente")
-        with col_doc2:
-            _panel_gestion_vinculos(oficio_encontrado, "Anexo", "Anexos",
-                                   "◇", f"{clave_expediente}_anexo")
-        with col_doc3:
-            _panel_gestion_vinculos(oficio_encontrado, "Firmado", "Oficio firmado",
-                                   "▣", f"{clave_expediente}_firmado")
+                # Estructura compacta en tres columnas equilibradas:
+                # contexto del oficio, datos editables y referencia fotográfica.
+                # No se crean nuevos campos ni se modifican los permisos.
+                izquierda, control, foto = st.columns([1.65, 1.0, .90], gap="small")
+                with izquierda:
+                    editar_campo(*campos[4])  # Proyecto
+                    editar_campo(*campos[5])  # Asunto: conserva "Ver texto completo"
+                with control:
+                    editar_campo(*campos[1])  # Responsable
+                    # El folio, el estatus y la recepción se ven en la cabecera;
+                    # desde aquí siguen siendo editables con sus widgets originales.
+                    with st.expander("✎ Editar datos de control", expanded=False):
+                        editar_campo(*campos[0])  # Folio
+                        editar_campo(*campos[2])  # Estatus
+                        editar_campo(*campos[3])  # Fecha de recepción
+                with foto:
+                    st.markdown(f"""
+                    <div class="exp-int-photo" style="{fondo_fotografia}">
+                      <div class="exp-int-photo-label">
+                        <strong>DISEÑO GEOMÉTRICO</strong>
+                        <span>REFERENCIA VISUAL · VÍA FÉRREA</span>
+                        <div class="exp-int-photo-line"></div>
+                      </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            with st.container(key="exp_int_seccion_2"):
+                st.markdown("""
+                <div class="exp-int-heading">
+                  <div class="exp-int-index">02</div>
+                  <div><div class="exp-int-section-title">DOCUMENTACIÓN VINCULADA</div>
+                    <div class="exp-int-section-desc">Archivos y documentos relacionados con este expediente</div></div>
+                  <div class="exp-int-tagline">PLANOS / OFICIOS / ANEXOS</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # El documento principal de un trámite directo no es un antecedente.
+                # Se consulta aparte, sin romper las tres categorías existentes.
+                try:
+                    tipo_actual = _modalidad_expediente(folio_resultado, numero_resultado)
+                except Exception as error:
+                    tipo_actual = None
+                    st.caption("Modalidad documental no disponible: " + str(error))
+                if tipo_actual and tipo_actual.get("Tipo de trámite") == "Directo":
+                    enlace_principal = str(tipo_actual.get("URL principal", "")).strip()
+                    st.caption("MODALIDAD · TRÁMITE DIRECTO · " +
+                               ("CON ANTECEDENTES" if tipo_actual.get("Tiene antecedentes") == "Sí"
+                                else "SIN ANTECEDENTES"))
+                    if enlace_principal.startswith("https://"):
+                        st.link_button(
+                            "Ver oficio principal · " + str(tipo_actual.get("Nombre principal", "")),
+                            enlace_principal, use_container_width=True)
+                # Los paneles ordinarios siguen funcionando sin cambios.
+                antecedentes_resultado = leer_documentos(oficio_encontrado.get("Antecedente", ""))
+                anexos_resultado = leer_documentos(oficio_encontrado.get("Anexo", ""))
+                firmado_resultado = leer_documentos(oficio_encontrado.get("Firmado", ""))
+                doc_1, doc_2, doc_3 = st.columns(3, gap="small")
+                clave_expediente = re.sub(r"[^a-zA-Z0-9_]", "_", f"{folio_resultado}_{numero_resultado}")
+                with doc_1:
+                    with st.container(key="exp_int_doc_antecedentes"):
+                        _panel_gestion_vinculos(oficio_encontrado, "Antecedente", "Antecedentes",
+                                               "▤", f"{clave_expediente}_antecedente")
+                with doc_2:
+                    with st.container(key="exp_int_doc_anexos"):
+                        _panel_gestion_vinculos(oficio_encontrado, "Anexo", "Anexos",
+                                               "◇", f"{clave_expediente}_anexo")
+                with doc_3:
+                    with st.container(key="exp_int_doc_firmado"):
+                        _panel_gestion_vinculos(oficio_encontrado, "Firmado", "Oficio firmado",
+                                               "▣", f"{clave_expediente}_firmado")
+
+            with st.container(key="exp_int_seccion_3"):
+                st.markdown("""
+                <div class="exp-int-heading">
+                  <div class="exp-int-index">03</div>
+                  <div><div class="exp-int-section-title">SEGUIMIENTO DEL TRÁMITE</div>
+                    <div class="exp-int-section-desc">Etapas del proceso documental</div></div>
+                  <div class="exp-int-tagline">RECEPCIÓN / REVISIÓN / FIRMA / ARCHIVO</div>
+                </div>
+                """, unsafe_allow_html=True)
+                # El paso procede del estatus real, y la fecha visible de
+                # recepción procede de Sheets. No se inventan otras fechas.
+                st.markdown(f"""
+                <div class="exp-int-timeline"><div class="exp-etapas">{etapas_html}</div></div>
+                """, unsafe_allow_html=True)
+
+            # Operación destructiva exactamente con el mismo control y permisos.
+            with st.container(key="exp_int_admin"):
+                if es_administrador():
+                    with st.expander("⚙ Gestión administrativa del expediente · Eliminar oficio", expanded=False):
+                        _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
+                else:
+                    st.markdown(
+                        '<div class="exp-int-admin-readonly">CONTROL DOCUMENTAL · EXPEDIENTE DE CONSULTA</div>',
+                        unsafe_allow_html=True,
+                    )
 
     elif consulta.strip():
         st.warning(
