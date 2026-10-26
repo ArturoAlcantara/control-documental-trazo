@@ -1,0 +1,4 @@
+libreoffice-writer
+fonts-crosextra-carlito
+fonts-crosextra-caladea
+fonts-liberation
