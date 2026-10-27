@@ -1034,6 +1034,53 @@ def _drive_carpeta_expediente(folio, numero):
     raiz = _carpeta_raiz_borradores()
     etiqueta = re.sub(r"[^A-Za-z0-9._ -]", "_", f"{folio}_{numero}")[:100]
     sesion = _drive_sesion()
+    # Diagnóstico exclusivo de SETF: comprobar la carpeta con la identidad OAuth
+    # real antes de intentar crear nada. No altera el comportamiento de DG.
+    if _area_activa_validada() == "setf":
+        identidad = ""
+        try:
+            respuesta_cuenta = sesion.get(
+                "https://www.googleapis.com/drive/v3/about",
+                params={"fields": "user(emailAddress)"}, timeout=20,
+            )
+            if respuesta_cuenta.ok:
+                correo = str(respuesta_cuenta.json().get("user", {}).get("emailAddress", ""))
+                if "@" in correo:
+                    usuario, dominio = correo.rsplit("@", 1)
+                    identidad = f" (cuenta OAuth: {usuario[:2]}***@{dominio})"
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            pass  # La comprobación de carpeta no depende del endpoint about.
+
+        ver_raiz = sesion.get(
+            f"https://www.googleapis.com/drive/v3/files/{raiz}",
+            params={"fields": "id,name,mimeType,trashed,capabilities(canAddChildren)",
+                    "supportsAllDrives": "true"}, timeout=25,
+        )
+        if ver_raiz.status_code in (403, 404):
+            raise RuntimeError(
+                "Google Drive no permite consultar la carpeta raíz de SETF "
+                f"con las credenciales OAuth actuales{identidad}. "
+                f"Respuesta HTTP {ver_raiz.status_code}. Aunque la carpeta se abra "
+                "en el navegador, el token de Streamlit puede pertenecer a otra cuenta "
+                "o tener permisos diferentes. Comprueba que autorizaste "
+                "configurar_drive_oauth.py con el Gmail propietario de "
+                "CONTROL DOCUMENTAL - SETF y que [drive_oauth] contiene el "
+                "refresh_token generado para esa cuenta. No cambies el ID de la carpeta "
+                "ni compartas tus tokens. No se guardó ninguna versión."
+            )
+        detalles_raiz = _drive_json(ver_raiz, "comprobar carpeta raíz de SETF")
+        if detalles_raiz.get("trashed") or detalles_raiz.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError(
+                "La carpeta raíz configurada para SETF no corresponde a una carpeta "
+                "de Google Drive activa. Revisa su selección en [setf] de Secrets."
+            )
+        if detalles_raiz.get("capabilities", {}).get("canAddChildren") is False:
+            raise RuntimeError(
+                "La cuenta OAuth de Streamlit tiene acceso a la carpeta SETF, "
+                "pero no puede crear subcarpetas allí" + identidad + ". "
+                "Revisa que esa cuenta tenga permiso de edición. No se guardó ninguna versión."
+            )
+
     consulta = (
         f"'{raiz}' in parents and name = '{etiqueta.replace(chr(39), '')}' "
         "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
