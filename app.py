@@ -2446,76 +2446,99 @@ def _adjuntar_word_corregido_tte(folio, numero, archivo):
     return subido
 
 
+def _adjuntos_tte_expediente(folio, numero):
+    """Adjuntos de devolución, agrupados por versión y sin depender del orden de filas.
+
+    Los archivos se conservan en Drive y su trazabilidad en EVENTOS_BORRADORES.
+    No se modifica ni reemplaza ninguna versión de BORRADORES.
+    """
+    acciones = ("Word corregido por la Tte.", "PDF corregido por la Tte.")
+    eventos = _eventos_expediente(folio, numero)
+    grupos = {}
+    for evento in eventos:
+        if str(evento.get("Accion", "")).strip() not in acciones:
+            continue
+        try:
+            dato = json.loads(str(evento.get("Detalle") or ""))
+            if not isinstance(dato, dict):
+                continue
+            version = int(str(evento.get("Version") or "0").strip())
+        except (ValueError, TypeError):
+            continue
+        if version < 1:
+            continue
+        id_drive = str(dato.get("drive_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", id_drive):
+            continue
+        es_pdf = str(evento.get("Accion", "")).strip() == acciones[1]
+        grupos.setdefault(version, []).append({
+            "id": id_drive,
+            "nombre": str(dato.get("nombre") or ("Correcciones_Tte.pdf" if es_pdf else "Correcciones_Tte.docx")),
+            "formato": "PDF" if es_pdf else "Word",
+            "es_pdf": es_pdf,
+            "url": str(dato.get("url") or ""),
+            "fecha": str(evento.get("Fecha") or ""),
+        })
+    for archivos in grupos.values():
+        archivos.sort(key=lambda x: x["fecha"])
+    return grupos
+
+
+def _mostrar_adjunto_tte(archivo, folio, numero, *, historico=False):
+    """Permite descargar el adjunto privado a quien consulta el expediente."""
+    drive_id = archivo["id"]
+    formato = archivo["formato"]
+    nombre = archivo["nombre"]
+    version_texto = " (histórico)" if historico else ""
+    st.markdown(f"**Documento de correcciones de la Tte.: {html.escape(nombre)}{version_texto}**")
+    identificador = hashlib.sha256(f"{folio}|{numero}|{drive_id}".encode()).hexdigest()[:18]
+    clave = f"tte_archivo_{identificador}"
+    izquierda, derecha = st.columns(2)
+    with izquierda:
+        url = archivo["url"]
+        if url.startswith("https://drive.google.com/file/d/"):
+            st.link_button(f"Ver {formato} en Drive", url, use_container_width=True)
+    with derecha:
+        if st.button(f"Preparar {formato} de la Tte.", key=f"{clave}_preparar", use_container_width=True):
+            try:
+                data = (_descargar_pdf_privado(drive_id) if archivo["es_pdf"]
+                        else _descargar_docx_drive(drive_id))
+                st.session_state[f"{clave}_bytes"] = data
+            except Exception as error:
+                st.error(f"No se pudo descargar el documento: {_mensaje_error_sheets(error)}")
+        if f"{clave}_bytes" in st.session_state:
+            st.download_button(
+                f"Descargar {formato} de la Tte.",
+                data=st.session_state[f"{clave}_bytes"], file_name=nombre,
+                mime=("application/pdf" if archivo["es_pdf"] else
+                      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                key=f"{clave}_descargar", use_container_width=True,
+            )
+    if archivo["es_pdf"] and f"{clave}_bytes" in st.session_state:
+        with st.expander("Vista previa del PDF devuelto"):
+            _mostrar_pdf_privado(st.session_state[f"{clave}_bytes"], f"{clave}_visor")
+
+
 def _word_tte_devolucion(folio, numero, etapa):
-    """Muestra el Word o PDF opcional devuelto en la ronda actual de la Tte."""
+    """Presenta el último adjunto de la ronda de correcciones actual.
+
+    Se localiza por versión y fecha; no depende del orden de aparición en la hoja.
+    Los adjuntos históricos se muestran por separado en el historial.
+    """
     if etapa != ETAPA_CORRECCIONES:
         return
     try:
-        eventos = _eventos_expediente(folio, numero)
-        ultima_devolucion = next(
-            (i for i in range(len(eventos) - 1, -1, -1)
-             if str(eventos[i].get("Accion", "")).strip() == ETAPA_CORRECCIONES),
-            None,
-        )
-        if ultima_devolucion is None:
+        versiones = _borradores_expediente(folio, numero)
+        if not versiones:
             return
-        inicio = next(
-            (i for i in range(ultima_devolucion - 1, -1, -1)
-             if str(eventos[i].get("Accion", "")).strip()
-             in (ETAPA_TTE, ETAPA_CORRECCIONES)), -1,
-        )
-        acciones = ("Word corregido por la Tte.", "PDF corregido por la Tte.")
-        adjuntos = [
-            e for e in eventos[inicio + 1:ultima_devolucion]
-            if str(e.get("Accion", "")).strip() in acciones
-        ]
+        version_actual = int(versiones[-1].get("Version") or 0)
+        adjuntos = _adjuntos_tte_expediente(folio, numero).get(version_actual, [])
         if not adjuntos:
             return
-        evento = adjuntos[-1]
-        dato = json.loads(str(evento.get("Detalle", "")))
-        drive_id = str(dato.get("drive_id", ""))
-        es_pdf = str(evento.get("Accion", "")).strip() == acciones[1]
-        extension = ".pdf" if es_pdf else ".docx"
-        nombre = str(dato.get("nombre") or ("Archivo_Tte" + extension))
-        url = str(dato.get("url", ""))
-        titulo = "PDF" if es_pdf else "Word"
-        st.info(f"La Tte. adjuntó un {titulo} con sus correcciones. "
-                "El archivo original del expediente no fue reemplazado.")
-        col_drive, col_descarga = st.columns(2)
-        with col_drive:
-            if url.startswith("https://drive.google.com/file/d/"):
-                st.link_button(f"↗ Ver {titulo} de la Tte. en Drive", url,
-                               use_container_width=True)
-        with col_descarga:
-            clave_base = f"tte_adj_{folio}_{numero}"
-            if st.button(f"↓ Preparar {titulo} de la Tte.",
-                         key=f"{clave_base}_preparar_{extension[1:]}",
-                         use_container_width=True):
-                try:
-                    datos = (_descargar_pdf_privado(drive_id) if es_pdf
-                             else _descargar_docx_drive(drive_id))
-                    st.session_state[f"{clave_base}_bytes"] = datos
-                    st.session_state[f"{clave_base}_id"] = drive_id
-                except Exception as error:
-                    st.error(f"No se pudo consultar el {titulo}: {_mensaje_error_sheets(error)}")
-            if (st.session_state.get(f"{clave_base}_id") == drive_id
-                    and f"{clave_base}_bytes" in st.session_state):
-                st.download_button(
-                    f"Descargar {titulo} de la Tte.",
-                    data=st.session_state[f"{clave_base}_bytes"],
-                    file_name=nombre,
-                    mime=("application/pdf" if es_pdf else
-                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-                    key=f"{clave_base}_descargar_{extension[1:]}",
-                    use_container_width=True,
-                )
-        if es_pdf and st.session_state.get(f"{clave_base}_id") == drive_id:
-            with st.expander("◉ Vista previa del PDF devuelto", expanded=False):
-                _mostrar_pdf_privado(st.session_state[f"{clave_base}_bytes"],
-                                     f"{clave_base}_visor_{drive_id}")
+        st.info("La Tte. adjuntó un documento con correcciones. El Word original del expediente se conserva sin cambios.")
+        _mostrar_adjunto_tte(adjuntos[-1], folio, numero)
     except Exception as error:
-        st.warning(f"No se pudo consultar el documento devuelto por la Tte.: "
-                   f"{_mensaje_error_sheets(error)}")
+        st.warning("No fue posible consultar el adjunto de la Tte.: " + _mensaje_error_sheets(error))
 
 
 def _mensaje_error_sheets(error):
@@ -2534,7 +2557,11 @@ def _mensaje_error_sheets(error):
 def _mostrar_observaciones_revisor(folio, numero, etapa):
     """Muestra las indicaciones conservadas en EVENTOS_BORRADORES."""
     import html
-    if not puede_gestionar_borradores() or etapa not in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA):
+    if etapa not in (ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA):
+        return
+    # En SETF el responsable asignado también debe ver la devolución de la Tte.
+    # DG conserva su validación original de revisores.
+    if _area_activa_validada() != "setf" and not puede_gestionar_borradores():
         return
     try:
         eventos = _eventos_expediente(folio, numero)
@@ -2620,6 +2647,16 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
             anteriores = [v for v in versiones
                           if int(v.get("Version") or 0) < int(ultimo.get("Version") or 0)]
             _mostrar_historial_pdf_por_version(folio, numero, anteriores, movimientos, actual=ultimo)
+            # Descargas del Word/PDF de devolución incluso después de registrar
+            # una versión corregida. Permanecen asociados a la versión revisada.
+            if _area_activa_validada() == "setf":
+                adjuntos_por_version = _adjuntos_tte_expediente(folio, numero)
+                if adjuntos_por_version:
+                    st.markdown("**Documentos devueltos por la Tte. · Historial**")
+                    for numero_version in sorted(adjuntos_por_version, reverse=True):
+                        for adjunto in adjuntos_por_version[numero_version]:
+                            st.caption(f"Versión revisada V{numero_version:02d} · {adjunto['fecha']}")
+                            _mostrar_adjunto_tte(adjunto, folio, numero, historico=True)
     else:
         st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
 
@@ -7741,6 +7778,13 @@ def _modulo_lateral_documentos(tipo):
             fecha_texto = fecha.strftime("%d/%m/%Y") if fecha else "Sin fecha registrada"
             estado_texto = (f"Firmado: {fecha_texto}" if firmado_realmente else
                             f"Estado: {str(oficio.get('Estatus', '')) or 'En trámite'}")
+            # Título de la fila: nombre del OFICIO FIRMADO (no del antecedente).
+            # Si falta el archivo/nombre, conservar el título del registro.
+            archivos_firmados = documentos["firmado"]
+            titulo_firmado = (str(archivos_firmados[0].get("nombre", "")).strip()
+                             if archivos_firmados else "")
+            if not titulo_firmado or re.fullmatch(r"Documento \d+", titulo_firmado, re.I):
+                titulo_firmado = numero or (f"Folio {folio}" if folio else "Sin número")
             token = hashlib.sha256((folio + "|" + numero + "|" + str(indice)).encode("utf-8")).hexdigest()[:16]
 
             with st.container(key=f"firm_reg_row_{token}"):
@@ -7749,7 +7793,7 @@ def _modulo_lateral_documentos(tipo):
                 with col_info:
                     st.markdown(
                         f'<div class="firm-inline-file">'
-                        f'<div class="firm-inline-name">{html.escape(numero or f"Folio {folio}" or "Sin número")}</div>'
+                        f'<div class="firm-inline-name">{html.escape(titulo_firmado)}</div>'
                         f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
                         f'· {html.escape(responsable)} · {html.escape(estado_texto)}</div>' 
                         f'</div>', unsafe_allow_html=True)
