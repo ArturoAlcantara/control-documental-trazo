@@ -8318,13 +8318,46 @@ def _id_libro_minutas_setf():
     return valor
 
 
+@st.cache_resource(show_spinner=False)
+def _cliente_gspread_minutas_setf():
+    """Cliente gspread real, compatible con gspread 5 y 6 en local/Cloud.
+
+    En gspread 6 `worksheet.spreadsheet.client` es un HTTPClient: sirve
+    para llamadas HTTP, pero NO ofrece `open_by_key`.
+    Usamos `gspread.authorize` con las credenciales YA configuradas,
+    sin cambiar el cliente ni las sesiones del módulo OFICIOS.
+    """
+    ruta_credenciales = BASE_DIR / "credentials.json"
+    if ruta_credenciales.is_file():
+        with ruta_credenciales.open("r", encoding="utf-8") as archivo:
+            info_cuenta_servicio = json.load(archivo)
+    else:
+        try:
+            info_cuenta_servicio = dict(st.secrets["gcp_service_account"])
+        except (KeyError, FileNotFoundError) as exc:
+            raise RuntimeError(
+                "Faltan las credenciales de la cuenta de servicio de Google "
+                "en [gcp_service_account]."
+            ) from exc
+
+    credenciales = Credentials.from_service_account_info(
+        info_cuenta_servicio,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
+    )
+    return gspread.authorize(credenciales)
+
+
 def _hoja_minutas_setf():
-    """Obtiene MINUTAS en el libro correcto, sin abrir nunca el libro DG."""
+    """Obtiene MINUTAS en su propio libro, sin acceder al libro de DG."""
     if _area_activa_validada() != "setf":
         raise PermissionError("La gestión de minutas de SETF no está disponible en DG.")
     identificador = _id_libro_minutas_setf()
-    hoja_oficios = conectar_google_sheets_por_area("setf")
-    cliente = hoja_oficios.spreadsheet.client
+    # La conexión de Oficios devuelve una Worksheet, no un Client.
+    # No usar `worksheet.spreadsheet.client`: con gspread 6 es HTTPClient.
+    cliente = _cliente_gspread_minutas_setf()
     libro = cliente.open_by_key(identificador)
     try:
         hoja = libro.worksheet("MINUTAS")
@@ -8913,9 +8946,13 @@ def _modulo_minutas_setf():
         codigo, fila_reservada, prox = _consecutivo_siguiente_setf(actuales, 2026)
     except Exception as error:
         st.error(f"No se pudo abrir el control de minutas de SETF: {error}")
-        st.info("El control de oficios de DG y SETF no se modifica. Configura "
-                "el ID del libro **Control Interno SETF** para habilitar Minutas.")
-        st.code('[setf]\nminutas_spreadsheet_id = "ID_DEL_CONTROL_INTERNO_SETF"', language="toml")
+        if isinstance(error, ValueError) and "minutas_spreadsheet_id" in str(error):
+            st.info("Falta configurar el ID del libro Control Interno SETF ")
+            st.code('[setf]\nminutas_spreadsheet_id = "ID_DEL_CONTROL_INTERNO_SETF"', language="toml")
+        else:
+            st.info("Revisa que la cuenta de servicio tenga acceso al libro "
+                    "Control Interno SETF y que exista la pestaña MINUTAS. "
+                    "Los registros no se modificaron.")
         return
     propias = [r for r in actuales if r["tipo"] == "Propia SETF" and r["registrada"]]
     otras = [r for r in total if r["tipo"] == "Otra reunión" and r["registrada"]]
