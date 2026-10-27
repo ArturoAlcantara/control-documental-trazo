@@ -866,50 +866,104 @@ ETAPA_ENVIADO = "Pendiente de revisión inicial"
 ETAPA_TTE = "Pendiente de revisión de la Tte."
 
 
-def _credenciales_drive():
-    """Drive personal usa OAuth del propietario, no la cuenta de servicio de Sheets.
+def _descripcion_segura_error_oauth(error):
+    """Clasifica errores de Google sin exponer tokens, IDs o secretos."""
+    detalle = str(error).lower()
+    if "invalid_grant" in detalle:
+        return (
+            "invalid_grant: Google indica que el refresh_token caducó, fue revocado "
+            "o no corresponde a una autorización vigente. Comprueba además si la "
+            "pantalla de consentimiento OAuth continúa en modo Testing."
+        )
+    if "invalid_client" in detalle or "unauthorized_client" in detalle:
+        return (
+            "invalid_client: el client_id y el client_secret no corresponden "
+            "al mismo cliente OAuth que emitió el refresh_token, o ese cliente "
+            "ya no está habilitado."
+        )
+    if "invalid_scope" in detalle:
+        return (
+            "invalid_scope: la autorización creada no incluye el alcance de "
+            "Google Drive requerido por la aplicación."
+        )
+    if "invalid_rapt" in detalle:
+        return "invalid_rapt: Google exige una nueva autenticación de la cuenta."
+    if "access_denied" in detalle or "admin_policy_enforced" in detalle:
+        return "acceso denegado: revisa las políticas de la cuenta de Google."
+    return (
+        "sin código OAuth identificable. Revisa los parámetros de autorización, "
+        "la conexión a Google y la configuración del proyecto en Google Cloud "
+        f"(tipo de error: {type(error).__name__})."
+    )
 
-    Ejecuta configurar_drive_oauth.py una sola vez para obtener el token.
-    En despliegues remotos se puede configurar [drive_oauth] en secrets.toml.
+
+def _credenciales_drive():
+    """Obtiene credenciales OAuth de Drive sin exponer datos sensibles.
+
+    Prioriza siempre los Secrets de Streamlit frente al JSON local, que sirve
+    solo como alternativa en entornos de desarrollo. Así se evita que un JSON
+    antiguo incluido accidentalmente en el servidor reemplace los Secrets.
     """
     alcance = ["https://www.googleapis.com/auth/drive"]
     token_local = BASE_DIR / "drive_oauth_token.json"
-    if token_local.is_file():
-        datos = json.loads(token_local.read_text(encoding="utf-8"))
-    else:
-        try:
-            datos = dict(st.secrets["drive_oauth"])
-        except (KeyError, FileNotFoundError) as error:
-            raise RuntimeError(
-                "Falta configurar [drive_oauth] en los Secrets de Streamlit Cloud. "
-                "Agrega los campos token, refresh_token, token_uri, client_id y client_secret "
-                "de tu autorización OAuth privada (sin subir el JSON a GitHub). "
-                "En localhost puedes ejecutar configurar_drive_oauth.py."
-            ) from error
-    credenciales = OAuthCredentials.from_authorized_user_info(datos, scopes=alcance)
-    if not credenciales.valid:
-        if credenciales.refresh_token:
-            try:
-                credenciales.refresh(GoogleAuthRequest())
-            except Exception as error:
-                raise RuntimeError(
-                    "Google Drive rechazó la renovación OAuth. El Word no se ha guardado "
-                    "en Drive ni se ha registrado una nueva versión. Vuelve a generar "
-                    "la autorización OAuth con la cuenta que tiene acceso a la carpeta, "
-                    "y actualiza los valores de [drive_oauth] en los Secrets PRIVADOS "
-                    "de Streamlit Cloud (refresh_token, client_id y client_secret de la "
-                    "misma aplicación OAuth). Después reinicia la aplicación. "
-                    "No subas credenciales a GitHub."
-                ) from error
-            if token_local.is_file():
-                token_local.write_text(credenciales.to_json(), encoding="utf-8")
-        else:
-            raise RuntimeError(
-                "La autorización de Drive no tiene refresh_token válido. "
-                "Vuelve a autorizar la cuenta y actualiza [drive_oauth] en Streamlit Secrets."
-            )
-    return credenciales
 
+    seccion_secreta = None
+    try:
+        seccion_secreta = st.secrets.get("drive_oauth")
+    except (KeyError, FileNotFoundError):
+        pass
+
+    if seccion_secreta:
+        datos = dict(seccion_secreta)
+        origen = "Secrets de Streamlit Cloud"
+    elif token_local.is_file():
+        datos = json.loads(token_local.read_text(encoding="utf-8"))
+        origen = "drive_oauth_token.json local"
+    else:
+        raise RuntimeError(
+            "No se encontraron credenciales de Google Drive. Configura "
+            "[drive_oauth] en los Secrets privados de Streamlit Cloud con "
+            "refresh_token, client_id, client_secret y token_uri."
+        )
+
+    faltantes = [
+        clave for clave in ("refresh_token", "client_id", "client_secret", "token_uri")
+        if not str(datos.get(clave, "")).strip()
+    ]
+    if faltantes:
+        raise RuntimeError(
+            f"Configuración OAuth incompleta en {origen}; faltan los campos: "
+            + ", ".join(faltantes)
+            + ". El Word no se ha guardado."
+        )
+
+    try:
+        credenciales = OAuthCredentials.from_authorized_user_info(
+            datos, scopes=alcance
+        )
+    except (ValueError, TypeError, KeyError) as error:
+        raise RuntimeError(
+            f"No se pudo interpretar la configuración OAuth de {origen}. "
+            "Revisa el formato del JSON y los Secrets, sin publicar sus valores. "
+            "El Word no se ha guardado."
+        ) from error
+
+    if not credenciales.valid:
+        try:
+            credenciales.refresh(GoogleAuthRequest())
+        except Exception as error:
+            explicacion = _descripcion_segura_error_oauth(error)
+            raise RuntimeError(
+                f"Google Drive rechazó la renovación OAuth usando {origen}. "
+                f"Diagnóstico: {explicacion} "
+                "El Word no se ha guardado ni se ha registrado una nueva versión. "
+                "No publiques tokens ni contraseñas en GitHub ni en capturas."
+            ) from error
+
+        # Solo se reescribe un token local si realmente se obtuvo desde él.
+        if origen == "drive_oauth_token.json local":
+            token_local.write_text(credenciales.to_json(), encoding="utf-8")
+    return credenciales
 
 def _carpeta_raiz_borradores():
     """Obtiene el ID de carpeta desde Streamlit o secrets.toml local.
