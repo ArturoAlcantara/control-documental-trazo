@@ -893,8 +893,13 @@ def _credenciales_drive():
                 credenciales.refresh(GoogleAuthRequest())
             except Exception as error:
                 raise RuntimeError(
-                    "Google Drive rechazó la renovación OAuth. Reautoriza la cuenta "
-                    "y actualiza [drive_oauth] en Streamlit Secrets (refresh_token vigente)."
+                    "Google Drive rechazó la renovación OAuth. El Word no se ha guardado "
+                    "en Drive ni se ha registrado una nueva versión. Vuelve a generar "
+                    "la autorización OAuth con la cuenta que tiene acceso a la carpeta, "
+                    "y actualiza los valores de [drive_oauth] en los Secrets PRIVADOS "
+                    "de Streamlit Cloud (refresh_token, client_id y client_secret de la "
+                    "misma aplicación OAuth). Después reinicia la aplicación. "
+                    "No subas credenciales a GitHub."
                 ) from error
             if token_local.is_file():
                 token_local.write_text(credenciales.to_json(), encoding="utf-8")
@@ -2521,8 +2526,16 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                                            ["Elaboración propia", "Memoria USB", "Correo electrónico",
                                             "Entregado por auxiliar", "Otro medio"],
                                            key=f"doc_procedencia_{folio}_{numero}")
-                personas = ["No especificado", "Magali Rivera", "Ricardo Godínez", "Cecilia Santos",
-                            "Jesús Rodriguez", "Alejandra Cardoso", "John Bautista", "Otro"]
+                # En SETF se ofrecen EXCLUSIVAMENTE los integrantes de SETF,
+                # incluidos los registrados en Secrets; en DG se conserva la lista anterior.
+                if _area_activa_validada() == "setf":
+                    personas = ["No especificado"] + [
+                        nombre for nombre in _responsables_setf()
+                        if nombre not in ("No especificado", "Otro")
+                    ] + ["Otro"]
+                else:
+                    personas = ["No especificado", "Magali Rivera", "Ricardo Godínez", "Cecilia Santos",
+                                "Jesús Rodriguez", "Alejandra Cardoso", "John Bautista", "Otro"]
                 persona_elegida = st.selectbox("¿Quién lo elaboró o entregó?", personas,
                                               key=f"doc_origen_lista_{folio}_{numero}")
                 origen = (st.text_input("Especifica el nombre", key=f"doc_origen_otro_{folio}_{numero}")
@@ -12997,7 +13010,11 @@ elif st.session_state.menu_activo == "oficios":
             st.success("Campo actualizado correctamente en Google Sheets.")
 
         def editar_campo(codigo, etiqueta, columna, valor):
-            autorizado = puede_editar_responsable(responsable_resultado)
+            # Un responsable SETF puede trabajar en el Word asignado, pero la
+            # edición de metadatos generales está reservada a los cinco administradores.
+            autorizado = (puede_administrar_oficios_actual()
+                          if _area_activa_validada() == "setf"
+                          else puede_editar_responsable(responsable_resultado))
             with st.container(key=f"exp_celda_{codigo}"):
                 titulo_col, boton_col = st.columns([8, 1], gap="small")
                 with titulo_col:
@@ -13013,8 +13030,9 @@ elif st.session_state.menu_activo == "oficios":
                 if autorizado and st.session_state.get("exp_editando") == codigo:
                     clave = f"exp_valor_{codigo}_{folio_resultado}_{numero_resultado}"
                     if codigo == "responsable":
-                        opciones = ["Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
-                                    "Ricardo", "Magali", "John", "Karina"]
+                        opciones = (_responsables_setf() if _area_activa_validada() == "setf" else
+                                    ["Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
+                                     "Ricardo", "Magali", "John", "Karina"])
                         if valor and valor not in opciones:
                             opciones.insert(0, valor)
                         nuevo = st.selectbox(etiqueta, opciones,
@@ -13321,7 +13339,9 @@ elif st.session_state.menu_activo == "oficios":
 
             # Operación destructiva exactamente con el mismo control y permisos.
             with st.container(key="exp_int_admin"):
-                if es_administrador():
+                # En SETF las acciones destructivas se asignan por identificador
+                # de cuenta; el rol de administrador DG NO concede estos permisos.
+                if puede_administrar_oficios_actual():
                     with st.expander("⚙ Gestión administrativa del expediente · Eliminar oficio", expanded=False):
                         _panel_eliminar_oficio(folio_resultado, numero_resultado, origen="busqueda")
                 else:
@@ -13829,7 +13849,7 @@ elif st.session_state.menu_activo == "oficios":
                 seleccionado = oficios_seleccionados.iloc[0]
                 folio_borrar = str(seleccionado.get("Folio", "")).strip()
                 numero_borrar = str(seleccionado.get("No. de oficio", "")).strip()
-                if es_administrador():
+                if puede_administrar_oficios_actual():
                     st.markdown("**Administración del oficio seleccionado**")
                     clave_dialogo = f"abrir_borrado_{folio_borrar}_{numero_borrar}"
                     if st.button(
@@ -13844,8 +13864,14 @@ elif st.session_state.menu_activo == "oficios":
                             st.session_state.pop("eliminacion_pendiente", None)
                             st.rerun()
                 else:
-                    st.info("Seleccionaste un oficio. La eliminación requiere iniciar sesión "
-                            "con una cuenta de administrador o propietario.")
+                    st.info(
+                        "Seleccionaste un oficio. Para eliminarlo se requiere permiso "
+                        "administrativo de esta área. En SETF solo pueden hacerlo "
+                        "Arturo, Francely, Alondra, Adán o Daniel, mediante sus cuentas autorizadas."
+                        if _area_activa_validada() == "setf" else
+                        "Seleccionaste un oficio. La eliminación requiere iniciar sesión "
+                        "con una cuenta de administrador o propietario."
+                    )
             elif len(oficios_seleccionados) > 1:
                 st.info("Selecciona solo un oficio para habilitar la eliminación.")
             else:
