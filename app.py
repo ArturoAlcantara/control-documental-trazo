@@ -1426,8 +1426,12 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
         raise ValueError("El oficio no se encontró de forma única en OFICIOS.")
     fila_num, actual = coincidencias[0]
     if not autorizacion_tte:
-        # Los revisores gestionan el documento, no cambian el responsable.
-        if not puede_gestionar_borradores():
+        # SETF: el responsable asignado o administrador documental autorizado
+        # puede enviar su documento a revisión; el flujo DG no se altera.
+        if _area_activa_validada() == "setf" and cambios == {"Estatus": "En revisión"}:
+            if not (puede_editar_responsable(campo(actual, "Responsable"))):
+                raise PermissionError("No tienes permiso para mandar este oficio a revisión de la Tte. Alondra.")
+        elif not puede_gestionar_borradores():
             raise PermissionError("Solo John o Alejandra pueden registrar la firma.")
     from gspread.utils import rowcol_to_a1
     actualizaciones = []
@@ -12691,6 +12695,30 @@ elif st.session_state.menu_activo == "oficios":
         .st-key-exp_int_admin [data-testid="stExpander"] summary,
         .st-key-exp_int_admin [data-testid="stExpander"] summary p {
             color:#FFF!important;font-weight:750!important;
+        }
+        /* Texto legible en el panel oscuro de administración del expediente.
+           Mantener el texto introducido en campos claros en color oscuro. */
+        .st-key-exp_int_admin [data-testid="stWidgetLabel"] p,
+        .st-key-exp_int_admin [data-testid="stCheckbox"] label p,
+        .st-key-exp_int_admin .stMarkdown p,
+        .st-key-exp_int_admin .stMarkdown strong,
+        .st-key-exp_int_admin label,
+        .st-key-exp_int_admin [data-testid="stTextInput"] label p {
+            color:#FFFFFF!important;
+        }
+        .st-key-exp_int_admin [data-testid="stTextInput"] input {
+            color:#182C3B!important;
+            background:#F5F8FA!important;
+        }
+        .st-key-exp_int_admin [data-testid="stAlert"] p,
+        .st-key-exp_int_admin [data-testid="stAlert"] strong {
+            color:#FFFFFF!important;
+        }
+        .st-key-exp_int_admin button p {
+            color:#FFFFFF!important;
+        }
+        .st-key-exp_int_admin button[kind="secondary"] p {
+            color:#182C3B!important;
         }
         .exp-int-admin-readonly {
             font-size:11px;color:#D3E0E6;
