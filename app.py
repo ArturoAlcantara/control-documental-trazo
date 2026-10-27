@@ -210,10 +210,33 @@ def responsable_de_sesion():
 def puede_editar_responsable(responsable):
     if not st.session_state.get("autenticado", False):
         return False
-    if es_administrador():
+    if puede_administrar_oficios_actual():
         return True
     asignado = responsable_de_sesion()
     return bool(asignado) and normalizar_texto(asignado) == normalizar_texto(responsable)
+
+
+# SETF: la administración es explícita por cuenta, NO por tener rol DG.
+# Si los IDs de Secrets fueran distintos, declarar los IDs exactos en
+# [setf] administradores_documentales = ["arturo", "francely", ...].
+ADMINISTRADORES_SETf_PREDETERMINADOS = frozenset({"arturo", "francely", "alondra", "adan", "daniel"})
+
+
+def es_administrador_documental_setf():
+    if not st.session_state.get("autenticado", False):
+        return False
+    if _area_activa_validada() != "setf":
+        return False
+    configurados = st.secrets.get("setf", {}).get("administradores_documentales", None)
+    autorizados = ({str(x).strip().lower() for x in configurados}
+                   if isinstance(configurados, (list, tuple)) else ADMINISTRADORES_SETf_PREDETERMINADOS)
+    return identificador_sesion() in autorizados
+
+
+def puede_administrar_oficios_actual():
+    if _area_activa_validada() == "setf":
+        return es_administrador_documental_setf()
+    return es_administrador()
 
 
 def exigir_permiso_edicion(responsable):
@@ -228,7 +251,7 @@ def exigir_sesion():
 
 def navegar_a(destino):
     """Cambia de módulo y actualiza la interfaz sin perder la sesión."""
-    destinos = {"home", "oficios", "diseno", "pendientes", "urgentes", "firmados"}
+    destinos = {"home", "oficios", "diseno", "pendientes", "urgentes", "firmados", "minutas"}
     if destino not in destinos:
         raise ValueError("Módulo de navegación no reconocido.")
     st.session_state.menu_activo = destino
@@ -317,7 +340,7 @@ def mostrar_login():
     st.markdown(
         """
         <h4 style="text-align:center; color:#B08A4A; letter-spacing:3px;">
-            MESA DE DISEÑO GEOMÉTRICO
+            INFRAESTRUCTURA FERROVIARIA
         </h4>
         <h1 style="text-align:center; color:#10283B;">
             CONTROL DOCUMENTAL
@@ -367,6 +390,7 @@ def mostrar_login():
                     st.session_state.cargo_institucional = str(datos_usuario.get("cargo", ""))
                     st.session_state.responsable_oficios = str(datos_usuario.get("responsable", "")).strip()
                     st.session_state.menu_activo = "home"
+                    st.session_state.pop("_ultima_area_datos", None)
                     st.session_state.pop("pend_bandeja", None)
                     _cookies_sesion["sesion"] = _crear_token(identificador)
                     _cookies_sesion.save()
@@ -378,7 +402,7 @@ def mostrar_login():
 
 
 def mostrar_sesion():
-    if st.session_state.get("menu_activo") in ("oficios", "pendientes", "urgentes", "firmados"):
+    if st.session_state.get("menu_activo") in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
         return  # Sesión y cierre están en la barra institucional del módulo.
     col_sesion1, col_sesion2 = st.columns([6, 1])
     with col_sesion2:
@@ -640,12 +664,12 @@ def mostrar_selector_areas():
     with columna_setf:
         foto = f'background-image:url(\'{foto_setf}\')' if foto_setf else 'background:linear-gradient(115deg,#314b60,#92a2aa)'
         st.markdown(f"""<div class="selector-card setf">
-          <div class="selector-foto" style="{foto}"><span class="selector-etiqueta">◷ &nbsp; PRÓXIMAMENTE</span></div>
+          <div class="selector-foto" style="{foto}"><span class="selector-etiqueta">✓ &nbsp; ÁREA ACTIVA</span></div>
           <div class="selector-cuerpo"><div class="selector-icono" style="color:white;border-color:#dce5ed">ϟ</div>
           <div class="selector-nombre">Sistemas Eléctricos de<br>Tracción Ferroviaria</div>
-          <div class="selector-descripcion">Vista preliminar. Próximamente, gestión documental de SETF.</div>
+          <div class="selector-descripcion">Registro y seguimiento documental de Sistemas Eléctricos.</div>
           </div></div>""", unsafe_allow_html=True)
-        if st.button("Visualizar interfaz SETF  →", key="seleccionar_setf", use_container_width=True):
+        if st.button("Ingresar a Sistemas Eléctricos  →", key="seleccionar_setf", use_container_width=True):
             st.session_state.area_actual = "setf"
             st.session_state.menu_activo = "home"
             st.rerun()
@@ -656,7 +680,7 @@ if len(autorizadas) == 2 and st.session_state.area_actual is None:
     mostrar_selector_areas()
     st.stop()
 
-if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "oficios", "pendientes", "urgentes", "firmados"):
+if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "oficios", "pendientes", "urgentes", "firmados", "minutas"):
     espacio, cambiar = st.columns([5,1])
     with cambiar:
         if st.button("⇄ Cambiar de área", key="cambiar_area_institucional", use_container_width=True):
@@ -665,34 +689,75 @@ if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "ofici
             st.session_state.pop("pend_bandeja", None)
             st.rerun()
 
-# Vista provisional SETF integrada en el mismo archivo.
-def mostrar_setf():
-    st.markdown("""<div style='text-align:center;padding:38px 0 24px'>
-       <div style='font-size:12px;letter-spacing:3px;color:#a17a3e;font-weight:750'>MESA DE TRABAJO · SETF</div>
-       <h1 style='color:#10283b'>Sistemas Eléctricos de Tracción Ferroviaria</h1>
-       <p style='color:#647484;font-size:17px'>Control documental</p></div>""", unsafe_allow_html=True)
-    a,b = st.columns(2, gap="large")
-    with a:
-        with st.container(border=True):
-            st.subheader("📁 Gestión de oficios")
-            st.write("Espacio reservado para los oficios de SETF.")
-            st.button("Próximamente", key="setf_oficios", disabled=True, use_container_width=True)
-    with b:
-        with st.container(border=True):
-            st.subheader("📋 Seguimiento documental")
-            st.write("Espacio reservado para pendientes, revisiones y firmas.")
-            st.button("Próximamente", key="setf_seguimiento", disabled=True, use_container_width=True)
-    st.info("Vista provisional: SETF todavía no consulta, registra ni modifica documentos.")
-
-
+# SETF utiliza los mismos módulos reales que Diseño Geométrico.
+# La separación se aplica antes de toda operación sobre Sheets/Drive.
+# Nunca usar automáticamente el libro ni la carpeta de DG como alternativa.
 if st.session_state.area_actual == "setf":
-    _, cerrar = st.columns([6,1])
-    with cerrar:
-        st.caption(f"Sesión: {st.session_state.usuario_actual}")
-        if st.button("Cerrar sesión", key="salir_setf", use_container_width=True):
-            cerrar_sesion_selector()
-    mostrar_setf()
-    st.stop()
+    try:
+        configuracion_setf = dict(st.secrets["setf"])
+        id_setf = str(configuracion_setf.get("spreadsheet_id", "")).strip()
+        carpeta_setf = str(configuracion_setf.get("drive_borradores_folder_id", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", id_setf):
+            raise ValueError("Configura [setf].spreadsheet_id con el ID del libro de SETF.")
+        if id_setf == "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY":
+            raise ValueError("El libro de SETF no puede ser el mismo que el de Diseño Geométrico.")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", carpeta_setf):
+            raise ValueError("Configura [setf].drive_borradores_folder_id con una carpeta de SETF independiente.")
+        carpeta_dg = str(st.secrets.get("drive_borradores_folder_id", "")).strip()
+        if carpeta_dg and carpeta_setf == carpeta_dg:
+            raise ValueError("La carpeta de Drive de SETF debe ser diferente de la de DG.")
+    except (KeyError, TypeError, FileNotFoundError) as error:
+        st.error("La configuración de SETF aún no está disponible. No se accederá a los datos de DG.")
+        st.code('[setf]\nspreadsheet_id = "ID_DEL_GOOGLE_SHEETS_SETf"\ndrive_borradores_folder_id = "ID_CARPETA_DRIVE_SETF"', language="toml")
+        st.stop()
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+
+# Evitar que una selección, un PDF o un documento preparado en una mesa se
+# conserve visible al cambiar a la otra en la misma sesión del navegador.
+_area_previa = st.session_state.get("_ultima_area_datos")
+if _area_previa != st.session_state.area_actual:
+    claves_sesion_documental = {
+        "oficios_marcados", "pdf_reporte_generado", "exp_identidad",
+        "exp_editando", "exp_guardado", "eliminacion_pendiente",
+        "pend_bandeja", "pend_expediente_abierto", "pend_guardado",
+        "firmados_kpi_filtro", "buscar_firmados", "buscar_urgentes",
+        "oficio_guardado", "mostrar_registro", "firma_editor_actual",
+        "registro_guardado", "version_formulario", "epoch_editor",
+        "firm_orden", "urgentes_estado",
+    }
+    claves_prefijo = ("doc_", "ver_pdf_", "preview_", "pdf_", "word_", "tte_dictamen_", "docx_")
+    for _clave in list(st.session_state.keys()):
+        if _clave in claves_sesion_documental or _clave.startswith(claves_prefijo):
+            st.session_state.pop(_clave, None)
+    st.session_state._ultima_area_datos = st.session_state.area_actual
+
+
+def _area_activa_validada():
+    """Frontera obligatoria para operaciones con datos."""
+    area = str(st.session_state.get("area_actual") or "")
+    if not st.session_state.get("autenticado") or area not in areas_autorizadas():
+        raise PermissionError("La sesión no tiene permisos para consultar esta área.")
+    return area
+
+
+def _rotulos_area(contenido):
+    """Personaliza solo los rótulos visibles; no toca las reglas de negocio DG."""
+    if _area_activa_validada() != "setf":
+        return contenido
+    if not isinstance(contenido, str):
+        return contenido
+    return (contenido
+        .replace("MESA DE DISEÑO GEOMÉTRICO DE VÍA FÉRREA", "MESA DE SISTEMAS ELÉCTRICOS DE TRACCIÓN FERROVIARIA")
+        .replace("MESA DE DISEÑO GEOMÉTRICO", "MESA DE SISTEMAS ELÉCTRICOS")
+        .replace("Mesa de Diseño Geométrico", "Mesa de Sistemas Eléctricos")
+        .replace("DISEÑO GEOMÉTRICO ·", "SISTEMAS ELÉCTRICOS ·")
+        .replace("DISEÑO GEOMÉTRICO /", "SISTEMAS ELÉCTRICOS /")
+        .replace("<strong>DISEÑO GEOMÉTRICO</strong>", "<strong>SISTEMAS ELÉCTRICOS</strong>")
+        .replace("TRAZO · ALINEAMIENTO · RASANTE", "ENERGÍA · CATENARIA · TRACCIÓN")
+        .replace("TRAZO &nbsp; / &nbsp; ALINEAMIENTO &nbsp; / &nbsp; RASANTE", "ENERGÍA &nbsp; / &nbsp; CATENARIA &nbsp; / &nbsp; TRACCIÓN")
+        .replace("TRAZO / ALINEAMIENTO / RASANTE", "ENERGÍA / CATENARIA / TRACCIÓN"))
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -702,8 +767,12 @@ ASSETS_DIR = BASE_DIR / "assets"
 # CONEXIÓN A GOOGLE SHEETS (HÍBRIDA: LOCAL + SECRETS)
 # =========================================================
 
-@st.cache_resource(show_spinner=False)
 def conectar_google_sheets():
+    return conectar_google_sheets_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def conectar_google_sheets_por_area(area):
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -767,7 +836,10 @@ def conectar_google_sheets():
     transporte.request = solicitud_con_reintentos
 
     try:
-        spreadsheet_id = "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY"
+        spreadsheet_id = (
+            "1jweDu5kKkF2onZArr8-QV_CgwO1tPzfMBtdkEeHRQgY"
+            if area == "diseno" else str(st.secrets["setf"]["spreadsheet_id"]).strip()
+        )
         documento = cliente.open_by_key(spreadsheet_id)
         hoja = documento.worksheet("OFICIOS")
         
@@ -840,6 +912,13 @@ def _carpeta_raiz_borradores():
     La lectura directa del archivo permite detectar cambios locales aun si
     Streamlit todavía conserva una versión anterior de sus secretos.
     """
+    if _area_activa_validada() == "setf":
+        carpeta_setf = str(st.secrets["setf"].get("drive_borradores_folder_id", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", carpeta_setf):
+            raise ValueError("La carpeta de SETF no está configurada correctamente.")
+        if carpeta_setf == str(st.secrets.get("drive_borradores_folder_id", "")).strip():
+            raise PermissionError("SETF no puede almacenar borradores dentro de la carpeta de DG.")
+        return carpeta_setf
     carpeta = ""
     ruta_secrets = BASE_DIR / ".streamlit" / "secrets.toml"
 
@@ -914,9 +993,13 @@ def _drive_carpeta_expediente(folio, numero):
     return _drive_json(r, "crear carpeta del expediente")["id"]
 
 
-@st.cache_resource(show_spinner=False)
 def _hoja_borradores():
-    hoja_oficios = conectar_google_sheets()
+    return _hoja_borradores_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_borradores_por_area(area):
+    hoja_oficios = conectar_google_sheets_por_area(area)
     libro = hoja_oficios.spreadsheet
     try:
         hoja = libro.worksheet("BORRADORES")
@@ -932,35 +1015,51 @@ def _hoja_borradores():
     return hoja
 
 
-@st.cache_data(ttl=25, show_spinner=False)
 def _leer_registros_borradores():
-    return _hoja_borradores().get_all_records()
+    return _leer_registros_borradores_por_area(_area_activa_validada())
 
 
 @st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_borradores_por_area(area):
+    return _hoja_borradores_por_area(area).get_all_records()
+
+
 def _leer_filas_borradores():
-    return _hoja_borradores().get_all_values()
+    return _leer_filas_borradores_por_area(_area_activa_validada())
 
 
 @st.cache_data(ttl=25, show_spinner=False)
+def _leer_filas_borradores_por_area(area):
+    return _hoja_borradores_por_area(area).get_all_values()
+
+
 def _leer_registros_eventos():
-    return _hoja_eventos_borradores().get_all_records()
+    return _leer_registros_eventos_por_area(_area_activa_validada())
 
 
 @st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_eventos_por_area(area):
+    return _hoja_eventos_borradores_por_area(area).get_all_records()
+
+
 def _leer_registros_oficios():
-    return conectar_google_sheets().get_all_records()
+    return _leer_registros_oficios_por_area(_area_activa_validada())
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_registros_oficios_por_area(area):
+    return conectar_google_sheets_por_area(area).get_all_records()
 
 
 def _invalidar_cache_documental(borradores=False, eventos=False, oficios=False):
     if borradores:
-        _leer_registros_borradores.clear()
-        _leer_filas_borradores.clear()
+        _leer_registros_borradores_por_area.clear()
+        _leer_filas_borradores_por_area.clear()
     if eventos:
-        _leer_registros_eventos.clear()
+        _leer_registros_eventos_por_area.clear()
     if oficios:
-        _leer_registros_oficios.clear()
-        obtener_oficios.clear()
+        _leer_registros_oficios_por_area.clear()
+        obtener_oficios_por_area.clear()
 
 
 def _borradores_expediente(folio, numero):
@@ -1029,10 +1128,14 @@ def _subir_borrador_drive(archivo, folio, numero, version):
                    f"https://drive.google.com/file/d/{respuesta['id']}/view"}
 
 
-@st.cache_resource(show_spinner=False)
 def _hoja_eventos_borradores():
+    return _hoja_eventos_borradores_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_eventos_borradores_por_area(area):
     """Bitácora independiente; nunca altera las columnas de BORRADORES."""
-    libro = conectar_google_sheets().spreadsheet
+    libro = conectar_google_sheets_por_area(area).spreadsheet
     columnas = ["Folio", "No. de oficio", "Version", "Accion", "Usuario", "Fecha", "Detalle"]
     try:
         hoja = libro.worksheet("EVENTOS_BORRADORES")
@@ -1065,6 +1168,8 @@ ETAPA_RETORNO_FIRMA = "Devuelto de firma para correcciones"
 
 
 def _permiso_documental(responsable):
+    if _area_activa_validada() == "setf":
+        return bool(st.session_state.get("autenticado"))
     return puede_gestionar_borradores() or puede_realizar_revision_final() or puede_editar_responsable(responsable)
 
 
@@ -1087,8 +1192,10 @@ def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No esp
     if puede_realizar_revision_final() and not puede_gestionar_borradores():
         raise PermissionError("La revisión final no permite subir versiones Word.")
     if anteriores:
-        if not puede_gestionar_borradores():
-            raise PermissionError("Tras la primera carga, las nuevas versiones corresponden a John y Alejandra.")
+        if not (puede_gestionar_borradores() or
+                (_area_activa_validada() == "setf" and
+                 puede_editar_responsable(oficio.get("Responsable", "")))):
+            raise PermissionError("Solo el responsable vigente o un revisor autorizado puede subir correcciones.")
         if etapa not in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA):
             raise PermissionError("El expediente está en revisión final, firma o archivado. No se puede sustituir la versión enviada.")
     version = max([int(x.get("Version") or 0) for x in anteriores], default=0) + 1
@@ -1410,13 +1517,22 @@ try {
 
         if not archivo_pdf.is_file():
             diagnostico = " | ".join(intentos[-2:])
+            if sys.platform.startswith("linux"):
+                mensaje = (
+                    "No se pudo preparar el PDF en el servidor. "
+                    "Para Streamlit Community Cloud, agrega a la raíz de tu "
+                    "repositorio de GitHub un archivo packages.txt que contenga "
+                    "libreoffice-writer, y vuelve a desplegar la aplicación. "
+                    "La versión Word original permanece intacta."
+                )
+            else:
+                mensaje = (
+                    "No se pudo generar el PDF. Instala LibreOffice o "
+                    "utiliza Microsoft Word instalado en Windows. "
+                    "La versión Word original permanece intacta."
+                )
             raise RuntimeError(
-                "No se pudo generar el PDF en este equipo. "
-                "Instala LibreOffice desde libreoffice.org y reinicia Streamlit; "
-                "o utiliza Microsoft Word instalado en Windows. "
-                "Como alternativa, instala pywin32 con: python -m pip install pywin32. "
-                "Tu Word sigue disponible y no se modificó. "
-                + ("Detalles: " + diagnostico if diagnostico else "")
+                mensaje + (" Detalles: " + diagnostico if diagnostico else "")
             )
         pdf = archivo_pdf.read_bytes()
         if not pdf.startswith(b"%PDF-") or len(pdf) < 200:
@@ -2393,8 +2509,9 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
     tte = puede_realizar_revision_final()
     auxiliar = puede_editar_responsable(responsable) and not (admin or tte)
     puede_subir = ((not ultimo and (admin or auxiliar)) or
-                   (ultimo and admin and etapa in (ETAPA_BORRADOR, ETAPA_ENVIADO,
-                                                    ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)))
+                   (ultimo and (admin or (_area_activa_validada() == "setf" and auxiliar))
+                    and etapa in (ETAPA_BORRADOR, ETAPA_ENVIADO,
+                                  ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)))
     if puede_subir:
         with st.expander("＋ Cargar primera versión" if not ultimo else "＋ Cargar nueva versión corregida", expanded=not ultimo):
             with st.form(key=f"doc_carga_{folio}_{numero}"):
@@ -2597,10 +2714,14 @@ def buscar_oficios(consulta):
     return resultados
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def obtener_oficios():
+    return obtener_oficios_por_area(_area_activa_validada())
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def obtener_oficios_por_area(area):
     try:
-        registros = _leer_registros_oficios()
+        registros = _leer_registros_oficios_por_area(area)
         return pd.DataFrame(registros)
     except Exception as error:
         st.warning(f"No se pudo consultar Google Sheets: {_mensaje_error_sheets(error)}")
@@ -2623,8 +2744,8 @@ def _eliminar_oficio_confirmado(folio, numero):
     Los archivos en Drive NO se borran; así se evita perder documentos originales.
     """
     exigir_sesion()
-    if not es_administrador():
-        raise PermissionError("Solo las cuentas con rol administrador o propietario pueden eliminar oficios.")
+    if not puede_administrar_oficios_actual():
+        raise PermissionError("No tienes permisos administrativos para eliminar oficios en esta área.")
     hojas = {
         "OFICIOS": conectar_google_sheets(),
         "BORRADORES": _hoja_borradores(),
@@ -2661,7 +2782,7 @@ def _eliminar_oficio_confirmado(folio, numero):
         for indice in sorted(filas_borrar[nombre], reverse=True):
             hojas[nombre].delete_rows(indice)
     _invalidar_cache_documental(borradores=True, eventos=True, oficios=True)
-    _leer_modalidades.clear()
+    _leer_modalidades_por_area.clear()
     # Comprobación de consistencia: ningún panel debe recuperar el expediente.
     for nombre, hoja in hojas.items():
         datos_restantes = hoja.get_all_values()
@@ -2679,7 +2800,7 @@ def _eliminar_oficio_confirmado(folio, numero):
 
 def _panel_eliminar_oficio(folio, numero, *, origen):
     """Confirmación doble reutilizable en tabla y ficha de búsqueda."""
-    if not es_administrador():
+    if not puede_administrar_oficios_actual():
         return
     folio, numero = str(folio).strip(), str(numero).strip()
     clave = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{origen}_{folio}_{numero}")
@@ -2710,6 +2831,42 @@ def _panel_eliminar_oficio(folio, numero, *, origen):
                 st.error("No se pudo completar la eliminación: " + _mensaje_error_sheets(error))
 
 
+def _reasignar_oficio_setf_emergencia(folio, numero, responsable_original, nuevo_responsable, motivo):
+    """Reasignación excepcional auditable, restringida por cuenta y por área."""
+    if not es_administrador_documental_setf():
+        raise PermissionError("Reasignación reservada a los cinco administradores SETF.")
+    permitidos = _responsables_setf()
+    if nuevo_responsable not in permitidos or not str(motivo).strip():
+        raise ValueError("Selecciona un usuario SETF y registra el motivo.")
+    hoja = conectar_google_sheets()
+    datos = hoja.get_all_records()
+    coincidencias = [r for r in datos if str(r.get("Folio", "")).strip() == str(folio).strip()
+                     and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+    if len(coincidencias) != 1:
+        raise ValueError("El expediente cambió o no es único; vuelve a consultar.")
+    actual = str(coincidencias[0].get("Responsable", "")).strip()
+    if normalizar_texto(actual) != normalizar_texto(responsable_original):
+        raise ValueError("Otro usuario cambió el responsable. Actualiza antes de reintentar.")
+    libro = hoja.spreadsheet
+    encabezados = ["Fecha", "Usuario", "Folio", "No. de oficio", "Responsable anterior",
+                   "Nuevo responsable", "Motivo", "Estado"]
+    try:
+        bitacora = libro.worksheet("REASIGNACIONES_SETF")
+    except gspread.WorksheetNotFound:
+        bitacora = libro.add_worksheet(title="REASIGNACIONES_SETF", rows=1000, cols=len(encabezados))
+        bitacora.append_row(encabezados, value_input_option="RAW")
+    if bitacora.row_values(1) != encabezados:
+        raise ValueError("La bitácora de reasignaciones tiene columnas inesperadas.")
+    registro = [datetime.now().astimezone().isoformat(timespec="seconds"),
+                identificador_sesion(), str(folio), str(numero), actual, nuevo_responsable,
+                motivo.strip(), "PENDIENTE"]
+    bitacora.append_row(registro, value_input_option="RAW")
+    num_bitacora = len(bitacora.get_all_values())
+    actualizar_campo_oficio(folio, numero, "Responsable", nuevo_responsable)
+    # Si esta marca falla, la entrada PENDIENTE conserva evidencia para verificar.
+    bitacora.update_cell(num_bitacora, 8, "COMPLETADO")
+
+
 def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valor):
     """Actualiza una sola celda del oficio, verificando la identidad antes de escribir[cite: 4]."""
     hoja = conectar_google_sheets()
@@ -2738,7 +2895,9 @@ def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valo
     col_responsable = cabeceras.index("Responsable")
     responsable_actual = fila_actual[col_responsable] if col_responsable < len(fila_actual) else ""
     exigir_permiso_edicion(responsable_actual)
-    if columna == "Responsable" and not es_administrador():
+    if _area_activa_validada() == "setf" and not puede_administrar_oficios_actual():
+        raise PermissionError("La modificación de datos generales en SETF es administrativa.")
+    if columna == "Responsable" and not puede_administrar_oficios_actual():
         if normalizar_texto(nuevo_valor) != normalizar_texto(responsable_actual):
             raise PermissionError("Solo los administradores pueden reasignar oficios.")
     if columna in ("Folio", "No. de oficio"):
@@ -2786,6 +2945,8 @@ def actualizar_estatus_y_entrega(folio_original, numero_original, nuevo_estatus,
     col_responsable = cabeceras.index("Responsable")
     responsable_actual = fila_actual[col_responsable] if col_responsable < len(fila_actual) else ""
     exigir_permiso_edicion(responsable_actual)
+    if _area_activa_validada() == "setf" and not puede_administrar_oficios_actual():
+        raise PermissionError("En SETF los cambios de estatus y fecha son administrativos.")
 
     from gspread.utils import rowcol_to_a1
     fila = coincidencias[0]
@@ -2822,6 +2983,8 @@ def guardar_edicion_pendiente(folio, numero, cambios):
     idx_responsable = cabeceras.index("Responsable")
     responsable = fila_actual[idx_responsable] if idx_responsable < len(fila_actual) else ""
     exigir_permiso_edicion(responsable)
+    if _area_activa_validada() == "setf" and not puede_administrar_oficios_actual():
+        raise PermissionError("Solo los administradores SETF pueden editar datos generales.")
     from gspread.utils import rowcol_to_a1
     actualizaciones = []
     for columna, nuevo in cambios.items():
@@ -2854,7 +3017,7 @@ ESTATUS_OFICIOS = [
 def generar_pdf_oficios(registros):
     """Reporte imprimible: fechas, observaciones y firmas según los responsables."""
     buffer = BytesIO()
-    ruta_logo = Path(__file__).parent / "assets" / "logo_diseno_geometrico.png"
+    ruta_logo = Path(__file__).parent / "assets" / ("logo_setf.png" if _area_activa_validada() == "setf" else "logo_diseno_geometrico.png")
     ancho, alto = landscape(letter)
     azul = colors.HexColor("#273B49")
     acero = colors.HexColor("#647E8D")
@@ -2881,7 +3044,7 @@ def generar_pdf_oficios(registros):
         canvas_obj.rect(35, alto - 52, ancho - 70, 3, fill=1, stroke=0)
         canvas_obj.setFillColor(colors.white)
         canvas_obj.setFont("Helvetica-Bold", 9)
-        canvas_obj.drawString(45, alto - 38, "CONTROL DOCUMENTAL - MESA DE DISEÑO GEOMÉTRICO")
+        canvas_obj.drawString(45, alto - 38, "CONTROL DOCUMENTAL - " + ("MESA SETF" if _area_activa_validada() == "setf" else "MESA DE DISEÑO GEOMÉTRICO"))
         canvas_obj.setFont("Helvetica", 8)
         canvas_obj.drawRightString(
             ancho - 45, alto - 38,
@@ -3022,16 +3185,24 @@ def generar_pdf_oficios(registros):
         ]))
         return bloque
 
-    elementos.append(KeepTogether([
-        Paragraph("VALIDACIÓN Y FIRMAS", estilo_titulo),
-        Spacer(1, 18),
-        bloque_firma_individual(
-            "Jefa de la Mesa de Diseño Geométrico de Vía Férrea",
-            "Tte. Alondra Leticia Barajas Ramirez",
-            ancho_linea=220,
-            matricula="(A-10057999)",
-        ),
-    ]))
+    if _area_activa_validada() == "diseno":
+        elementos.append(KeepTogether([
+            Paragraph("VALIDACIÓN Y FIRMAS", estilo_titulo),
+            Spacer(1, 18),
+            bloque_firma_individual(
+                "Jefa de la Mesa de Diseño Geométrico de Vía Férrea",
+                "Tte. Alondra Leticia Barajas Ramirez",
+                ancho_linea=220,
+                matricula="(A-10057999)",
+            ),
+        ]))
+
+    else:
+        elementos.append(Paragraph(
+            "REPORTE DE CONSULTA SETF · SIN FIRMAS INSTITUCIONALES",
+            estilo_firma,
+        ))
+        nombres_presentes = []
 
     if nombres_presentes:
         for inicio in range(0, len(nombres_presentes), 3):
@@ -3113,9 +3284,13 @@ COLUMNAS_MODALIDADES = [
 ]
 
 
-@st.cache_resource(show_spinner=False)
 def _hoja_modalidades():
-    libro = conectar_google_sheets().spreadsheet
+    return _hoja_modalidades_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_modalidades_por_area(area):
+    libro = conectar_google_sheets_por_area(area).spreadsheet
     try:
         hoja = libro.worksheet("MODALIDADES_TRAMITE")
     except gspread.WorksheetNotFound:
@@ -3127,9 +3302,13 @@ def _hoja_modalidades():
     return hoja
 
 
-@st.cache_data(ttl=25, show_spinner=False)
 def _leer_modalidades():
-    return _hoja_modalidades().get_all_records()
+    return _leer_modalidades_por_area(_area_activa_validada())
+
+
+@st.cache_data(ttl=25, show_spinner=False)
+def _leer_modalidades_por_area(area):
+    return _hoja_modalidades_por_area(area).get_all_records()
 
 
 def _modalidad_expediente(folio, numero):
@@ -3154,7 +3333,7 @@ def _registrar_modalidad(folio, numero, tipo, tiene_antecedentes,
         "Pendiente de autorización" if tipo == "Directo" else "Registro ordinario",
         identificador_sesion(), fecha, "", "", "",
     ], value_input_option="RAW")
-    _leer_modalidades.clear()
+    _leer_modalidades_por_area.clear()
 
 
 def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
@@ -3182,7 +3361,7 @@ def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
     from gspread.utils import rowcol_to_a1
     hoja.batch_update([{"range": rowcol_to_a1(fila, col), "values": [[valor]]}
                        for col, valor in cambios.items()], value_input_option="RAW")
-    _leer_modalidades.clear()
+    _leer_modalidades_por_area.clear()
 
 
 def _autorizar_tramite_directo(folio, numero, autorizar, observaciones=""):
@@ -3241,7 +3420,7 @@ def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo
     from gspread.utils import rowcol_to_a1
     hoja.batch_update([{"range": rowcol_to_a1(fila, columna), "values": [[dato]]}
                        for columna, dato in cambios.items()], value_input_option="RAW")
-    _leer_modalidades.clear()
+    _leer_modalidades_por_area.clear()
 
 
 def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fecha=None, comentario=""):
@@ -3498,6 +3677,32 @@ def _panel_tramites_directos_tte():
 # FORMULARIO DE REGISTRO
 # =========================================================
 
+def _responsables_setf():
+    """Retorna responsables válidos de las cuentas SETF configuradas en Secrets."""
+    if _area_activa_validada() != "setf":
+        return []
+    nombres = []
+    usuarios = st.secrets["usuarios"]
+    for identificador, info in usuarios.items():
+        if not hasattr(info, "get"):
+            continue
+        if str(info.get("area", "diseno")).strip().lower() != "setf":
+            continue
+        nombre = str(info.get("responsable") or info.get("nombre") or "").strip()
+        if nombre and nombre not in nombres:
+            nombres.append(nombre)
+    # Responsable adicional SETF para registrar oficios; no altera permisos de inicio de sesión.
+    if "Ing. Arturo" not in nombres:
+        nombres.append("Ing. Arturo")
+    adicionales = st.secrets["setf"].get("responsables", [])
+    if isinstance(adicionales, list):
+        for nombre in adicionales:
+            nombre = str(nombre).strip()
+            if nombre and nombre not in nombres:
+                nombres.append(nombre)
+    return nombres
+
+
 def formulario_nuevo_oficio():
 
     # Control de limpieza del formulario
@@ -3626,10 +3831,13 @@ def formulario_nuevo_oficio():
         unsafe_allow_html=True
     )
 
-    responsables_disponibles = [
-        "Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
-        "Ricardo", "Magali", "John", "Karina",
-    ]
+    responsables_disponibles = (
+        _responsables_setf() if _area_activa_validada() == "setf"
+        else ["Alejandra", "Alex", "Jesús", "Cecilia", "Tte. Barajas",
+              "Ricardo", "Magali", "John", "Karina"]
+    )
+    if not responsables_disponibles:
+        st.warning("No hay responsables SETF configurados. Agrega al menos un usuario con area = 'setf' en Secrets.")
     if registro_solo_numero_salida:
         # Estos campos no se dibujan arriba ni como placeholders.
         # «numero» recibirá el valor del campo de salida antes de guardar.
@@ -3659,85 +3867,106 @@ def formulario_nuevo_oficio():
 
     col4, col5 = st.columns([1, 1.6])
 
-    with col4:
-        programa = st.selectbox(
-            "Programa",
-            [
-                "Tren Maya",
-                "Trenes del Norte"
-            ],
-            index=None,
-            placeholder="Seleccionar programa",
-            key=f"programa_{version}"
-        )
-
-    with col5:
-        proyecto_nuevo = st.text_input(
-            "Proyecto nuevo (opcional)",
-            placeholder="Escribe aquí si el proyecto no aparece en la lista...",
-            key=f"proyecto_nuevo_{version}"
-        )
-
-    fase = None
-    proyecto_seleccionado = None
-
-    if programa == "Tren Maya":
-        proyecto_seleccionado = st.selectbox(
-            "Proyecto (Tren Maya)",
-            [
-                "Terminales de Carga",
-                "Bases de Mantenimiento",
-                "Vialidades de Acceso a las Edificaciones"
-            ],
-            index=None,
-            placeholder="Seleccionar proyecto",
-            key=f"proyecto_maya_{version}"
-        )
-    elif programa == "Trenes del Norte":
-        fase = st.selectbox(
-            "Fase",
-            [
-                "Ingeniería a Detalle, Fase 1",
-                "Ingeniería Básica, Fase 2"
-            ],
-            index=None,
-            placeholder="Seleccionar fase",
-            key=f"fase_norte_{version}"
-        )
-
-        if fase == "Ingeniería a Detalle, Fase 1":
+    # SETF: catálogo plano, sin programa/fase/subproyecto.
+    # Diseño Geométrico conserva íntegro su catálogo y jerarquía anteriores.
+    if _area_activa_validada() == "setf":
+        with col4:
             proyecto_seleccionado = st.selectbox(
                 "Proyecto",
-                [
-                    "AIFA-Pachuca",
-                    "México-Querétaro"
-                ],
+                ["Tren Maya", "AIFA-Pachuca", "Extensión de Suburbanos Mex-Qro"],
                 index=None,
                 placeholder="Seleccionar proyecto",
-                key=f"proyecto_norte_fase1_{version}"
+                key=f"proyecto_setf_{version}",
             )
-        elif fase == "Ingeniería Básica, Fase 2":
-            proyecto_seleccionado = st.selectbox(
-                "Proyecto",
-                [
-                    "San Luis Potosí-Saltillo",
-                    "Querétaro-San Luis Potosí",
-                    "Mazatlán-Los Mochis",
-                    "Irapuato-Guadalajara"
-                ],
-                index=None,
-                placeholder="Seleccionar proyecto",
-                key=f"proyecto_norte_fase2_{version}"
+        with col5:
+            proyecto_nuevo = st.text_input(
+                "Otro proyecto (si no aparece en la lista)",
+                placeholder="Escribe el nombre del nuevo proyecto...",
+                key=f"proyecto_nuevo_setf_{version}",
             )
-
-    if proyecto_nuevo.strip():
-        proyecto = proyecto_nuevo.strip()
-    elif programa == "Tren Maya" and proyecto_seleccionado:
-        proyecto = f"Tren Maya - {proyecto_seleccionado}"
-    elif programa == "Trenes del Norte" and fase and proyecto_seleccionado:
-        proyecto = f"Trenes del Norte - {fase} - {proyecto_seleccionado}"
+        proyecto = proyecto_nuevo.strip() or (proyecto_seleccionado or "")
+        programa = proyecto
+        fase = None
     else:
-        proyecto = ""
+        with col4:
+            programa = st.selectbox(
+                "Programa",
+                [
+                    "Tren Maya",
+                    "Trenes del Norte"
+                ],
+                index=None,
+                placeholder="Seleccionar programa",
+                key=f"programa_{version}"
+            )
+
+        with col5:
+            proyecto_nuevo = st.text_input(
+                "Proyecto nuevo (opcional)",
+                placeholder="Escribe aquí si el proyecto no aparece en la lista...",
+                key=f"proyecto_nuevo_{version}"
+            )
+
+        fase = None
+        proyecto_seleccionado = None
+
+        if programa == "Tren Maya":
+            proyecto_seleccionado = st.selectbox(
+                "Proyecto (Tren Maya)",
+                [
+                    "Terminales de Carga",
+                    "Bases de Mantenimiento",
+                    "Vialidades de Acceso a las Edificaciones"
+                ],
+                index=None,
+                placeholder="Seleccionar proyecto",
+                key=f"proyecto_maya_{version}"
+            )
+        elif programa == "Trenes del Norte":
+            fase = st.selectbox(
+                "Fase",
+                [
+                    "Ingeniería a Detalle, Fase 1",
+                    "Ingeniería Básica, Fase 2"
+                ],
+                index=None,
+                placeholder="Seleccionar fase",
+                key=f"fase_norte_{version}"
+            )
+
+            if fase == "Ingeniería a Detalle, Fase 1":
+                proyecto_seleccionado = st.selectbox(
+                    "Proyecto",
+                    [
+                        "AIFA-Pachuca",
+                        "México-Querétaro"
+                    ],
+                    index=None,
+                    placeholder="Seleccionar proyecto",
+                    key=f"proyecto_norte_fase1_{version}"
+                )
+            elif fase == "Ingeniería Básica, Fase 2":
+                proyecto_seleccionado = st.selectbox(
+                    "Proyecto",
+                    [
+                        "San Luis Potosí-Saltillo",
+                        "Querétaro-San Luis Potosí",
+                        "Mazatlán-Los Mochis",
+                        "Irapuato-Guadalajara"
+                    ],
+                    index=None,
+                    placeholder="Seleccionar proyecto",
+                    key=f"proyecto_norte_fase2_{version}"
+                )
+
+        if proyecto_nuevo.strip():
+            proyecto = proyecto_nuevo.strip()
+        elif programa == "Tren Maya" and proyecto_seleccionado:
+            proyecto = f"Tren Maya - {proyecto_seleccionado}"
+        elif programa == "Trenes del Norte" and fase and proyecto_seleccionado:
+            proyecto = f"Trenes del Norte - {fase} - {proyecto_seleccionado}"
+        else:
+            proyecto = ""
 
     if registro_solo_numero_salida:
         # El responsable sigue siendo necesario para permisos y seguimiento.
@@ -4174,9 +4403,13 @@ COLUMNAS_EVENTOS_VINCULOS = [
     "Documento anterior", "Documento nuevo",
 ]
 
-@st.cache_resource(show_spinner=False)
 def _hoja_eventos_vinculos():
-    libro = conectar_google_sheets().spreadsheet
+    return _hoja_eventos_vinculos_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_eventos_vinculos_por_area(area):
+    libro = conectar_google_sheets_por_area(area).spreadsheet
     try:
         hoja = libro.worksheet("EVENTOS_VINCULOS")
     except gspread.WorksheetNotFound:
@@ -4188,6 +4421,8 @@ def _hoja_eventos_vinculos():
 
 
 def _permiso_vinculos(oficio):
+    if _area_activa_validada() == "setf":
+        return es_administrador_documental_setf()
     return es_administrador() or puede_editar_responsable(oficio.get("Responsable", ""))
 
 
@@ -5527,6 +5762,26 @@ def mostrar_mis_pendientes():
     import html
 
     mostrar_sesion()
+    # Compactar 75 % el espacio entre la cabecera institucional y el panel
+    # principal de Mis pendientes, tanto en Diseño Geométrico como en SETF.
+    # Mayor especificidad para prevalecer sobre los estilos heredados.
+    st.markdown("""<style>
+      @media (min-width: 1050px) {
+        html body .stMainBlockContainer:has(.pend-hero) .pend-hero {
+          margin-top: -59px !important;
+        }
+      }
+      @media (min-width: 720px) and (max-width: 1049px) {
+        html body .stMainBlockContainer:has(.pend-hero) .pend-hero {
+          margin-top: -42px !important;
+        }
+      }
+      @media (max-width: 719px) {
+        html body .stMainBlockContainer:has(.pend-hero) .pend-hero {
+          margin-top: 0 !important;
+        }
+      }
+    </style>""", unsafe_allow_html=True)
     # Imagen con transparencia solicitada; un SVG técnico queda como respaldo.
     imagen_pendientes = (_imagen_selector("banner_mis_pendientes.png")
                           or _imagen_selector("trazo_pendientes.png"))
@@ -5537,7 +5792,7 @@ def mostrar_mis_pendientes():
         f'<span class="pend-hero-illustration" style="background-image:url(\'{imagen_pendientes}\')" aria-hidden="true"></span>'
         if imagen_pendientes else ''
     )
-    st.markdown(f"""
+    st.markdown(_rotulos_area(f"""
     <div class="pend-hero">
       {ilustracion_pendientes}
       <div class="pend-hero-copy">
@@ -5548,7 +5803,7 @@ def mostrar_mis_pendientes():
       </div>
       <div class="pend-hero-track">TRAZO &nbsp; / &nbsp; ALINEAMIENTO &nbsp; / &nbsp; RASANTE</div>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
 
     registros = obtener_oficios()
     if registros.empty:
@@ -5780,9 +6035,11 @@ def mostrar_mis_pendientes():
 
                     if st.session_state.get("pend_expediente_abierto") == identidad:
                         autorizado = puede_editar_responsable(responsable)
+                        edicion_general = (autorizado if _area_activa_validada() != "setf"
+                                           else es_administrador_documental_setf())
                         if not autorizado:
                             st.info("Tienes acceso de consulta, pero no permiso para editar este oficio.")
-                        else:
+                        if edicion_general:
                             # Se conserva el encabezado del oficio; solo cambia el panel editable.
                             with st.container(border=True, key="pend_editor"):
                                 st.markdown(
@@ -6341,23 +6598,55 @@ def mostrar_cabecera_documental():
     </style>
     """, unsafe_allow_html=True)
 
+    # Logotipo de SETF: tamaño apropiado para la rodela circular, sin afectar a DG.
+    if _area_activa_validada() == "setf":
+        st.markdown("""<style>
+          .st-key-cabecera_documental [data-testid="stImage"] {
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+          }
+          .st-key-cabecera_documental [data-testid="stImage"] img {
+            max-height: 94px !important;
+            max-width: 94px !important;
+            height: 94px !important;
+            width: 94px !important;
+            object-fit: contain !important;
+            margin: 0 auto !important;
+            filter: drop-shadow(0 2px 3px rgba(0,0,0,.18));
+          }
+        </style>""", unsafe_allow_html=True)
+
     nombre = str(st.session_state.get("usuario_actual") or "").strip()
     if identificador_sesion() == "alondra":
         nombre = "Tte. Alondra Barajas"
-    logo = ASSETS_DIR / "logo_selector.png"
-    if not logo.is_file():
+    # SOLO SETF: usar el emblema institucional ya guardado como
+    # assets/logo_selector.png, sin renombrarlo ni moverlo. No afecta al
+    # selector de áreas ni a la rodela SETF de la barra lateral.
+    # Diseño Geométrico conserva su logotipo y las medidas originales.
+    es_setf = _area_activa_validada() == "setf"
+    if es_setf:
+        logo = ASSETS_DIR / "logo_selector.png"
+        if not logo.is_file():
+            st.error("Falta assets/logo_selector.png para el encabezado de SETF. "
+                     "Comprueba que esté dentro de la carpeta assets.")
+    else:
         logo = ASSETS_DIR / "logo_diseno_geometrico.png"
+        if not logo.is_file():
+            logo = ASSETS_DIR / "logo_selector.png"  # Respaldo original de DG.
 
     with st.container(key="cabecera_documental"):
+        columnas_cabecera = ([0.85, 3.0, 1.8, 1.65, 1.4]
+                            if es_setf else [0.65, 3.2, 1.8, 1.65, 1.4])
         col_logo, col_marca, col_sesion, col_area, col_salir = st.columns(
-            [0.65, 3.2, 1.8, 1.65, 1.4], vertical_alignment="center", gap="small"
+            columnas_cabecera, vertical_alignment="center", gap="small"
         )
         with col_logo:
             if logo.is_file():
-                st.image(str(logo), width=59)
+                st.image(str(logo), width=94 if es_setf else 59)
         with col_marca:
-            st.markdown("""<div style="font-weight:800;font-size:21px;letter-spacing:1.2px;line-height:1.2;color:#fff">CONTROL DOCUMENTAL</div>
-            <div style="margin-top:4px;color:#B8C8D3;font-size:10px;font-weight:700;letter-spacing:2px">MESA DE DISEÑO GEOMÉTRICO</div>""", unsafe_allow_html=True)
+            st.markdown(_rotulos_area("""<div style="font-weight:800;font-size:21px;letter-spacing:1.2px;line-height:1.2;color:#fff">CONTROL DOCUMENTAL</div>
+            <div style="margin-top:4px;color:#B8C8D3;font-size:10px;font-weight:700;letter-spacing:2px">MESA DE DISEÑO GEOMÉTRICO</div>"""), unsafe_allow_html=True)
         with col_sesion:
             st.markdown(
                 '<div style="text-align:right;color:#C7D6E0;font-size:11px">Sesión activa</div>'
@@ -6376,7 +6665,79 @@ def mostrar_cabecera_documental():
                 _cerrar_sesion_desde_cabecera()
 
 
-if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados"):
+# =========================================================
+# SETF · FONDOS INDEPENDIENTES POR APARTADO
+# =========================================================
+# Solo cambia la presentación. Las consultas, permisos, los widgets y los
+# procesos de Google Sheets/Drive son los mismos que en la versión anterior.
+# Los archivos se guardan en assets/ y NO se incluyen en este app.py.
+_FONDOS_SETf_POR_PAGINA = {
+    "oficios": "fondo_setf_oficios.png",
+    "pendientes": "fondo_setf_pendientes.png",
+    "urgentes": "fondo_setf_urgentes.png",
+    "firmados": "fondo_setf_firmados.png",
+    "minutas": "fondo_minutas_setf.png",  # Fondo exclusivo del módulo Minutas SETF.
+}
+
+
+@st.cache_data(show_spinner=False)
+def _imagen_setf_pagina_cacheada(ruta_absoluta, fecha_modificacion_ns):
+    """Evita recodificar los PNG grandes ante cada interacción de Streamlit."""
+    ruta = Path(ruta_absoluta)
+    if not ruta.is_file():
+        return ""
+    return base64.b64encode(ruta.read_bytes()).decode("ascii")
+
+
+def aplicar_fondo_setf_por_pagina():
+    """Fondo de TODA la página, nunca del banner ni de las tarjetas."""
+    if _area_activa_validada() != "setf":
+        return
+    nombre = _FONDOS_SETf_POR_PAGINA.get(st.session_state.get("menu_activo"))
+    if not nombre:
+        return  # Home y Módulo de planos conservan sus fondos actuales.
+
+    ruta = ASSETS_DIR / nombre
+    if ruta.is_file():
+        imagen = _imagen_setf_pagina_cacheada(str(ruta), ruta.stat().st_mtime_ns)
+        imagen_css = (
+            'linear-gradient(rgba(250,252,253,.13),rgba(250,252,253,.17)),'
+            f'url("data:image/png;base64,{imagen}")'
+        )
+    else:
+        # No utilizar accidentalmente el plano de DG cuando falte un PNG SETF.
+        imagen_css = 'linear-gradient(140deg,#fcfcfb 0%,#f4f8f9 100%)'
+
+    # Especificidad superior a los estilos heredados de DG y a los fondos
+    # de Urgentes/Firmados que se inyectan después, también con !important.
+    selector = ('html body [data-testid="stAppViewContainer"]'
+                '[data-testid="stAppViewContainer"]'
+                '[data-testid="stAppViewContainer"]')
+    st.markdown(f"""<style>
+    {selector} {{
+        background-color: #f9fbfc !important;
+        background-image: {imagen_css} !important;
+        background-size: cover !important;
+        background-position: center center !important;
+        background-repeat: no-repeat !important;
+        background-attachment: fixed !important;
+    }}
+    {selector} [data-testid="stMain"],
+    {selector} > .main,
+    {selector} [data-testid="stHeader"] {{
+        background-color: transparent !important;
+    }}
+    @media (max-width: 760px) {{
+        {selector} {{
+            background-attachment: scroll !important;
+            background-position: center top !important;
+        }}
+    }}
+    </style>""", unsafe_allow_html=True)
+
+
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
+    aplicar_fondo_setf_por_pagina()
     mostrar_cabecera_documental()
 
 
@@ -6385,23 +6746,28 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
 # =========================================================
 # Mantener la misma estructura de widgets y las mismas claves entre
 # pantallas evita desmontajes innecesarios durante la navegación.
-if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados"):
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
     # Imagen de la barra lateral: independiente del fondo del área principal.
     # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
-    ruta_fondo_sidebar = next((ruta for ruta in (
-        *(ASSETS_DIR / f"fondo_sidebar{ext}" for ext in
-          (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")),
-        ASSETS_DIR / "fondo_ferroviario.png",
-        ASSETS_DIR / "fondo_pendientes.png",
-        ASSETS_DIR / "fondo_oficios.png",
-    ) if ruta.is_file()), None)
+    if _area_activa_validada() == "setf":
+        # No mostrar el fondo lateral de Diseño Geométrico dentro de SETF.
+        ruta_setf_sidebar = ASSETS_DIR / "fondo_sidebar_setf.png"
+        ruta_fondo_sidebar = ruta_setf_sidebar if ruta_setf_sidebar.is_file() else None
+    else:
+        ruta_fondo_sidebar = next((ruta for ruta in (
+            *(ASSETS_DIR / f"fondo_sidebar{ext}" for ext in
+              (".png", ".jpg", ".jpeg", ".webp", ".PNG", ".JPG", ".JPEG", ".WEBP")),
+            ASSETS_DIR / "fondo_ferroviario.png",
+            ASSETS_DIR / "fondo_pendientes.png",
+            ASSETS_DIR / "fondo_oficios.png",
+        ) if ruta.is_file()), None)
     fondo_sidebar_css = ""
     if ruta_fondo_sidebar is not None:
         extension = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png",
                      ".webp": "webp"}[ruta_fondo_sidebar.suffix.lower()]
         imagen_sidebar = base64.b64encode(ruta_fondo_sidebar.read_bytes()).decode("ascii")
         # La imagen personalizada ya es clara: evitar que una capa opaca la oculte.
-        es_personalizado = ruta_fondo_sidebar.stem.lower() == "fondo_sidebar"
+        es_personalizado = ruta_fondo_sidebar.stem.lower() in ("fondo_sidebar", "fondo_sidebar_setf")
         opacidad = ".20" if es_personalizado else ".87"
         opacidad_final = ".25" if es_personalizado else ".91"
         fondo_sidebar_css = (
@@ -6477,7 +6843,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
     """.replace("__FONDO_SIDEBAR__", fondo_sidebar_css).replace(
         "__ACTIVE_NAV_CSS__",
         '[data-testid="stSidebar"] [class*="st-key-nav_compartida_' +
-        {"oficios": "inicio", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados"}.get(
+        {"oficios": "oficios", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados", "minutas": "minutas"}.get(
             st.session_state.menu_activo, "inicio") +
         '"] button {background:linear-gradient(120deg,#4A4C44,#55574D) !important;'
         'border:1px solid #C7A465 !important;border-left:6px solid #E2B66B !important;'
@@ -6485,19 +6851,29 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
         'transform:translateX(2px) !important;}'
     ), unsafe_allow_html=True)
     with st.sidebar:
-        ruta_logo = BASE_DIR / "assets" / "logo_diseno_geometrico.png"
+        ruta_logo = BASE_DIR / "assets" / ("logo_setf.png" if _area_activa_validada() == "setf" else "logo_diseno_geometrico.png")
         if ruta_logo.is_file():
             # Widget nativo en vez de inyectar <img> con una cadena base64.
-            _, columna_logo, _ = st.columns([0.35, 5.3, 0.35])
+            _, columna_logo, _ = st.columns(
+                [0.10, 5.8, 0.10] if _area_activa_validada() == "setf"
+                else [0.35, 5.3, 0.35]
+            )
             with columna_logo:
-                st.image(str(ruta_logo), use_container_width=True)
+                if _area_activa_validada() == "setf":
+                    st.image(str(ruta_logo), width=186)
+                else:
+                    st.image(str(ruta_logo), use_container_width=True)
         st.markdown(
-            '<div class="cd-sidebar-title">CONTROL DOCUMENTAL</div>'
-            '<div class="cd-sidebar-subtitle">Mesa de Diseño Geométrico</div>',
+            _rotulos_area('<div class="cd-sidebar-title">CONTROL DOCUMENTAL</div>'
+            '<div class="cd-sidebar-subtitle">Mesa de Diseño Geométrico</div>'),
             unsafe_allow_html=True,
         )
         if st.button("⌂ Menú principal", key="nav_compartida_inicio", use_container_width=True):
             navegar_a("home")
+        # Acceso directo desde la barra lateral a Oficios en trámite, en DG y SETF.
+        if st.button("▦ Oficios en trámite", key="nav_compartida_oficios", use_container_width=True):
+            if st.session_state.menu_activo != "oficios":
+                navegar_a("oficios")
         if st.button("▤ Mis pendientes", key="nav_compartida_pendientes", use_container_width=True):
             if st.session_state.menu_activo != "pendientes":
                 navegar_a("pendientes")
@@ -6507,6 +6883,9 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
         if st.button("▣ Firmados", key="nav_compartida_firmados", use_container_width=True):
             if st.session_state.menu_activo != "firmados":
                 navegar_a("firmados")
+        if st.button("▤ Minutas", key="nav_compartida_minutas", use_container_width=True):
+            if st.session_state.menu_activo != "minutas":
+                navegar_a("minutas")
         st.divider()
 
 # Fondo de trabajo: conserva el plano ferroviario visible detrás de las tarjetas.
@@ -6516,9 +6895,13 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
 # =========================================================
 # MÓDULOS LATERALES: URGENTES Y FIRMADOS
 # =========================================================
-@st.cache_resource(show_spinner=False)
 def _hoja_urgencias():
-    libro = conectar_google_sheets().spreadsheet
+    return _hoja_urgencias_por_area(_area_activa_validada())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_urgencias_por_area(area):
+    libro = conectar_google_sheets_por_area(area).spreadsheet
     columnas = ["Folio", "No. de oficio", "Urgente", "Actualizado por", "Fecha actualización"]
     try:
         hoja = libro.worksheet("URGENCIAS")
@@ -6617,7 +7000,7 @@ def _modulo_lateral_documentos(tipo):
             fondo_css = 'background:#edf0ed !important;'
             st.caption("Fondo opcional: agrega assets/fondo_firmados.png a tu proyecto y reinicia Streamlit.")
 
-        st.markdown("""
+        st.markdown(_rotulos_area("""
         <style>
         [data-testid="stAppViewContainer"]:has(.firm-hero) { __FONDO__ }
         [data-testid="stAppViewContainer"]:has(.firm-hero) [data-testid="stMain"],
@@ -6828,6 +7211,97 @@ def _modulo_lateral_documentos(tipo):
         }
         .firm-admin-edit {margin:18px 0 7px;}
         .firm-caption {margin:7px 0 12px!important;}
+
+        /* ARCHIVO FIRMADO / BARRA DE CONSULTA INSTITUCIONAL */
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] {
+            position:relative!important;
+            isolation:isolate!important;
+            background:linear-gradient(115deg,rgba(252,254,251,.98),rgba(237,245,238,.98))!important;
+            border:1px solid #A9BEB0!important;
+            border-left:4px solid #B79965!important;
+            border-radius:15px!important;
+            padding:18px 22px 20px!important;
+            margin:14px 0 23px!important;
+            box-shadow:0 7px 20px rgba(33,59,45,.09)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] .firm-search-head {
+            display:flex;justify-content:space-between;align-items:flex-end;
+            gap:16px;margin-bottom:16px;padding-bottom:12px;
+            border-bottom:1px solid rgba(131,157,139,.29);
+        }
+        .firm-search-head-left {display:flex;flex-direction:column;gap:4px;min-width:0;}
+        .firm-search-eyebrow {
+            font-size:9px!important;letter-spacing:1.7px;font-weight:800;
+            color:#A07D52!important;
+        }
+        .firm-search-title {
+            color:#294B3B!important;font-size:18px!important;
+            line-height:1.15!important;font-weight:800!important;
+        }
+        .firm-search-hint {
+            font-size:10px!important;letter-spacing:.25px;
+            color:#658071!important;text-align:right;white-space:nowrap;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stHorizontalBlock"] {
+            align-items:flex-end!important;gap:16px!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] label,
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] label p {
+            color:#476457!important;font-size:11px!important;
+            font-weight:700!important;letter-spacing:.1px;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stTextInput"] input {
+            background-color:#FFFEFC!important;
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM2NTg1NzMiIHN0cm9rZS13aWR0aD0iMS45IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxjaXJjbGUgY3g9IjEwLjgiIGN5PSIxMC44IiByPSI2LjgiLz48cGF0aCBkPSJtMTYgMTYgNC41IDQuNSIvPjwvc3ZnPg==")!important;
+            background-repeat:no-repeat!important;
+            background-position:15px center!important;
+            background-size:19px 19px!important;
+            padding-left:44px!important;
+            border:1.5px solid #B4C7B8!important;
+            border-radius:10px!important;
+            min-height:47px!important;
+            color:#243D32!important;
+            box-shadow:0 2px 6px rgba(39,63,48,.035)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stTextInput"] input::placeholder {
+            color:#8B9F92!important;opacity:1!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stTextInput"] input:focus {
+            border-color:#5B8368!important;
+            box-shadow:0 0 0 3px rgba(95,136,108,.15)!important;
+            outline:none!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+            min-height:47px!important;
+            background:#FFFEFC!important;
+            border:1.5px solid #B4C7B8!important;
+            border-radius:10px!important;
+            box-shadow:0 2px 6px rgba(39,63,48,.035)!important;
+            color:#294B3B!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [data-testid="stSelectbox"] [data-baseweb="select"] > div:focus-within {
+            border-color:#5B8368!important;
+            box-shadow:0 0 0 3px rgba(95,136,108,.15)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [class*="st-key-firm_limpiar"] button {
+            min-height:47px!important;
+            border:1px solid #365C48!important;
+            background:#365C48!important;
+            color:#FFFFFF!important;
+            border-radius:10px!important;
+            font-size:12px!important;font-weight:750!important;
+            box-shadow:0 3px 10px rgba(37,67,49,.14)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_search_panel"] [class*="st-key-firm_limpiar"] button:hover {
+            background:#46745A!important;border-color:#46745A!important;
+            box-shadow:0 5px 13px rgba(37,67,49,.18)!important;
+        }
+        @media(max-width:900px) {
+            div[class*="st-key-firm_search_panel"] {padding:15px!important;}
+            div[class*="st-key-firm_search_panel"] .firm-search-head {align-items:flex-start;flex-wrap:wrap;}
+            .firm-search-hint {text-align:left;white-space:normal;}
+            div[class*="st-key-firm_search_panel"] [data-testid="stHorizontalBlock"] {gap:9px!important;}
+        }
         @media(max-width:900px){
             div[class*="st-key-firm_reg_row_"] {padding:11px!important;}
             div[class*="st-key-firm_reg_row_"] .stLinkButton a,
@@ -6861,7 +7335,7 @@ def _modulo_lateral_documentos(tipo):
           </svg>
           <span class="firm-signature">REGISTRO · VALIDACIÓN · ARCHIVO</span>
         </div>
-        """.replace("__FONDO__", fondo_css), unsafe_allow_html=True)
+        """.replace("__FONDO__", fondo_css)), unsafe_allow_html=True)
 
         try:
             registros = _leer_registros_oficios()
@@ -7028,25 +7502,40 @@ def _modulo_lateral_documentos(tipo):
             st.button("← Ver todos los oficios firmados", key="firm_kpi_ver_todos",
                       on_click=_cambiar_vista_firmados, args=("todos",))
 
-        st.markdown('<div class="firm-label">CONSULTA DE EXPEDIENTES</div>',
-                    unsafe_allow_html=True)
         def _limpiar_filtros_firmados():
             # Los callbacks se ejecutan antes de instanciar los widgets del rerun.
             st.session_state["buscar_firmados"] = ""
             st.session_state["firm_orden"] = "Más recientes"
 
-        buscar_col, orden_col, limpiar_col = st.columns([5, 2.2, 1.5], gap="small")
-        with buscar_col:
-            consulta = st.text_input("Buscar por folio, número o asunto",
-                                    placeholder="Folio, número de oficio o asunto...",
-                                    key="buscar_firmados")
-        with orden_col:
-            orden = st.selectbox("Ordenar", ["Más recientes", "Más antiguos", "Número de oficio"],
-                                 key="firm_orden")
-        with limpiar_col:
-            st.markdown('<div style="height:28px"></div>', unsafe_allow_html=True)
-            st.button("Limpiar filtros", key="firm_limpiar", use_container_width=True,
-                      on_click=_limpiar_filtros_firmados)
+        # Barra institucional de consulta: un solo contenedor visual para
+        # búsqueda, ordenamiento y limpieza. Conserva las claves y callbacks.
+        with st.container(key="firm_search_panel"):
+            st.markdown("""
+              <div class="firm-search-head">
+                <div class="firm-search-head-left">
+                  <span class="firm-search-eyebrow">ARCHIVO DOCUMENTAL / CONSULTA</span>
+                  <div class="firm-search-title">Localizar expediente</div>
+                </div>
+                <span class="firm-search-hint">Folio · Oficio · Asunto · Responsable</span>
+              </div>
+              """, unsafe_allow_html=True)
+            buscar_col, orden_col, limpiar_col = st.columns([5.1, 2.1, 1.55], gap="medium", vertical_alignment="bottom")
+            with buscar_col:
+                consulta = st.text_input(
+                    "Buscar documento",
+                    placeholder="Buscar por folio, número, asunto o responsable...",
+                    key="buscar_firmados",
+                )
+            with orden_col:
+                orden = st.selectbox(
+                    "Ordenar por", ["Más recientes", "Más antiguos", "Número de oficio"],
+                    key="firm_orden",
+                )
+            with limpiar_col:
+                st.button(
+                    "Limpiar filtros", key="firm_limpiar", use_container_width=True,
+                    on_click=_limpiar_filtros_firmados,
+                )
 
         if consulta.strip():
             q = normalizar_texto(consulta)
@@ -7520,7 +8009,7 @@ def _modulo_lateral_documentos(tipo):
     max_antiguedad = max(antiguedades) if antiguedades else None
 
     # No se usa imagen adicional: este trazo SVG se integra en el encabezado.
-    st.markdown(f"""
+    st.markdown(_rotulos_area(f"""
     <div class="urg-hero">
       <svg class="urg-trazo" viewBox="0 0 600 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
         <g fill="none" stroke="#D8C6B4" stroke-width=".7" opacity=".43">
@@ -7540,7 +8029,96 @@ def _modulo_lateral_documentos(tipo):
       </div>
       <div class="urg-count"><strong>{len(lista):02d}</strong><span>Urgentes activos</span></div>
     </div>
-    """, unsafe_allow_html=True)
+    """), unsafe_allow_html=True)
+
+    # SETF: el banner antes café ahora sigue la identidad azul petróleo.
+    # El buscador y las tarjetas conservan íntegra la lógica de urgencias.
+    if _area_activa_validada() == "setf":
+        st.markdown("""<style>
+        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero {
+            background:linear-gradient(112deg,#142D40 0%,#1B3D50 62%,#315264 100%)!important;
+            border:1px solid #8A9FA9!important;border-left:5px solid #BC9863!important;
+            box-shadow:0 10px 24px rgba(22,46,61,.12)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero .urg-count {
+            background:rgba(219,232,240,.10)!important;
+            border:1px solid rgba(205,221,229,.42)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero .urg-count strong {color:#FFF9EC!important;}
+        .urg-kpi--urgent {--urg-accent:#AC5848;--urg-tint:#FBF1ED;--urg-border:#D1A292;}
+        .urg-kpi--soon   {--urg-accent:#AA8150;--urg-tint:#F8F3E9;--urg-border:#D6C19B;}
+        .urg-kpi--manual {--urg-accent:#466B82;--urg-tint:#EEF3F6;--urg-border:#9DB4C2;}
+        .urg-kpi .value, .urg-kpi .label {color:#21394A!important;}
+        .urg-kpi .small {color:#647A89!important;}
+        /* Tarjeta de búsqueda SETF, inspirada en el buscador de Firmados. */
+        [data-testid="stAppViewContainer"]:has(.urg-hero) .st-key-urgentes_busqueda_setf {
+            background:linear-gradient(110deg,rgba(253,252,248,.97),rgba(236,242,245,.96))!important;
+            border:1px solid #A7BBC5!important;
+            border-left:4px solid #B99564!important;
+            border-radius:15px!important;
+            padding:17px 21px 18px!important;
+            margin:12px 0 18px!important;
+            box-shadow:0 7px 19px rgba(32,55,69,.10)!important;
+        }
+        .st-key-urgentes_busqueda_setf .urg-search-header {
+            display:flex;align-items:flex-end;justify-content:space-between;
+            gap:13px;flex-wrap:wrap;margin:0 0 13px;padding:0 0 12px;
+            border-bottom:1px solid rgba(119,146,161,.27);
+        }
+        .st-key-urgentes_busqueda_setf .urg-search-eyebrow {
+            color:#A0794B!important;font-size:9px!important;font-weight:800;
+            letter-spacing:1.6px;margin-bottom:4px;
+        }
+        .st-key-urgentes_busqueda_setf .urg-search-title {
+            color:#244457!important;font-size:18px!important;font-weight:800;
+            line-height:1.15;
+        }
+        .st-key-urgentes_busqueda_setf .urg-search-hint {
+            color:#6B8595!important;font-size:10px!important;
+            letter-spacing:.15px;text-align:right;
+        }
+        .st-key-urgentes_busqueda_setf [data-testid="stHorizontalBlock"] {
+            align-items:flex-end!important;gap:12px!important;
+        }
+        .st-key-urgentes_busqueda_setf label,
+        .st-key-urgentes_busqueda_setf label p {
+            color:#3D6074!important;font-weight:750!important;font-size:11px!important;
+        }
+        .st-key-urgentes_busqueda_setf [data-testid="stTextInput"] input {
+            min-height:46px!important;background-color:#FFFEFB!important;
+            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM2NTg1NzMiIHN0cm9rZS13aWR0aD0iMS45IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxjaXJjbGUgY3g9IjEwLjgiIGN5PSIxMC44IiByPSI2LjgiLz48cGF0aCBkPSJtMTYgMTYgNC41IDQuNSIvPjwvc3ZnPg==")!important;
+            background-repeat:no-repeat!important;
+            background-position:13px center!important;
+            background-size:18px 18px!important;
+            padding-left:42px!important;
+            border:1.5px solid #A6BBC7!important;border-radius:10px!important;
+            color:#203C4B!important;box-shadow:0 2px 6px rgba(32,60,75,.035)!important;
+        }
+        .st-key-urgentes_busqueda_setf [data-testid="stTextInput"] input:focus {
+            border-color:#52798D!important;outline:none!important;
+            box-shadow:0 0 0 3px rgba(87,126,144,.15)!important;
+        }
+        .st-key-urgentes_busqueda_setf [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+            min-height:46px!important;background:#FFFEFB!important;
+            border:1.5px solid #A6BBC7!important;border-radius:10px!important;
+            color:#203C4B!important;
+        }
+        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button {
+            background:#244A60!important;border:1px solid #244A60!important;
+            min-height:46px!important;border-radius:10px!important;
+            color:#FFFFFF!important;font-weight:750!important;
+            box-shadow:0 3px 10px rgba(27,61,80,.15)!important;
+        }
+        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button:hover {
+            background:#35627A!important;border-color:#35627A!important;
+        }
+        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button * {color:#FFF!important;}
+        @media(max-width:900px){
+          .st-key-urgentes_busqueda_setf {padding:13px!important;}
+          .st-key-urgentes_busqueda_setf .urg-search-hint {text-align:left;}
+          .st-key-urgentes_busqueda_setf [data-testid="stHorizontalBlock"] {gap:8px!important;}
+        }
+        </style>""", unsafe_allow_html=True)
 
     kpis = (
         (len(lista), "Urgentes activos", "En seguimiento prioritario", "urgent"),
@@ -7599,21 +8177,36 @@ def _modulo_lateral_documentos(tipo):
         f'{str(max_antiguedad) + " días" if max_antiguedad is not None else "—"}'
         '</div></div>', unsafe_allow_html=True)
 
-    # Se conservan el filtro por estatus y la búsqueda existente.
-    col_buscar, col_estado, col_limpiar = st.columns([5, 2, 1.4], gap="small")
-    with col_buscar:
-        consulta = st.text_input("Buscar", placeholder="Folio, oficio, asunto o responsable...",
-                                 key="buscar_urgentes")
-    estados = sorted({str(r.get("Estatus", "")).strip() for r in lista
-                      if str(r.get("Estatus", "")).strip()})
-    with col_estado:
-        estado = st.selectbox("Filtrar por estado", ["Todos"] + estados, key="urgentes_estado")
-    with col_limpiar:
-        st.write("")
-        if st.button("Limpiar filtros", key="urgentes_limpiar", use_container_width=True):
-            st.session_state["buscar_urgentes"] = ""
-            st.session_state["urgentes_estado"] = "Todos"
-            st.rerun()
+    # Se mantienen los filtros, keys y lógica de búsqueda originales.
+    # Solo SETF recibe la presentación de buscador institucional.
+    from contextlib import nullcontext
+    _panel_urg = (st.container(key="urgentes_busqueda_setf")
+                  if _area_activa_validada() == "setf" else nullcontext())
+    def _limpiar_filtros_urgentes_callback():
+        # Streamlit ejecuta callbacks antes de construir los widgets del nuevo ciclo.
+        # Así evitamos modificar el estado después de instanciar la búsqueda.
+        st.session_state["buscar_urgentes"] = ""
+        st.session_state["urgentes_estado"] = "Todos"
+
+    with _panel_urg:
+        if _area_activa_validada() == "setf":
+            st.markdown('''<div class="urg-search-header">
+                <div><div class="urg-search-eyebrow">CONSULTA PRIORITARIA · EXPEDIENTES</div>
+                <div class="urg-search-title">Localizar expediente</div></div>
+                <div class="urg-search-hint">Folio · Oficio · Asunto · Responsable</div>
+                </div>''', unsafe_allow_html=True)
+        col_buscar, col_estado, col_limpiar = st.columns([5, 2, 1.6], gap="small")
+        with col_buscar:
+            consulta = st.text_input("Buscar", placeholder="Folio, oficio, asunto o responsable...",
+                                     key="buscar_urgentes")
+        estados = sorted({str(r.get("Estatus", "")).strip() for r in lista
+                          if str(r.get("Estatus", "")).strip()})
+        with col_estado:
+            estado = st.selectbox("Filtrar por estado", ["Todos"] + estados, key="urgentes_estado")
+        with col_limpiar:
+            st.write("")
+            st.button("Limpiar filtros", key="urgentes_limpiar",
+                      use_container_width=True, on_click=_limpiar_filtros_urgentes_callback)
     filtrados = lista
     if consulta.strip():
         buscado = normalizar_texto(consulta)
@@ -7695,13 +8288,811 @@ def _modulo_lateral_documentos(tipo):
 # HOME
 # =========================================================
 
+# =========================================================
+# MINUTAS · CONTROL INTERNO SETF (INDEPENDIENTE DE OFICIOS)
+# =========================================================
+# [setf].minutas_spreadsheet_id apunta al archivo "Control Interno SETF".
+# Su pestaña MINUTAS (A-D) se trata como registro maestro EXISTENTE.
+# Si hay un folio reservado por sus fórmulas, se rellena B:D sin tocar A.
+# Las minutas externas nuevas se guardan en MINUTAS_EXTERNAS_APP para NO
+# interferir con el consecutivo que calcula la hoja original.
+
+_MINUTAS_PATRON_SETf = re.compile(r"^AIFA-ITEyPF-(?:CAT|SETF)-(\d{4})-(\d{4})$", re.IGNORECASE)
+_MINUTAS_EXTERNAS_CAMPOS = [
+    "Clave externa", "Asunto", "Fecha", "Proyecto", "Enlace",
+    "Registrado por", "Fecha de registro",
+]
+
+
+def _id_libro_minutas_setf():
+    try:
+        conf = st.secrets["setf"]
+        valor = str(conf.get("minutas_spreadsheet_id", "")).strip()
+    except (FileNotFoundError, KeyError, TypeError):
+        valor = ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", valor):
+        raise ValueError(
+            'Agrega minutas_spreadsheet_id = "ID_DEL_CONTROL_INTERNO_SETF" '
+            'dentro de [setf] en .streamlit/secrets.toml.'
+        )
+    return valor
+
+
+def _hoja_minutas_setf():
+    """Obtiene MINUTAS en el libro correcto, sin abrir nunca el libro DG."""
+    if _area_activa_validada() != "setf":
+        raise PermissionError("La gestión de minutas de SETF no está disponible en DG.")
+    identificador = _id_libro_minutas_setf()
+    hoja_oficios = conectar_google_sheets_por_area("setf")
+    cliente = hoja_oficios.spreadsheet.client
+    libro = cliente.open_by_key(identificador)
+    try:
+        hoja = libro.worksheet("MINUTAS")
+    except gspread.WorksheetNotFound as exc:
+        raise ValueError('No se encontró la pestaña "MINUTAS" en Control Interno SETF.') from exc
+    return libro, hoja
+
+
+def _filas_minutas_setf(hoja):
+    """Primera columna: folio; B asunto; C fecha; D proyecto.
+
+    La fila 1 es encabezado. Evitar get_all_records porque hay códigos
+    reservados y celdas con hipervínculos, no una tabla convencional.
+    """
+    valores = hoja.get_all_values()
+    salida = []
+    for idx, valores_fila in enumerate(valores[1:], start=2):
+        datos = (list(valores_fila) + [""] * 4)[:4]
+        clave, asunto, fecha, proyecto = (str(v).strip() for v in datos)
+        if not any((clave, asunto, fecha, proyecto)):
+            continue
+        if not clave and not asunto:
+            continue
+        match = _MINUTAS_PATRON_SETf.fullmatch(clave)
+        salida.append({
+            "numero": clave, "asunto": asunto, "fecha": fecha,
+            "proyecto": proyecto, "tipo": "Propia SETF" if match else "Otra reunión",
+            "consecutivo": int(match.group(1)) if match else None,
+            "anio": int(match.group(2)) if match else None,
+            "fila": idx, "origen": "MINUTAS", "enlace": "",
+            "registrada": bool(asunto or fecha or proyecto),
+        })
+    return salida
+
+
+def _consecutivo_siguiente_setf(registros, anio):
+    """Calcula el siguiente folio SIN contar las otras reuniones.
+
+    Para 2026 el histórico confirmado al iniciar el módulo es 0058.
+    No se adelanta el contador por fórmulas/preasignaciones vacías.
+    """
+    propios = [r for r in registros if r["tipo"] == "Propia SETF" and r["anio"] == anio]
+    usados = [r["consecutivo"] for r in propios if r["registrada"]]
+    piso = 58 if anio == 2026 else 0
+    numero = max([piso, *usados]) + 1
+    codigo = f"AIFA-ITEyPF-SETF-{numero:04d}-{anio}"
+    candidatos = [r for r in propios if r["consecutivo"] == numero]
+    if len(candidatos) > 1:
+        raise ValueError(f"Folio {codigo} duplicado en Sheets. Revisa la tabla antes de registrar.")
+    if candidatos and candidatos[0]["registrada"]:
+        raise ValueError(f"El consecutivo {codigo} ya tiene datos. Actualiza el registro antes de continuar.")
+    # Si hay otros consecutivos superiores ya preparados, no saltarse los vacíos.
+    return codigo, (candidatos[0]["fila"] if candidatos else None), numero
+
+
+@st.cache_resource(show_spinner=False)
+def _candado_minutas_instancia():
+    """Serializa altas dentro del mismo proceso Streamlit.
+
+    Google Sheets carece de compare-and-swap. Para varios servidores/editores
+    externos se necesitará una reserva transaccional adicional.
+    """
+    import threading
+    return threading.RLock()
+
+
+def _texto_sheets_seguro(texto):
+    texto = str(texto or "").strip()
+    if texto.startswith(("=", "+", "-", "@")):
+        return "'" + texto
+    return texto
+
+
+def _url_minuta_segura(url):
+    from urllib.parse import urlsplit
+    valor = str(url or "").strip()
+    if not valor:
+        return ""
+    partes = urlsplit(valor)
+    if partes.scheme.lower() != "https" or not partes.hostname or partes.username or partes.password:
+        raise ValueError("El enlace debe ser una dirección HTTPS válida.")
+    if len(valor) > 1500:
+        raise ValueError("El enlace del documento es demasiado largo.")
+    return valor
+
+
+def _guardar_minuta_propia_setf(asunto, fecha, proyecto, enlace):
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Solo es posible registrar minutas propias desde SETF.")
+    asunto, proyecto = str(asunto).strip(), str(proyecto).strip()
+    if not asunto or not proyecto:
+        raise ValueError("Indica el asunto y el proyecto de la minuta.")
+    enlace = _url_minuta_segura(enlace)
+    anio = int(fecha.year)
+    # La tabla mostrada corresponde a 2026; otros años comienzan en 0001,
+    # pero siguen basándose en los registros reales del año correspondiente.
+    with _candado_minutas_instancia():
+        _, hoja = _hoja_minutas_setf()
+        registros = _filas_minutas_setf(hoja)  # Lectura fresca antes de escribir.
+        codigo, fila, consecutivo = _consecutivo_siguiente_setf(registros, anio)
+        # No escribir una fórmula creada por el usuario como asunto.
+        # Solo generar HYPERLINK para URL HTTPS validada.
+        if enlace:
+            asunto_celda = '=HYPERLINK("' + enlace.replace('"', '""') + '","' + asunto.replace('"', '""') + '")'
+        else:
+            asunto_celda = _texto_sheets_seguro(asunto)
+        # En Sheets la lista validada usa "México-Querétaro".
+        proyecto_hoja = (
+            "México-Querétaro" if proyecto == "Extensión de Suburbanos Mex-Qro"
+            else _texto_sheets_seguro(proyecto)
+        )
+        valores = [asunto_celda, fecha.strftime("%d/%m/%Y"), proyecto_hoja]
+        if fila is not None:
+            # La hoja histórica aún puede reservar el siguiente folio con CAT.
+            # Nunca escribir B:D bajo una clave CAT si la app promete SETF.
+            original = str(hoja.acell(f"A{fila}").value or "").strip()
+            if original.casefold() != codigo.casefold():
+                raise ValueError(
+                    f"La fila {fila} sigue reservada como '{original}'. "
+                    f"Para registrar con '{codigo}', primero actualiza la fórmula "
+                    "de la columna A de MINUTAS para que genere SETF. "
+                    "No se modificó ningún dato."
+                )
+            # Conservar A y su fórmula original, una vez que coincida el prefijo.
+            hoja.update(range_name=f"B{fila}:D{fila}", values=[valores], value_input_option="USER_ENTERED")
+        else:
+            # Confirmar que la hoja NO tenga códigos superiores preparados:
+            # esos espacios no deben desplazarse ni sobrescribirse.
+            superiores = [r for r in registros if r["tipo"] == "Propia SETF"
+                         and r["anio"] == anio and r["consecutivo"] > consecutivo]
+            if superiores:
+                raise ValueError(
+                    f"No se encontró la fila reservada {codigo} y existen otros "
+                    "consecutivos posteriores. Revisa la fórmula de MINUTAS; no se escribió nada."
+                )
+            # La hoja no tiene fila preasignada para el siguiente consecutivo.
+            # Verificar antes de append para no sobrescribir una fórmula oculta.
+            siguiente_fila = max(2, len(hoja.get_all_values()) + 1)
+            valor_formula = hoja.acell(f"A{siguiente_fila}", value_render_option="FORMULA").value
+            if valor_formula:
+                raise ValueError(
+                    f"La fila {siguiente_fila} contiene una fórmula de folio. "
+                    "No se sobrescribió; verifica el consecutivo en la pestaña MINUTAS."
+                )
+            hoja.append_row([codigo, *valores], value_input_option="USER_ENTERED", table_range="A:D")
+        # Verificar que la clave registrada exista UNA vez y no quede vacía.
+        posteriores = _filas_minutas_setf(hoja)
+        coincidencias = [r for r in posteriores if r["numero"].upper() == codigo.upper()]
+        if len(coincidencias) != 1 or not coincidencias[0]["registrada"]:
+            raise RuntimeError(
+                "No se pudo confirmar la escritura. Revisa la pestaña MINUTAS antes de intentarlo otra vez."
+            )
+    return codigo
+
+
+def _hoja_minutas_externas_setf(libro, crear=False):
+    nombre = "MINUTAS_EXTERNAS_APP"
+    try:
+        hoja = libro.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        if not crear:
+            return None
+        hoja = libro.add_worksheet(title=nombre, rows=1000, cols=len(_MINUTAS_EXTERNAS_CAMPOS))
+        hoja.append_row(_MINUTAS_EXTERNAS_CAMPOS, value_input_option="RAW")
+    cabecera = hoja.row_values(1)
+    if cabecera != _MINUTAS_EXTERNAS_CAMPOS:
+        raise ValueError(f"La pestaña {nombre} tiene encabezados distintos; no se realizaron cambios.")
+    return hoja
+
+
+def _filas_minutas_externas_setf(libro):
+    hoja = _hoja_minutas_externas_setf(libro)
+    if hoja is None:
+        return []
+    salida = []
+    for posicion, fila in enumerate(hoja.get_all_values()[1:], start=2):
+        datos = (list(fila) + [""] * len(_MINUTAS_EXTERNAS_CAMPOS))[:len(_MINUTAS_EXTERNAS_CAMPOS)]
+        clave, asunto, fecha, proyecto, enlace, *_ = datos
+        if asunto or clave:
+            salida.append({
+                "numero": clave or "Sin clave", "asunto": asunto, "fecha": fecha,
+                "proyecto": proyecto, "tipo": "Otra reunión", "consecutivo": None,
+                "anio": None, "fila": posicion, "origen": "MINUTAS_EXTERNAS_APP",
+                "enlace": enlace, "registrada": True,
+            })
+    return salida
+
+
+def _guardar_minuta_externa_setf(clave, asunto, fecha, proyecto, enlace):
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Solo es posible registrar minutas externas desde SETF.")
+    clave, asunto, proyecto = (str(x or "").strip() for x in (clave, asunto, proyecto))
+    if not asunto or not proyecto:
+        raise ValueError("Indica el asunto y el proyecto de la reunión.")
+    enlace = _url_minuta_segura(enlace)
+    if _MINUTAS_PATRON_SETf.fullmatch(clave):
+        raise ValueError("Esta clave pertenece al consecutivo SETF. Utiliza 'Minuta propia SETF'.")
+    with _candado_minutas_instancia():
+        libro, _ = _hoja_minutas_setf()
+        hoja = _hoja_minutas_externas_setf(libro, crear=True)
+        if clave:
+            existentes = hoja.col_values(1)[1:]
+            if any(str(c).strip().casefold() == clave.casefold() for c in existentes):
+                raise ValueError("Ya existe una minuta externa con esa clave.")
+        hoja.append_row([
+            _texto_sheets_seguro(clave), _texto_sheets_seguro(asunto),
+            fecha.strftime("%d/%m/%Y"), _texto_sheets_seguro(proyecto), enlace,
+            identificador_sesion(), datetime.now().astimezone().isoformat(timespec="seconds"),
+        ], value_input_option="RAW")
+    return clave or "Minuta externa registrada"
+
+
+def _clave_vinculo_minuta_setf(registro):
+    """Identificador estable: origen, fila y clave; no altera MINUTAS."""
+    return f"{registro['origen']}|{registro['fila']}|{registro['numero']}"
+
+
+def _hoja_vinculos_minutas_setf(libro, crear=False):
+    """Enlaces manuales en pestaña auxiliar, sin editar fórmulas de MINUTAS."""
+    nombre = "MINUTAS_ENLACES_APP"
+    cabeceras = ["Identificador", "Enlace", "Modificado por", "Fecha de modificación"]
+    try:
+        ws = libro.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        if not crear:
+            return None
+        ws = libro.add_worksheet(title=nombre, rows=1000, cols=4)
+        ws.append_row(cabeceras, value_input_option="RAW")
+    if ws.row_values(1) != cabeceras:
+        raise ValueError("La pestaña de enlaces tiene encabezados inesperados; no se guardó nada.")
+    return ws
+
+
+def _vinculos_minutas_setf(libro):
+    ws = _hoja_vinculos_minutas_setf(libro)
+    if ws is None:
+        return {}
+    return {str(r[0]).strip(): str(r[1]).strip()
+            for fila in ws.get_all_values()[1:]
+            if (r := (list(fila) + ["", ""]))[0].strip() and r[1].strip()}
+
+
+def _guardar_vinculo_minuta_setf(registro, url):
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Esta acción es exclusiva de SETF.")
+    url = _url_minuta_segura(url)
+    if not url:
+        raise ValueError("Pega el enlace HTTPS de la minuta para guardarlo.")
+    ident = _clave_vinculo_minuta_setf(registro)
+    with _candado_minutas_instancia():
+        libro, _ = _hoja_minutas_setf()
+        ws = _hoja_vinculos_minutas_setf(libro, crear=True)
+        filas = ws.col_values(1)
+        coincidencias = [i for i, texto in enumerate(filas, start=1) if i > 1 and texto == ident]
+        if len(coincidencias) > 1:
+            raise ValueError("Hay vínculos duplicados para esta minuta. Revisa MINUTAS_ENLACES_APP.")
+        valores = [ident, url, str(identificador_sesion()),
+                   datetime.now().astimezone().isoformat(timespec="seconds")]
+        if coincidencias:
+            ws.update(range_name=f"A{coincidencias[0]}:D{coincidencias[0]}",
+                      values=[valores], value_input_option="RAW")
+        else:
+            ws.append_row(valores, value_input_option="RAW")
+    return url
+
+
+def _proyecto_form_minuta_setf(clave):
+    opciones = ["Tren Maya", "AIFA-Pachuca", "Extensión de Suburbanos Mex-Qro", "Otro proyecto"]
+    eleccion = st.selectbox("Proyecto", opciones, key=f"minutas_proyecto_{clave}")
+    if eleccion == "Otro proyecto":
+        return st.text_input(
+            "Especifica el nombre del otro proyecto",
+            key=f"minutas_otro_{clave}",
+            placeholder="Escribe el nombre completo del proyecto...",
+            help="Este nombre se guardará como proyecto de la minuta.",
+        ).strip()
+    return eleccion
+
+
+def _modulo_minutas_setf():
+    st.markdown("""<style>
+    .setf-min-hero {background:linear-gradient(110deg,#162E40,#285168);
+        color:white;border-left:5px solid #C5A36D;border-radius:14px;
+        padding:28px 34px;margin:4px 0 20px;
+        box-shadow:0 9px 25px rgba(17,40,54,.16)}
+    .setf-min-hero .tag {letter-spacing:2.2px;font-size:10px;color:#D8B77F;font-weight:800}
+    .setf-min-hero h2 {font-size:31px;color:#FFF!important;margin:10px 0 5px!important}
+    .setf-min-hero p {color:#DDE5EA!important;margin:0}
+    .setf-min-hero {position:relative;isolation:isolate;overflow:hidden;min-height:178px;
+        display:flex;flex-direction:column;justify-content:center;padding-right:39%;}
+    .setf-min-hero .tag,.setf-min-hero h2,.setf-min-hero p {position:relative;z-index:2;}
+    .setf-min-hero::after {content:"";position:absolute;inset:0;
+        background:linear-gradient(90deg,#162E40 0%,rgba(22,46,64,.35) 58%,transparent 100%);
+        pointer-events:none;z-index:1;}
+    /* Selector de tipo de minuta con aspecto de tarjetas, conservando el estado
+       y los valores originales del st.radio. Sólo SETF -> Minutas. */
+    .st-key-minutas_tipo_registro [role="radiogroup"] {
+        display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:13px!important;margin:9px 0 13px!important;
+    }
+    .st-key-minutas_tipo_registro [role="radiogroup"] > label {
+        display:flex!important;align-items:flex-start!important;cursor:pointer!important;
+        min-height:108px!important;border:1px solid #CCD9DF!important;
+        border-radius:14px!important;background:linear-gradient(145deg,#fff,#F6F9F9)!important;
+        padding:17px 15px!important;box-shadow:0 5px 13px rgba(24,55,75,.06)!important;
+        transition:border-color .18s ease,background .18s ease,transform .18s ease!important;
+    }
+    .st-key-minutas_tipo_registro [role="radiogroup"] > label:hover {
+        transform:translateY(-1px);border-color:#A78A5C!important;
+    }
+    .st-key-minutas_tipo_registro [role="radiogroup"] > label:has(input:checked),
+    .st-key-minutas_tipo_registro [role="radiogroup"] > label:has([aria-checked="true"]) {
+        border:2px solid #C29B5D!important;
+        background:linear-gradient(130deg,#FCF8EF,#F1F6F7)!important;
+        box-shadow:0 7px 17px rgba(149,112,55,.13)!important;
+    }
+    .st-key-minutas_tipo_registro [role="radiogroup"] > label p {
+        white-space:pre-line!important;line-height:1.65!important;
+        font-size:13px!important;color:#24475B!important;font-weight:600!important;
+    }
+    @media (max-width:720px) {
+        .st-key-minutas_tipo_registro [role="radiogroup"] {grid-template-columns:1fr!important;}
+        .st-key-minutas_tipo_registro [role="radiogroup"] > label {min-height:85px!important;}
+        .setf-min-hero {padding-right:24px!important;min-height:155px!important;}
+    }
+    /* Indicadores de Minutas: cuatro tarjetas coherentes con el sistema SETF. */
+    .setf-min-kpi {position:relative;box-sizing:border-box;
+        border:1px solid var(--min-border,#C9D6DB);
+        border-left:5px solid var(--min-accent,#628498);
+        background:var(--min-bg,rgba(248,250,250,.98));
+        padding:18px 17px 16px 19px;border-radius:14px;min-height:128px;
+        box-shadow:0 7px 19px rgba(35,59,71,.075);
+        display:flex;flex-direction:column;justify-content:center;gap:10px;
+        transition:box-shadow .15s ease,transform .15s ease}
+    .setf-min-kpi:hover {box-shadow:0 9px 23px rgba(35,59,71,.12);transform:translateY(-1px)}
+    .setf-min-kpi strong {display:block;font-size:clamp(12px, 1.04vw, 18px);
+        font-weight:800;color:#153447;overflow-wrap:anywhere;line-height:1.4;
+        letter-spacing:.1px}
+    .setf-min-kpi span {display:block;font-size:12px;font-weight:600;color:#516B79;line-height:1.45}
+    .setf-min-kpi-ultima {--min-accent:#B39262;--min-border:#DACAB4;--min-bg:rgba(250,246,239,.97)}
+    .setf-min-kpi-siguiente {--min-accent:#4F788F;--min-border:#B7CBD5;--min-bg:rgba(236,245,249,.97)}
+    .setf-min-kpi-propias {--min-accent:#55816E;--min-border:#B6D2C3;--min-bg:rgba(238,247,242,.97)}
+    .setf-min-kpi-otras {--min-accent:#8A7799;--min-border:#D3C7DC;--min-bg:rgba(246,242,249,.97)}
+    /* Estilo premium localizado: no cambia otras páginas ni DG */
+    .st-key-setf_minutas_registro, .st-key-setf_minutas_consulta {
+        border:1px solid rgba(172,153,119,.40)!important;
+        border-radius:18px!important;
+        background:linear-gradient(150deg,rgba(255,255,255,.97),rgba(247,246,242,.96))!important;
+        box-shadow:0 12px 30px rgba(22,46,62,.10)!important;
+        padding:19px 22px 23px!important;
+        margin:15px 0 21px!important;
+    }
+    .setf-min-section-tag {font-size:10px;letter-spacing:2px;
+        color:#A17A3F;font-weight:850;text-transform:uppercase;margin-bottom:5px;}
+    .setf-min-section-title {font-size:24px;line-height:1.2;
+        color:#17394F;font-weight:850;margin:0 0 5px;}
+    .setf-min-section-sub {font-size:13px;color:#617787;margin:0 0 15px;}
+    .setf-min-registro-chip {font-size:11px;font-weight:800;color:#2D617A;
+        background:#EDF4F7;border:1px solid #C3D5DC;border-radius:999px;
+        padding:5px 12px;display:inline-block;margin:0 0 12px;}
+    .st-key-setf_minutas_registro [data-testid="stExpander"] {
+        border:1px solid #CCD9DF!important;border-radius:12px!important;
+        background:rgba(255,255,255,.92)!important;overflow:hidden;
+    }
+    .st-key-setf_minutas_registro [data-testid="stExpander"] summary {
+        background:#EDF4F7!important;color:#17394F!important;
+        font-weight:750!important;padding:10px 15px!important;
+    }
+    .st-key-setf_minutas_registro [data-testid="stAlert"] {
+        border-left:4px solid #4F788F;border-radius:10px;
+    }
+    .st-key-setf_minutas_registro [data-testid="stForm"] {
+        border:1px solid #DAE1E3!important;border-radius:12px!important;
+        background:#FCFCFA!important;padding:16px!important;
+    }
+    .st-key-setf_minutas_registro input,
+    .st-key-setf_minutas_registro textarea,
+    .st-key-setf_minutas_consulta input {border-radius:9px!important;}
+    .st-key-setf_minutas_registro [data-testid="stFormSubmitButton"] button {
+        background:linear-gradient(105deg,#173A51,#2B6379)!important;
+        border:1px solid #1E4B62!important;color:#FFF!important;
+        border-radius:10px!important;min-height:45px!important;font-weight:800!important;
+        box-shadow:0 5px 14px rgba(22,57,77,.17)!important;
+    }
+    .st-key-setf_minutas_registro [data-testid="stFormSubmitButton"] button:hover {
+        background:linear-gradient(105deg,#21516B,#33758E)!important;
+    }
+    .st-key-setf_minutas_consulta [data-testid="stTextInput"] input,
+    .st-key-setf_minutas_consulta [data-baseweb="select"]>div {
+        background:#FFF!important;border:1px solid #C9D5DC!important;
+        border-radius:10px!important;min-height:42px!important;
+    }
+    .st-key-setf_minutas_consulta [data-testid="stTextInput"] input:focus {
+        border-color:#527E92!important;box-shadow:0 0 0 2px #BBD2DC!important;
+    }
+    @media(max-width:780px) {
+        .st-key-setf_minutas_registro,.st-key-setf_minutas_consulta {padding:13px!important;}
+        .setf-min-section-title {font-size:21px;}
+    }
+
+    /* Minutas SETF · registro y vínculos: acabado institucional */
+    .st-key-setf_minutas_registro [data-testid="stRadio"] > label {font-weight:750!important;}
+    .st-key-setf_minutas_registro [data-testid="stRadio"] [role="radiogroup"] {
+        gap:12px!important;align-items:stretch!important;
+    }
+    .st-key-setf_minutas_registro [data-testid="stRadio"] [role="radiogroup"] > label {
+        flex:1 1 0!important;min-height:100px!important;
+        border-radius:15px!important;border:1px solid #CDDCE3!important;
+        background:linear-gradient(145deg,#FFFFFF,#F4F8F9)!important;
+        padding:17px 15px!important;box-shadow:0 6px 17px rgba(20,51,70,.05)!important;
+        font-weight:700!important;align-items:flex-start!important;
+    }
+    .st-key-setf_minutas_registro [data-testid="stRadio"] [role="radiogroup"] > label:has(input:checked) {
+        border-color:#BE9554!important;background:linear-gradient(140deg,#FFFDF8,#F9F2E5)!important;
+        box-shadow:0 5px 18px rgba(178,131,65,.15)!important;
+    }
+    .st-key-setf_minutas_registro [data-testid="stTextInput"] input:focus {
+        border-color:#527E92!important;box-shadow:0 0 0 2px #BAD1DC!important;
+    }
+    [class*="st-key-setf_minutas_vinculo_"] [data-testid="stExpander"] {
+        border:1px solid #CAD9E1!important;border-radius:12px!important;
+        background:linear-gradient(110deg,rgba(255,255,255,.97),rgba(247,250,250,.95))!important;
+        box-shadow:0 5px 15px rgba(22,48,64,.05)!important;overflow:hidden;
+    }
+    [class*="st-key-setf_minutas_vinculo_"] [data-testid="stExpander"] summary {
+        font-weight:750!important;color:#22516B!important;padding:11px 15px!important;
+    }
+    [class*="st-key-setf_minutas_vinculo_"] [data-testid="stExpander"] summary:hover {
+        background:rgba(234,243,247,.65)!important;
+    }
+    .setf-min-link-intro {display:flex;flex-direction:column;gap:3px;padding:6px 2px 11px;}
+    .setf-min-link-intro strong {color:#183A50;font-size:14px;}
+    .setf-min-link-intro span {color:#617787;font-size:12px;line-height:1.5;}
+    [class*="st-key-setf_minutas_vinculo_"] [data-testid="stFormSubmitButton"] button {
+        min-height:43px!important;background:linear-gradient(105deg,#1A4259,#27657E)!important;
+        color:white!important;border:0!important;border-radius:10px!important;font-weight:750!important;
+    }
+    @media(max-width:750px) {
+        .st-key-setf_minutas_registro [data-testid="stRadio"] [role="radiogroup"] {flex-direction:column!important;}
+        .st-key-setf_minutas_registro [data-testid="stRadio"] [role="radiogroup"] > label {min-height:70px!important;}
+    }
+    /* Tarjeta única con acción a la derecha, sólo para minutas SETF. */
+    [class*="st-key-setf_minutas_item_"] {
+        background:linear-gradient(115deg,rgba(255,255,255,.98),rgba(250,249,246,.98))!important;
+        border:1px solid #CCD9DE!important;border-left:4px solid #4E788A!important;
+        border-radius:14px!important;padding:13px 17px!important;
+        box-shadow:0 5px 15px rgba(20,49,65,.075)!important;
+        margin:12px 0 4px!important;
+    }
+    .setf-min-item-text strong {font-size:14px;color:#153B50;overflow-wrap:anywhere;}
+    .setf-min-item-text p {font-size:12px;color:#576F7E;margin:5px 0 0;line-height:1.5;}
+    [class*="st-key-setf_minutas_item_"] [data-testid="stHorizontalBlock"] {
+        align-items:center!important;
+    }
+    [class*="st-key-setf_minutas_item_"] [data-testid="stLinkButton"] a {
+        background:linear-gradient(110deg,#C88727,#D69D45)!important;
+        color:#fff!important;border:1px solid #B7791E!important;
+        border-radius:10px!important;min-height:44px!important;
+        font-weight:800!important;box-shadow:0 5px 12px rgba(155,92,22,.20)!important;
+        display:flex!important;align-items:center!important;justify-content:center!important;
+    }
+    [class*="st-key-setf_minutas_item_"] [data-testid="stLinkButton"] a:hover {
+        background:linear-gradient(110deg,#AD6C18,#C48427)!important;
+        color:#fff!important;
+    }
+    [class*="st-key-setf_minutas_item_"] [data-testid="stButton"] button:disabled {
+        background:#F0F1F1!important;color:#84919A!important;
+        border:1px solid #D9DEE2!important;border-radius:10px!important;
+        min-height:44px!important;
+    }
+    [class*="st-key-setf_minutas_vinculo_"] [data-testid="stExpander"] {
+        border:1px solid #DBE2E4!important;border-radius:10px!important;
+        background:rgba(255,255,255,.88)!important;
+    }
+    @media(max-width:750px) {
+        [class*="st-key-setf_minutas_item_"] {padding:11px!important;}
+    }
+    .setf-min-item {background:rgba(253,253,251,.96);border:1px solid #D5DCDF;
+        border-left:4px solid #6B8C9B;border-radius:12px;padding:15px 18px;margin:8px 0}
+    .setf-min-item strong {color:#1B3A4F;font-size:14px}
+    .setf-min-item p {color:#647985;font-size:12px;margin:5px 0 0}
+
+    /* Panel de información: reemplaza captions sueltos con un único bloque.
+       Estilos locales utilizados sólo por _modulo_minutas_setf. */
+    .setf-min-info {margin:15px 0 18px!important;padding:16px 20px 15px!important;
+        background:linear-gradient(120deg,rgba(251,248,242,.97),rgba(248,250,249,.97));
+        border:1px solid #DDD1BE;border-left:4px solid #B99560;border-radius:14px;
+        box-shadow:0 6px 20px rgba(23,48,62,.07);color:#24455A;}
+    .setf-min-info-head {display:flex;align-items:center;gap:12px;
+        padding-bottom:11px;border-bottom:1px solid #E7DFD2;}
+    .setf-min-info-symbol {display:flex;align-items:center;justify-content:center;
+        flex:0 0 39px;height:39px;border-radius:10px;background:#EEE4D3;
+        color:#98703E;font-weight:800;font-size:21px;}
+    .setf-min-info-kicker {display:block;color:#977343;font-size:10px;
+        letter-spacing:1.7px;font-weight:850;line-height:1.5;}
+    .setf-min-info-title {color:#19394B;font-weight:850;font-size:17px;line-height:1.35;}
+    .setf-min-info-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+        gap:18px;padding-top:13px;}
+    .setf-min-info-block {display:flex;align-items:flex-start;gap:11px;min-width:0;}
+    .setf-min-info-ico {display:flex;justify-content:center;align-items:center;
+        flex:0 0 29px;height:29px;border-radius:8px;background:#E8EFF1;
+        color:#3E6B80;font-size:11px;font-weight:850;}
+    .setf-min-info-name {font-size:14px;font-weight:800;color:#24475B;margin:2px 0 4px;}
+    .setf-min-info-block p {font-size:12.5px!important;line-height:1.6!important;
+        color:#516775!important;margin:0!important;}
+    .setf-min-info-block strong {font-weight:800;color:#254E66;}
+    .setf-min-info-note {margin-top:7px;padding:6px 9px;background:#F8EFE1;
+        border-radius:7px;border-left:3px solid #C5A16C;
+        color:#805F33;font-size:11.5px;line-height:1.5;}
+    .setf-min-info-foot {margin-top:7px!important;color:#71858F!important;font-size:11.5px!important;}
+    @media (max-width:900px) {
+       .setf-min-info-grid {grid-template-columns:1fr;gap:14px;}
+       .setf-min-info {padding:14px!important;margin:12px 0 15px!important;}
+    }
+
+    /* Pulido final de Minutas SETF: compacto y legible. */
+    .st-key-cabecera_documental { margin-bottom:-38px!important; }
+    .setf-min-hero { margin-top:0!important;margin-bottom:15px!important; }
+    .setf-min-kpi {min-height:145px!important;padding:17px 16px 17px 19px!important;gap:9px!important;}
+    .setf-min-kpi strong {font-size:clamp(14px,1.12vw,19px)!important;line-height:1.32!important;}
+    .setf-min-kpi span {font-size:12.5px!important;}
+    .setf-min-kpi-siguiente {
+        border:2px solid #BB8D42!important;border-left:6px solid #D6A24D!important;
+        background:linear-gradient(135deg,#183C51 0%,#27566C 100%)!important;
+        box-shadow:0 12px 24px rgba(18,57,79,.22)!important;
+        transform:translateY(-3px);
+    }
+    .setf-min-kpi-siguiente strong {color:#FFFFFF!important;font-size:clamp(14px,1.16vw,20px)!important;}
+    .setf-min-kpi-siguiente span {color:#F2D5A4!important;font-weight:800!important;}
+    .setf-min-kpi-siguiente::before {content:'PRÓXIMA MINUTA';display:block;
+        font-size:9px;letter-spacing:1.5px;font-weight:850;color:#F3CC8C;}
+    .setf-min-kpi-siguiente:hover {transform:translateY(-3px)!important;}
+    [class*="st-key-setf_minutas_item_"] {padding:18px 20px!important;margin:12px 0 14px!important;}
+    .setf-min-item-text strong {font-size:17px!important;line-height:1.35!important;}
+    .setf-min-item-text p {font-size:14px!important;line-height:1.55!important;margin:7px 0 0!important;}
+    .setf-min-item-text p:last-child {font-size:12.5px!important;color:#627787!important;}
+    [class*="st-key-setf_minutas_item_"] [data-testid="stExpander"] {
+        border:1px solid #DBE3E6!important;border-radius:10px!important;
+        background:#F7F9F9!important;margin-top:9px!important;overflow:hidden!important;
+    }
+    [class*="st-key-setf_minutas_item_"] [data-testid="stExpander"] summary {
+        color:#235269!important;font-weight:750!important;padding:9px 13px!important;
+        font-size:13px!important;
+    }
+    [class*="st-key-setf_minutas_item_"] [data-testid="stFormSubmitButton"] button {
+        background:#1F5069!important;color:white!important;border-radius:10px!important;
+        border:0!important;font-weight:800!important;
+    }
+    @media (max-width:850px) {
+        .st-key-cabecera_documental {margin-bottom:-15px!important;}
+        .setf-min-kpi-siguiente {transform:none!important;}
+    }
+    </style>""", unsafe_allow_html=True)
+    # Archivo decorativo opcional. Si no está en assets, el encabezado conserva
+    # el degradado institucional y la aplicación sigue funcionando.
+    imagen_hero_minutas = _imagen_selector("hero_setf_minutas.png")
+    if imagen_hero_minutas:
+        st.markdown(
+            '<style>.setf-min-hero {background-image:'
+            'linear-gradient(90deg,#162E40 0%,rgba(22,46,64,.98) 39%,rgba(22,46,64,.62) 69%,rgba(22,46,64,.12) 100%),'
+            f'url("{imagen_hero_minutas}")!important;'
+            'background-position:center,right center!important;'
+            'background-size:cover,auto 118%!important;'
+            'background-repeat:no-repeat!important;}</style>',
+            unsafe_allow_html=True,
+        )
+    st.markdown("""<section class="setf-min-hero">
+      <div class="tag">SISTEMAS ELÉCTRICOS · CONTROL DOCUMENTAL</div>
+      <h2>Minutas de reunión</h2>
+      <p>Control de consecutivos, consulta de reuniones y seguimiento documental</p>
+    </section>""", unsafe_allow_html=True)
+    try:
+        id_libro = _id_libro_minutas_setf()
+        libro, hoja = _hoja_minutas_setf()
+        actuales = _filas_minutas_setf(hoja)
+        externas_app = _filas_minutas_externas_setf(libro)
+        total = actuales + externas_app
+        vinculos_manuales = _vinculos_minutas_setf(libro)
+        for registro in total:
+            enlace_manual = vinculos_manuales.get(_clave_vinculo_minuta_setf(registro))
+            if enlace_manual:
+                registro["enlace"] = enlace_manual
+        codigo, fila_reservada, prox = _consecutivo_siguiente_setf(actuales, 2026)
+    except Exception as error:
+        st.error(f"No se pudo abrir el control de minutas de SETF: {error}")
+        st.info("El control de oficios de DG y SETF no se modifica. Configura "
+                "el ID del libro **Control Interno SETF** para habilitar Minutas.")
+        st.code('[setf]\nminutas_spreadsheet_id = "ID_DEL_CONTROL_INTERNO_SETF"', language="toml")
+        return
+    propias = [r for r in actuales if r["tipo"] == "Propia SETF" and r["registrada"]]
+    otras = [r for r in total if r["tipo"] == "Otra reunión" and r["registrada"]]
+    k1,k2,k3,k4 = st.columns(4, gap="small")
+    for columna,valor,etiqueta,clase in [
+        (k1, f"AIFA-ITEyPF-SETF-{max([58, *[r['consecutivo'] for r in propias if r['anio'] == 2026]]):04d}-2026", "Última minuta propia · 2026", "ultima"),
+        (k2, codigo, "Siguiente consecutivo · 2026", "siguiente"),
+        (k3, str(len(propias)), "Minutas propias registradas", "propias"),
+        (k4, str(len(otras)), "Minutas de otras reuniones", "otras"),
+    ]:
+        with columna:
+            st.markdown(f'<div class="setf-min-kpi setf-min-kpi-{clase}"><strong>{valor}</strong><span>{etiqueta}</span></div>',unsafe_allow_html=True)
+    # Panel visual explicativo de Minutas SETF: mantiene las mismas advertencias
+    # y las reglas de numeración/Drive; sólo cambia su presentación.
+    st.markdown("""<section class="setf-min-info" aria-label="Información sobre el control de minutas">
+      <div class="setf-min-info-head">
+        <span class="setf-min-info-symbol">▤</span>
+        <div><span class="setf-min-info-kicker">INFORMACIÓN DEL SISTEMA</span>
+        <div class="setf-min-info-title">Control y gestión de minutas</div></div>
+      </div>
+      <div class="setf-min-info-grid">
+        <div class="setf-min-info-block">
+          <span class="setf-min-info-ico">01</span>
+          <div><div class="setf-min-info-name">Numeración institucional</div>
+          <p>Las nuevas minutas utilizan la clave <strong>AIFA-ITEyPF-SETF</strong>.
+          Los registros históricos con CAT siguen consultables sin modificar sus claves.</p>
+          <div class="setf-min-info-note">Antes de registrar la minuta 0059, comprueba que
+          su fórmula en Google Sheets utilice SETF y no CAT.</div></div>
+        </div>
+        <div class="setf-min-info-block">
+          <span class="setf-min-info-ico">02</span>
+          <div><div class="setf-min-info-name">Almacenamiento documental</div>
+          <p>La hoja <strong>MINUTAS</strong> conserva el registro maestro de consecutivos.
+          Guarda tus documentos en Drive y vincula sus enlaces manualmente desde aquí.</p>
+          <p class="setf-min-info-foot">Los vínculos se registran por separado, sin alterar la tabla original.</p></div>
+        </div>
+      </div>
+    </section>""", unsafe_allow_html=True)
+    with st.container(key="setf_minutas_registro"):
+        st.markdown('''''''''<div class="setf-min-section-tag">REGISTRO INSTITUCIONAL</div>
+        <div class="setf-min-section-title">Nueva minuta de reunión</div>
+        <div class="setf-min-section-sub">Captura los datos, conserva el consecutivo automático y vincula tu documento en Drive.</div>
+        <span class="setf-min-registro-chip">SETF · Control de minutas</span>''''''''' , unsafe_allow_html=True)
+        with st.expander("＋ Registrar nueva minuta", expanded=False):
+            st.markdown('<div class="setf-min-section-tag">CLASIFICACIÓN DOCUMENTAL</div>', unsafe_allow_html=True)
+            st.markdown('**¿Qué tipo de minuta deseas registrar?**')
+            tipo = st.radio(
+                "Tipo de registro",
+                ["Minuta propia SETF", "Minuta de otra reunión"],
+                horizontal=True,
+                key="minutas_tipo_registro",
+                label_visibility="collapsed",
+                format_func=lambda valor: (
+                    "▣  Minuta propia SETF\nReunión de la mesa · consecutivo automático"
+                    if valor == "Minuta propia SETF" else
+                    "♧  Minuta de otra reunión\nDocumento externo · no consume consecutivo"
+                ),
+            )
+            if tipo == "Minuta propia SETF":
+                st.info(f"Número propuesto: **{codigo}**" + (
+                    " · ya preparado en la hoja." if fila_reservada else
+                    " · se generará al registrar si no existe una fórmula que lo reserve."
+                ))
+            with st.form(key="form_nueva_minuta_setf", clear_on_submit=False):
+                clave_externa = ""
+                if tipo != "Minuta propia SETF":
+                    clave_externa = st.text_input("Clave de otra institución (opcional)", key="minutas_clave_externa")
+                asunto = st.text_area("Asunto de la reunión", key="minutas_asunto_nuevo", height=82)
+                c1,c2 = st.columns([1,2])
+                with c1:
+                    fecha = st.date_input("Fecha de la reunión", key="minutas_fecha_nueva")
+                with c2:
+                    proyecto = _proyecto_form_minuta_setf("nuevo")
+                    if not proyecto:
+                        st.caption("Escribe el nombre del proyecto para continuar.")
+                enlace = st.text_input("Enlace al documento (opcional, HTTPS)", key="minutas_enlace_nuevo",
+                                       placeholder="https://drive.google.com/...")
+                enviar = st.form_submit_button("Registrar minuta", type="primary", use_container_width=True)
+            if enviar:
+                try:
+                    if tipo == "Minuta propia SETF":
+                        guardado = _guardar_minuta_propia_setf(asunto, fecha, proyecto, enlace)
+                    else:
+                        guardado = _guardar_minuta_externa_setf(clave_externa, asunto, fecha, proyecto, enlace)
+                    st.session_state["minutas_confirmacion_setf"] = f"Minuta registrada: {guardado}"
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"No se pudo confirmar el registro: {error}. Verifica Sheets antes de reintentar.")
+    if st.session_state.get("minutas_confirmacion_setf"):
+        st.success(st.session_state.pop("minutas_confirmacion_setf"))
+    with st.container(key="setf_minutas_consulta"):
+        st.markdown('''<div class="setf-min-section-tag">ARCHIVO Y CONSULTA DOCUMENTAL</div>
+            <div class="setf-min-section-title">Consulta de minutas</div>
+            <div class="setf-min-section-sub">Encuentra reuniones por clave, asunto o proyecto y filtra sus resultados.</div>''', unsafe_allow_html=True)
+        c1,c2,c3 = st.columns([3,1.45,1.65], gap="small")
+        with c1:
+            buscar = st.text_input("Buscar por clave, asunto o proyecto", placeholder="Buscar minuta...", key="minutas_buscar_setf")
+        with c2:
+            filtro_tipo = st.selectbox("Tipo de minuta", ["Todas", "Propias SETF", "Otras reuniones"], key="minutas_filtro_tipo")
+        with c3:
+            proyectos = sorted({r["proyecto"] for r in total if r["proyecto"]})
+            filtro_proyecto = st.selectbox("Proyecto", ["Todos", *proyectos], key="minutas_filtro_proyecto")
+    registros = [r for r in total if r["registrada"]]
+    if filtro_tipo == "Propias SETF":
+        registros = [r for r in registros if r["tipo"] == "Propia SETF"]
+    elif filtro_tipo == "Otras reuniones":
+        registros = [r for r in registros if r["tipo"] == "Otra reunión"]
+    if filtro_proyecto != "Todos":
+        registros = [r for r in registros if r["proyecto"] == filtro_proyecto]
+    if buscar.strip():
+        buscado = buscar.casefold().strip()
+        registros = [r for r in registros if buscado in " ".join(
+            (r["numero"],r["asunto"],r["fecha"],r["proyecto"])
+        ).casefold()]
+    registros.sort(key=lambda r: (str(r["fecha"]), r["numero"]), reverse=True)
+    st.caption(f"{len(registros)} minuta(s) encontradas · Los folios preparados sin asunto no se consideran registros.")
+    for r in registros[:100]:
+        titulo = html.escape(r["numero"] or "Sin clave")
+        asunto = html.escape(r["asunto"] or "Sin asunto")
+        proyecto = html.escape(r["proyecto"] or "Sin proyecto")
+        fecha = html.escape(r["fecha"] or "Sin fecha")
+        with st.container(key=f"setf_minutas_item_{r['origen']}_{r['fila']}"):
+            columna_datos, columna_accion = st.columns([4.5, 1.15], gap="medium", vertical_alignment="center")
+            with columna_datos:
+                st.markdown(f'<div class="setf-min-item-text"><strong>{titulo}</strong>'
+                            f'<p>{asunto}</p><p>{fecha} · {proyecto} · {html.escape(r["tipo"])}</p></div>',
+                            unsafe_allow_html=True)
+            with columna_accion:
+                if r.get("enlace"):
+                    st.link_button("Abrir minuta ↗", r["enlace"], use_container_width=True)
+                else:
+                    st.button("Sin enlace", disabled=True, use_container_width=True,
+                              key=f"sin_enlace_minuta_{r['origen']}_{r['fila']}")
+            with st.expander("🔗  Vincular o actualizar documento", expanded=False):
+                st.markdown(
+                    '<div class="setf-min-link-intro"><strong>Enlace directo a la minuta</strong>'
+                    '<span>Guarda aquí la dirección del PDF o documento de Drive. '
+                    'Al guardarla, podrás abrirlo desde el botón naranja de la tarjeta.</span></div>',
+                    unsafe_allow_html=True,
+                )
+                with st.form(key=f"vinculo_minuta_{r['origen']}_{r['fila']}", clear_on_submit=False):
+                    link_nuevo = st.text_input("URL del documento (HTTPS)",
+                                               value=r.get("enlace", ""),
+                                               key=f"url_minuta_{r['origen']}_{r['fila']}",
+                                               placeholder="https://drive.google.com/file/d/...")
+                    enviar_vinculo = st.form_submit_button("Guardar enlace de la minuta", use_container_width=True)
+                if enviar_vinculo:
+                    try:
+                        _guardar_vinculo_minuta_setf(r, link_nuevo)
+                        st.success("Enlace guardado. La minuta se abrirá directamente desde su tarjeta.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"No se pudo guardar el enlace: {error}")
+    if not registros:
+        st.info("No hay minutas que coincidan con los filtros seleccionados.")
+    elif len(registros) > 100:
+        st.caption("Se muestran las primeras 100 minutas. Utiliza los filtros para encontrar otras.")
+
+
+def _modulo_minutas_diseno_pendiente():
+    st.markdown("""<div style="background:linear-gradient(115deg,#162D40,#365464);
+        color:white;border-left:5px solid #C4A16A;border-radius:15px;padding:26px 30px">
+        <div style="font-size:11px;letter-spacing:2px;color:#D7B57A">MESA DE DISEÑO GEOMÉTRICO</div>
+        <h2 style="color:#fff;margin:9px 0">Minutas de reunión</h2>
+        <p style="color:#DFE7EA;margin:0">Módulo reservado para la próxima etapa.</p></div>""",
+        unsafe_allow_html=True)
+    st.info("La gestión de minutas de Diseño Geométrico se implementará más adelante. "
+            "Este apartado no consulta ni modifica la información de SETF.")
+
+
 if st.session_state.menu_activo == "home":
     # Portada de Diseño Geométrico con el mismo lenguaje visual del selector de áreas.
     # Los módulos reales y sus permisos permanecen intactos.
-    fondo_home = _imagen_selector("fondo_ferroviario.png")
-    logo_home = _imagen_selector("logo_selector.png")
-    foto_oficios = _imagen_selector("menu_oficios.png") or _imagen_selector("tarjeta_diseno.png")
-    foto_ingenieria = _imagen_selector("menu_ingenieria.png") or _imagen_selector("tarjeta_diseno.png")
+    fondo_home = (_imagen_selector("fondo_setf.png") or _imagen_selector("fondo_ferroviario.png")) if _area_activa_validada() == "setf" else _imagen_selector("fondo_ferroviario.png")
+    logo_home = (_imagen_selector("logo_setf.png") or _imagen_selector("logo_selector.png")) if _area_activa_validada() == "setf" else _imagen_selector("logo_selector.png")
+    foto_oficios = (_imagen_selector("menu_setf_oficios.png") or _imagen_selector("tarjeta_setf.png")) if _area_activa_validada() == "setf" else (_imagen_selector("menu_oficios.png") or _imagen_selector("tarjeta_diseno.png"))
+    foto_ingenieria = (_imagen_selector("menu_setf_planos.png") or _imagen_selector("tarjeta_setf.png")) if _area_activa_validada() == "setf" else (_imagen_selector("menu_ingenieria.png") or _imagen_selector("tarjeta_diseno.png"))
     fondo_home_css = (
         f'url("{fondo_home}")'
         if fondo_home else 'linear-gradient(130deg,#eef3f6,#fafafa)'
@@ -7743,6 +9134,8 @@ if st.session_state.menu_activo == "home":
     
     .home-brand {{height:90px;display:flex;align-items:center;gap:17px;position:relative;z-index:1;color:white;}}
     .home-brand img {{height:58px;width:65px;object-fit:contain;}}
+    .home-brand-setf img {{height:70px;width:70px;object-fit:contain;
+      filter:drop-shadow(0 2px 4px rgba(0,0,0,.2));}}
     .home-brand-name {{border-left:1px solid #caa45e;padding-left:19px;}}
     .home-brand-name strong {{font-size:23px;letter-spacing:1.3px;color:#fff;display:block;line-height:1.1;}}
     .home-brand-name span {{font-size:10px;letter-spacing:3.3px;color:#d5dce3;display:block;margin-top:8px;}}
@@ -7816,6 +9209,7 @@ if st.session_state.menu_activo == "home":
        .home-brand-name strong {{font-size:17px;}}
        .home-brand-name span {{font-size:9px;letter-spacing:1px;}}
        .home-brand img {{width:48px;}}
+       .home-brand-setf img {{width:52px;height:52px;}}
        .home-institutional-card {{height:280px;}}
        .home-institutional-photo {{height:115px;}}
     }}
@@ -7841,9 +9235,10 @@ if st.session_state.menu_activo == "home":
         nombre_home = str(st.session_state.get("usuario_actual") or "Usuario")
     nombre_home = html.escape(nombre_home)
     cab_logo = f'<img src="{logo_home}" alt="Logotipo institucional">' if logo_home else '<span style="font-size:35px;color:#d3a75d">▰</span>'
+    clase_marca = "home-brand home-brand-setf" if _area_activa_validada() == "setf" else "home-brand"
     col_marca, col_usuario, col_cambiar, col_cerrar = st.columns([4.4,1.65,1.25,1.2], gap="medium", vertical_alignment="center")
     with col_marca:
-        st.markdown(f"""<div class="home-brand">{cab_logo}<div class="home-brand-name">
+        st.markdown(f"""<div class="{clase_marca}">{cab_logo}<div class="home-brand-name">
            <strong>CONTROL DOCUMENTAL</strong><span>INFRAESTRUCTURA FERROVIARIA</span>
            </div> </div>""", unsafe_allow_html=True)
     with col_usuario:
@@ -7859,12 +9254,12 @@ if st.session_state.menu_activo == "home":
         if st.button("↪ Cerrar sesión", key="home_cerrar_sesion", use_container_width=True):
             cerrar_sesion_selector()
 
-    st.markdown("""<div class="home-institutional-hero">
+    st.markdown(_rotulos_area("""<div class="home-institutional-hero">
       <div class="home-institutional-kicker">MESA DE DISEÑO GEOMÉTRICO DE VÍA FÉRREA</div>
       <div class="home-institutional-rule"></div>
       <div class="home-institutional-title">Selecciona tu módulo de trabajo</div>
       <div class="home-institutional-subtitle">Elige el módulo que deseas consultar.</div>
-     </div>""", unsafe_allow_html=True)
+     </div>"""), unsafe_allow_html=True)
 
     _, col_oficios, col_ingenieria, _ = st.columns([.4, 4.8, 4.8, .4], gap="large")
     with col_oficios:
@@ -7878,16 +9273,30 @@ if st.session_state.menu_activo == "home":
         if st.button("Ingresar a Oficios en trámite  →", key="home_oficios", use_container_width=True):
             navegar_a("oficios")
     with col_ingenieria:
+        # SETF tiene un Módulo de planos visual; su gestión funcional queda para otra etapa.
+        # En Diseño Geométrico se conserva Ingeniería de detalle sin modificaciones.
+        es_setf_home = _area_activa_validada() == "setf"
+        titulo_segunda_tarjeta = "Módulo de planos" if es_setf_home else "Ingeniería de detalle"
+        estado_segunda_tarjeta = "◩ &nbsp; PRÓXIMAMENTE" if es_setf_home else "⌁ &nbsp; INGENIERÍA"
+        descripcion_segunda_tarjeta = (
+            "Espacio reservado para la consulta y gestión de planos eléctricos ferroviarios."
+            if es_setf_home else "Fase I · Documentación técnica y desarrollo del proyecto."
+        )
+        boton_segunda_tarjeta = (
+            "Ingresar al Módulo de planos  →" if es_setf_home
+            else "Ingresar a Ingeniería de detalle  →"
+        )
         imagen = f'background-image:url(\'{foto_ingenieria}\')' if foto_ingenieria else 'background:linear-gradient(120deg,#284657,#567688)'
         st.markdown(f"""<div class="home-institutional-card">
-          <div class="home-institutional-photo" style="{imagen}"><div class="home-institutional-status">⌁ &nbsp; INGENIERÍA</div></div>
+          <div class="home-institutional-photo" style="{imagen}"><div class="home-institutional-status">{estado_segunda_tarjeta}</div></div>
           <div class="home-institutional-content"><div class="home-institutional-icon">◩</div>
-            <div class="home-institutional-name">Ingeniería de detalle</div>
-            <div class="home-institutional-description">Fase I · Documentación técnica y desarrollo del proyecto.</div>
+            <div class="home-institutional-name">{titulo_segunda_tarjeta}</div>
+            <div class="home-institutional-description">{descripcion_segunda_tarjeta}</div>
           </div> </div>""", unsafe_allow_html=True)
-        if st.button("Ingresar a Ingeniería de detalle  →", key="home_diseno", use_container_width=True):
+        if st.button(boton_segunda_tarjeta, key="home_diseno", use_container_width=True):
+            # Conserva la ruta interna 'diseno' para no alterar navegación ni permisos.
             navegar_a("diseno")
-    st.markdown('<div class="home-institutional-footer">TRAZO · ALINEAMIENTO · RASANTE</div>', unsafe_allow_html=True)
+    st.markdown(_rotulos_area('<div class="home-institutional-footer">TRAZO · ALINEAMIENTO · RASANTE</div>'), unsafe_allow_html=True)
 
 # =========================================================
 # MÓDULO OFICIOS EN TRÁMITE
@@ -9983,10 +11392,11 @@ elif st.session_state.menu_activo == "oficios":
                 border-color: #B99A65 !important;
                 color: #FFFDF7 !important;
             }}
-            [data-testid="stSidebar"] [class*="st-key-nav_compartida_inicio"] button {{
+            [data-testid="stSidebar"] [class*="st-key-nav_compartida_oficios"] button {{
                 background:linear-gradient(120deg,#4A4C44,#55574D) !important;
                 border:1px solid #B99A65 !important;
-                border-left:4px solid #D2B47A !important;
+                border-left:6px solid #E2B66B !important;
+                box-shadow:inset 3px 0 0 #E2B66B, 0 5px 15px rgba(48,44,35,.22) !important;
             }}
             </style>
             """,
@@ -10224,7 +11634,17 @@ elif st.session_state.menu_activo == "oficios":
             </div>
         </body>
         </html>
-        """,
+        """.replace(
+            "MESA DE DISEÑO GEOMÉTRICO · GESTIÓN DE OFICIOS",
+            "MESA DE SISTEMAS ELÉCTRICOS DE TRACCIÓN FERROVIARIA · GESTIÓN DE OFICIOS"
+            if _area_activa_validada() == "setf" else
+            "MESA DE DISEÑO GEOMÉTRICO · GESTIÓN DE OFICIOS"
+        ).replace(
+            "TRAZO · ALINEAMIENTO · RASANTE",
+            "ENERGÍA · CATENARIA · TRACCIÓN"
+            if _area_activa_validada() == "setf" else
+            "TRAZO · ALINEAMIENTO · RASANTE"
+        ),
         height=178,
         scrolling=False
     )
@@ -10531,12 +11951,12 @@ elif st.session_state.menu_activo == "oficios":
                 <div class="detalle">Documentos formalizados</div>
             </div>
 
-            <div class="kpi pendientes">
+            <div class="kpi pendientes" translate="no">
                 <div class="kpi-top">
                     <div class="numero">__PENDIENTES__</div>
                     <div class="icono">!</div>
                 </div>
-                <div class="nombre">Pendientes</div>
+                <div class="nombre notranslate" translate="no">Pendientes</div>
                 <div class="detalle">Requieren seguimiento</div>
             </div>
 
@@ -11331,7 +12751,7 @@ elif st.session_state.menu_activo == "oficios":
     ).decode("ascii")
 
     st.markdown(
-        textwrap.dedent(f"""
+        _rotulos_area(textwrap.dedent(f"""
         <div class="centro-exp-head" style="background-image:url('{dibujo_centro_uri}'),linear-gradient(105deg,#142B3F,#244B5A);background-size:53% 100%,100% 100%;background-position:right center,center center;background-repeat:no-repeat;">
             <div class="centro-exp-icon">⌕</div>
             <div>
@@ -11341,7 +12761,7 @@ elif st.session_state.menu_activo == "oficios":
             </div>
         </div>
         <div class="centro-exp-search-label">LOCALIZAR UN EXPEDIENTE</div>
-        """),
+        """)),
         unsafe_allow_html=True
     )
 
@@ -11737,7 +13157,7 @@ elif st.session_state.menu_activo == "oficios":
         )
 
         with st.container(key="exp_integral"):
-            st.markdown(f"""
+            st.markdown(_rotulos_area(f"""
             <div class="exp-int-hero">
               <div class="exp-int-artwork" style="background-image:url('{imagen_trazo}');" aria-hidden="true"></div>
               <div>
@@ -11753,7 +13173,7 @@ elif st.session_state.menu_activo == "oficios":
                 </div>
               </div>
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
 
             # Autorización ya existente. No se altera cómo se guarda información.
             if not puede_editar_responsable(responsable_resultado):
@@ -11767,14 +13187,14 @@ elif st.session_state.menu_activo == "oficios":
                     )
 
             with st.container(key="exp_int_seccion_1"):
-                st.markdown(f"""
+                st.markdown(_rotulos_area(f"""
                 <div class="exp-int-heading">
                   <div class="exp-int-index">01</div>
                   <div><div class="exp-int-section-title">INFORMACIÓN GENERAL</div>
                     <div class="exp-int-section-desc">Datos del oficio y su contexto técnico</div></div>
                   <div class="exp-int-tagline">TRAZO / ALINEAMIENTO / RASANTE</div>
                 </div>
-                """, unsafe_allow_html=True)
+                """), unsafe_allow_html=True)
 
                 # Estructura compacta en tres columnas equilibradas:
                 # contexto del oficio, datos editables y referencia fotográfica.
@@ -11792,7 +13212,7 @@ elif st.session_state.menu_activo == "oficios":
                         editar_campo(*campos[2])  # Estatus
                         editar_campo(*campos[3])  # Fecha de recepción
                 with foto:
-                    st.markdown(f"""
+                    st.markdown(_rotulos_area(f"""
                     <div class="exp-int-photo" style="{fondo_fotografia}">
                       <div class="exp-int-photo-label">
                         <strong>DISEÑO GEOMÉTRICO</strong>
@@ -11800,7 +13220,7 @@ elif st.session_state.menu_activo == "oficios":
                         <div class="exp-int-photo-line"></div>
                       </div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    """), unsafe_allow_html=True)
 
             with st.container(key="exp_int_seccion_2"):
                 st.markdown("""
@@ -12025,6 +13445,41 @@ elif st.session_state.menu_activo == "oficios":
     )
 
     tabla_oficios = obtener_oficios()
+    if _area_activa_validada() == "setf" and es_administrador_documental_setf() and not tabla_oficios.empty:
+        with st.expander("Reasignación de emergencia · SETF", expanded=False):
+            st.caption("Solo para ausencias o contingencias. El cambio de responsable se registra y no elimina versiones previas.")
+            candidatos = tabla_oficios.to_dict("records")
+            seleccionados = {}
+            for r in candidatos:
+                fol = str(r.get("Folio", "")).strip()
+                num = str(r.get("No. de oficio", "")).strip()
+                if not num:
+                    continue
+                clave = f"{num} · Folio {fol} · {str(r.get('Responsable',''))}"
+                seleccionados[clave] = (fol, num, str(r.get("Responsable", "")).strip())
+            if seleccionados:
+                with st.form("setf_reasignacion_emergencia"):
+                    elegido = st.selectbox("Oficio a reasignar", list(seleccionados))
+                    anterior = seleccionados[elegido][2]
+                    destino = st.selectbox("Nuevo responsable", _responsables_setf(), index=None,
+                                           placeholder="Selecciona un integrante de SETF")
+                    motivo = st.text_area("Motivo de emergencia (obligatorio)", placeholder="Ej. Ausencia del responsable principal")
+                    confirmar = st.checkbox("Confirmo la reasignación excepcional")
+                    enviar = st.form_submit_button("Reasignar y guardar en bitácora", type="primary")
+                if enviar:
+                    if not destino or not motivo.strip() or not confirmar:
+                        st.error("Selecciona al nuevo responsable, indica un motivo y confirma la operación.")
+                    elif normalizar_texto(destino) == normalizar_texto(anterior):
+                        st.warning("El nuevo responsable debe ser distinto del actual.")
+                    else:
+                        folio_r, numero_r, original = seleccionados[elegido]
+                        try:
+                            _reasignar_oficio_setf_emergencia(folio_r, numero_r, original, destino, motivo.strip())
+                            st.success("Reasignación guardada. El oficio aparecerá en los pendientes del nuevo responsable.")
+                            st.rerun()
+                        except Exception as err:
+                            st.error(f"No se pudo completar la reasignación: {err}")
+
 
     columnas_oficios = [
         "Folio",
@@ -12409,11 +13864,17 @@ elif st.session_state.menu_activo == "urgentes":
 elif st.session_state.menu_activo == "firmados":
     _modulo_lateral_documentos("firmados")
 
+elif st.session_state.menu_activo == "minutas":
+    if _area_activa_validada() == "setf":
+        _modulo_minutas_setf()
+    else:
+        _modulo_minutas_diseno_pendiente()
+
 elif st.session_state.menu_activo == "diseno":
     if st.button("← Volver al Menú Principal", key="volver_diseno"):
         st.session_state.menu_activo = "home"
         st.rerun()
 
     st.markdown("---")
-    st.markdown("## Ingeniería de Detalle Fase I")
-    st.info("Espacio preparado para la gestión de proyectos y control de esta mesa.")
+    st.markdown("## Sistemas Eléctricos · Módulo de planos" if _area_activa_validada() == "setf" else "## Ingeniería de Detalle Fase I")
+    st.info("Módulo de planos en preparación. La consulta, carga, revisión y gestión de planos se implementarán en una próxima etapa." if _area_activa_validada() == "setf" else "Espacio preparado para la gestión de proyectos y control de esta mesa.")
