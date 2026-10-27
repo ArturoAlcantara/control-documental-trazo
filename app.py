@@ -1363,7 +1363,8 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
     permitido = (
         (actual == ETAPA_BORRADOR and etapa_nueva == ETAPA_ENVIADO and (admin or auxiliar)) or
         (actual in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)
-         and etapa_nueva == ETAPA_TTE and admin) or
+         and etapa_nueva == ETAPA_TTE
+         and (admin or (_area_activa_validada() == "setf" and auxiliar))) or
         (actual == ETAPA_TTE and etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_FIRMA) and tte) or
         (actual == ETAPA_FIRMA and etapa_nueva in (ETAPA_RETORNO_FIRMA, ETAPA_ARCHIVADO) and admin)
     )
@@ -1395,7 +1396,15 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
         if set(cambios) != {"Estatus"} or cambios["Estatus"] not in ("En firma", "En correcciones"):
             raise PermissionError("La Tte. solo puede autorizar la firma o solicitar correcciones.")
     else:
-        exigir_permiso_borradores()
+        # En SETF el responsable asignado puede mandar su propio Word
+        # directamente a revisión de la Tte.; DG conserva sus revisores.
+        if _area_activa_validada() == "setf" and cambios == {"Estatus": "En revisión"}:
+            oficio_autorizado = _verificar_expediente_documental(folio, numero)
+            if not (puede_gestionar_borradores() or
+                    puede_editar_responsable(oficio_autorizado.get("Responsable", ""))):
+                raise PermissionError("No tienes permiso para enviar este oficio a revisión.")
+        else:
+            exigir_permiso_borradores()
     # La comprobación de acceso ocurre en el servidor, no en el formulario.
     _verificar_expediente_documental(folio, numero)
     hoja = conectar_google_sheets()
@@ -2630,15 +2639,32 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                 # En SETF se ofrecen EXCLUSIVAMENTE los integrantes de SETF,
                 # incluidos los registrados en Secrets; en DG se conserva la lista anterior.
                 if _area_activa_validada() == "setf":
-                    personas = ["No especificado"] + [
-                        nombre for nombre in _responsables_setf()
-                        if nombre not in ("No especificado", "Otro")
-                    ] + ["Otro"]
+                    # Los autores no deben heredarse de los responsables DG.
+                    # Usar cuentas adscritas a SETF y autores opcionales explícitos.
+                    nombres_setf = []
+                    for info in st.secrets["usuarios"].values():
+                        if (hasattr(info, "get") and
+                            str(info.get("area", "diseno")).strip().lower() == "setf"):
+                            nombre = str(info.get("nombre") or info.get("responsable") or "").strip()
+                            if nombre and nombre not in nombres_setf:
+                                nombres_setf.append(nombre)
+                    # Arturo y Alondra pueden alternar las dos áreas sin
+                    # tener necesariamente area='setf' en su perfil.
+                    for usuario_id in ("arturo", "alondra"):
+                        info = st.secrets["usuarios"].get(usuario_id, {})
+                        nombre = str(info.get("nombre") or info.get("responsable") or "").strip()
+                        if nombre and nombre not in nombres_setf:
+                            nombres_setf.append(nombre)
+                    for nombre in st.secrets["setf"].get("autores_documentos", []):
+                        nombre = str(nombre).strip()
+                        if nombre and nombre not in nombres_setf:
+                            nombres_setf.append(nombre)
+                    personas = ["No especificado"] + sorted(nombres_setf) + ["Otro"]
                 else:
                     personas = ["No especificado", "Magali Rivera", "Ricardo Godínez", "Cecilia Santos",
                                 "Jesús Rodriguez", "Alejandra Cardoso", "John Bautista", "Otro"]
                 persona_elegida = st.selectbox("¿Quién lo elaboró o entregó?", personas,
-                                              key=f"doc_origen_lista_{folio}_{numero}")
+                                              key=f"doc_origen_lista_{_area_activa_validada()}_{folio}_{numero}")
                 origen = (st.text_input("Especifica el nombre", key=f"doc_origen_otro_{folio}_{numero}")
                           if persona_elegida == "Otro" else persona_elegida)
                 guardar = st.form_submit_button("Guardar Word y conservar versión", use_container_width=True)
@@ -2683,7 +2709,16 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
     """, unsafe_allow_html=True)
     st.markdown("**Siguiente acción**")
     if etapa == ETAPA_BORRADOR:
-        if admin:
+        if _area_activa_validada() == "setf" and (admin or auxiliar):
+            if st.button("Mandar versión a la Tte. Alondra →", key=f"doc_tte_{folio}_{numero}",
+                         type="primary", use_container_width=True):
+                try:
+                    _cambiar_etapa_borrador(folio, numero, ETAPA_TTE)
+                    _actualizar_oficio_flujo(folio, numero, {"Estatus": "En revisión"})
+                    st.rerun()
+                except Exception as error:
+                    st.error(_mensaje_error_sheets(error))
+        elif admin:
             if st.button("Enviar versión actual a la Tte. Alondra →", key=f"doc_tte_{folio}_{numero}",
                          type="primary", use_container_width=True):
                 try:
@@ -2700,9 +2735,12 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                     st.rerun()
                 except Exception as error:
                     st.error(_mensaje_error_sheets(error))
-    elif etapa in (ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) and admin:
-        st.info("John y Alejandra pueden cargar una versión corregida o enviar la actual a la Tte.")
-        if st.button("Enviar versión actual a la Tte. Alondra →", key=f"doc_reenviar_{folio}_{numero}",
+    elif etapa in (ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA) and (
+            admin or (_area_activa_validada() == "setf" and auxiliar)):
+        st.info("Puedes enviar la versión actual a la Tte. Alondra." if _area_activa_validada() == "setf"
+                else "John y Alejandra pueden cargar una versión corregida o enviar la actual a la Tte.")
+        if st.button("Mandar versión a la Tte. Alondra →" if _area_activa_validada() == "setf"
+                     else "Enviar versión actual a la Tte. Alondra →", key=f"doc_reenviar_{folio}_{numero}",
                      type="primary", use_container_width=True):
             try:
                 _cambiar_etapa_borrador(folio, numero, ETAPA_TTE)
@@ -5297,7 +5335,9 @@ def _panel_revision_tte(registro):
                     archivo_tte = st.file_uploader(
                         "Word o PDF con modificaciones de la Tte. (opcional)",
                         type=["docx", "pdf"], key=f"tte_word_devolucion_{clave}",
-                        help="Adjunto opcional. John y Alejandra podrán consultarlo en Drive como Word o PDF.",
+                        help=("Adjunto opcional. El personal autorizado de SETF podrá consultarlo en Drive como Word o PDF."
+                              if _area_activa_validada() == "setf" else
+                              "Adjunto opcional. John y Alejandra podrán consultarlo en Drive como Word o PDF."),
                     )
                     comentario = st.text_area(
                         "Comentarios u observaciones (opcional)",
