@@ -251,9 +251,11 @@ def exigir_sesion():
 
 def navegar_a(destino):
     """Cambia de módulo y actualiza la interfaz sin perder la sesión."""
-    destinos = {"home", "oficios", "diseno", "pendientes", "urgentes", "firmados", "minutas"}
+    destinos = {"home", "oficios", "diseno", "pendientes", "urgentes", "firmados", "minutas", "reuniones"}
     if destino not in destinos:
         raise ValueError("Módulo de navegación no reconocido.")
+    if destino == "reuniones" and _area_activa_validada() != "setf":
+        raise PermissionError("Gestión de reuniones está disponible únicamente para SETF.")
     st.session_state.menu_activo = destino
     st.rerun()
 
@@ -402,7 +404,7 @@ def mostrar_login():
 
 
 def mostrar_sesion():
-    if st.session_state.get("menu_activo") in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
+    if st.session_state.get("menu_activo") in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
         return  # Sesión y cierre están en la barra institucional del módulo.
     col_sesion1, col_sesion2 = st.columns([6, 1])
     with col_sesion2:
@@ -680,7 +682,7 @@ if len(autorizadas) == 2 and st.session_state.area_actual is None:
     mostrar_selector_areas()
     st.stop()
 
-if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "oficios", "pendientes", "urgentes", "firmados", "minutas"):
+if len(autorizadas) == 2 and st.session_state.menu_activo not in ("home", "oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
     espacio, cambiar = st.columns([5,1])
     with cambiar:
         if st.button("⇄ Cambiar de área", key="cambiar_area_institucional", use_container_width=True):
@@ -720,14 +722,14 @@ _area_previa = st.session_state.get("_ultima_area_datos")
 if _area_previa != st.session_state.area_actual:
     claves_sesion_documental = {
         "oficios_marcados", "pdf_reporte_generado", "exp_identidad",
-        "exp_editando", "exp_guardado", "eliminacion_pendiente",
+        "exp_editando", "exp_guardado", "eliminacion_pendiente", "eliminacion_lote_pendiente",
         "pend_bandeja", "pend_expediente_abierto", "pend_guardado",
         "firmados_kpi_filtro", "buscar_firmados", "buscar_urgentes",
         "oficio_guardado", "mostrar_registro", "firma_editor_actual",
         "registro_guardado", "version_formulario", "epoch_editor",
         "firm_orden", "urgentes_estado",
     }
-    claves_prefijo = ("doc_", "ver_pdf_", "preview_", "pdf_", "word_", "tte_dictamen_", "docx_")
+    claves_prefijo = ("doc_", "ver_pdf_", "preview_", "pdf_", "word_", "tte_dictamen_", "docx_", "reun_")
     for _clave in list(st.session_state.keys()):
         if _clave in claves_sesion_documental or _clave.startswith(claves_prefijo):
             st.session_state.pop(_clave, None)
@@ -1341,6 +1343,56 @@ def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No esp
             f"Detalle: {_mensaje_error_sheets(error)}"
         )
     return subido
+
+
+
+
+# Registro independiente de oficios NUEVOS enviados a firma. Cada mesa usa su libro.
+COLUMNAS_ENVIOS_FIRMA = ["Folio", "No. de oficio origen", "No. de oficio nuevo", "Asunto nuevo", "Fecha envío", "Usuario"]
+
+@st.cache_resource(show_spinner=False)
+def _hoja_envios_firma_por_area(area):
+    libro = conectar_google_sheets_por_area(area).spreadsheet
+    try:
+        hoja = libro.worksheet("ENVIOS_FIRMA")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="ENVIOS_FIRMA", rows=1000, cols=6)
+        hoja.append_row(COLUMNAS_ENVIOS_FIRMA, value_input_option="RAW")
+    if hoja.row_values(1) != COLUMNAS_ENVIOS_FIRMA:
+        raise ValueError("La hoja ENVIOS_FIRMA tiene una estructura distinta; no se modificaron los datos.")
+    return hoja
+
+
+def _leer_envios_firma():
+    # Lectura fresca: los movimientos deben verse entre cuentas sin reiniciar sesión.
+    return _hoja_envios_firma_por_area(_area_activa_validada()).get_all_records()
+
+
+def _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto):
+    """Registra la identidad del documento enviado antes de cambiar su etapa."""
+    from zoneinfo import ZoneInfo
+    nuevo_numero = str(nuevo_numero or "").strip()
+    nuevo_asunto = str(nuevo_asunto or "").strip()
+    if not nuevo_numero or not nuevo_asunto:
+        raise ValueError("El número y el asunto del nuevo oficio son obligatorios para enviarlo a firma.")
+    if len(nuevo_numero) > 180 or len(nuevo_asunto) > 1000:
+        raise ValueError("El número o el asunto excede la longitud permitida.")
+    hoja = _hoja_envios_firma_por_area(_area_activa_validada())
+    registros = hoja.get_all_records()
+    identidad = (str(folio).strip(), str(numero).strip())
+    for registro in registros:
+        anterior = (str(registro.get("Folio", "")).strip(),
+                    str(registro.get("No. de oficio origen", "")).strip())
+        if normalizar_texto(registro.get("No. de oficio nuevo", "")) == normalizar_texto(nuevo_numero):
+            if anterior != identidad:
+                raise ValueError("Este número de oficio nuevo ya se registró en otro expediente de esta mesa.")
+            if (str(registro.get("Asunto nuevo", "")).strip() == nuevo_asunto):
+                # Evita duplicar un registro idéntico si una operación posterior falló.
+                return
+            raise ValueError("Este número ya está asociado al expediente con otro asunto. Revisa el historial.")
+    fecha = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+    hoja.append_row([str(folio), str(numero), nuevo_numero, nuevo_asunto,
+                     fecha, identificador_sesion()], value_input_option="RAW")
 
 
 def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
@@ -2797,6 +2849,11 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
         with st.form(key=f"doc_revision_tte_{folio}_{numero}"):
             decision = st.radio("Resultado de la revisión", ["Autorizar para firma", "Solicitar correcciones"],
                                 horizontal=True)
+            if decision == "Autorizar para firma":
+                nuevo_numero_firma = st.text_input("Número del nuevo oficio enviado a firma *", key=f"firma_num_doc_{folio}_{numero}")
+                nuevo_asunto_firma = st.text_area("Asunto del nuevo oficio *", key=f"firma_asunto_doc_{folio}_{numero}")
+            else:
+                nuevo_numero_firma, nuevo_asunto_firma = "", ""
             comentario = st.text_area("Observaciones de revisión (opcional)",
                                       placeholder="Puedes dejar indicaciones o continuar sin comentarios")
             archivo_tte = (st.file_uploader("Word o PDF con modificaciones de la Tte. (opcional)",
@@ -2812,6 +2869,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                 if nueva == ETAPA_CORRECCIONES and archivo_tte is not None:
                     with st.spinner("Guardando documento corregido en Drive..."):
                         _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
+                if nueva == ETAPA_FIRMA:
+                    _registrar_envio_firma(folio, numero, nuevo_numero_firma, nuevo_asunto_firma)
                 _actualizar_oficio_flujo(folio, numero, {
                     "Estatus": "En firma" if nueva == ETAPA_FIRMA else "En correcciones"
                 }, autorizacion_tte=True)
@@ -2992,6 +3051,41 @@ def _eliminar_oficio_confirmado(folio, numero):
                for fila in datos_restantes[1:]):
             raise RuntimeError(f"La eliminación quedó incompleta en {nombre}. "
                                "Revisa las hojas antes de reintentar.")
+
+
+
+
+def _eliminar_oficios_lote_confirmado(identidades):
+    """Elimina varios oficios usando la eliminación auditada individual.
+
+    No se garantiza atomicidad entre llamadas a Sheets. En caso de error se
+    entrega el listado de los que ya fueron eliminados para evitar reintentos ciegos.
+    """
+    exigir_sesion()
+    if not puede_administrar_oficios_actual():
+        raise PermissionError("No tienes permisos para eliminar oficios en esta área.")
+    identidades = [(str(f).strip(), str(n).strip()) for f, n in identidades]
+    if len(identidades) < 2 or len(identidades) != len(set(identidades)):
+        raise ValueError("Selecciona al menos dos oficios diferentes.")
+    registros_actuales = _leer_registros_oficios()
+    for folio, numero in identidades:
+        if sum(str(r.get("Folio", "")).strip() == folio and
+               str(r.get("No. de oficio", "")).strip() == numero
+               for r in registros_actuales) != 1:
+            raise ValueError(f"El expediente {folio} / {numero} ya cambió o no es único. No se inició el lote.")
+    completados = []
+    for folio, numero in identidades:
+        try:
+            _eliminar_oficio_confirmado(folio, numero)
+            completados.append((folio, numero))
+        except Exception as error:
+            detalle = ", ".join(f"{f} / {n}" for f, n in completados) or "ninguno"
+            raise RuntimeError(
+                f"El lote se detuvo al procesar {folio} / {numero}. "
+                f"Eliminados antes del fallo: {detalle}. "
+                f"Revisa Google Sheets antes de repetir. Motivo: {error}"
+            ) from error
+    return completados
 
 
 def _panel_eliminar_oficio(folio, numero, *, origen):
@@ -3560,7 +3654,7 @@ def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
     _leer_modalidades_por_area.clear()
 
 
-def _autorizar_tramite_directo(folio, numero, autorizar, observaciones=""):
+def _autorizar_tramite_directo(folio, numero, autorizar, observaciones="", nuevo_numero="", nuevo_asunto=""):
     """Solo Tte.: confirma un envío; no cuenta un simple registro como salida."""
     exigir_permiso_revision_final()
     registro = _modalidad_expediente(folio, numero)
@@ -3575,6 +3669,8 @@ def _autorizar_tramite_directo(folio, numero, autorizar, observaciones=""):
     if len(coincidencias) != 1 or str(coincidencias[0].get("Estatus", "")).strip() != "En revisión":
         raise ValueError("El oficio ya no espera revisión, o no es único en OFICIOS.")
     nuevo = "En firma" if autorizar else "En correcciones"
+    if autorizar:
+        _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto)
     # El origen/versión 0 distingue al trámite directo de los borradores.
     _actualizar_oficio_flujo(folio, numero, {"Estatus": nuevo}, autorizacion_tte=True)
     try:
@@ -3842,6 +3938,8 @@ def _panel_tramites_directos_tte():
             url = str(m.get("URL principal", "")).strip()
             if url.startswith("https://"):
                 st.link_button("Ver oficio principal en Drive", url, use_container_width=True)
+            nuevo_numero_directo = st.text_input("Número del nuevo oficio enviado a firma *", key=f"directo_num_nuevo_{clave}")
+            nuevo_asunto_directo = st.text_area("Asunto del nuevo oficio *", key=f"directo_asunto_nuevo_{clave}")
             obs = st.text_area("Observaciones (opcional)", key=f"directo_obs_{clave}", height=68)
             adjunto_directo = st.file_uploader(
                 "Word o PDF con correcciones (opcional)", type=["docx", "pdf"],
@@ -3862,7 +3960,7 @@ def _panel_tramites_directos_tte():
                     try:
                         if devolver and adjunto_directo is not None:
                             _adjuntar_correccion_directo_tte(folio, numero, adjunto_directo)
-                        _autorizar_tramite_directo(folio, numero, aprobar, obs)
+                        _autorizar_tramite_directo(folio, numero, aprobar, obs, nuevo_numero_directo, nuevo_asunto_directo)
                         st.success("Decisión registrada y expediente actualizado.")
                         st.rerun()
                     except Exception as error:
@@ -3913,6 +4011,27 @@ def formulario_nuevo_oficio():
             "Oficio registrado correctamente en Google Sheets. "
             "Puedes capturar un nuevo oficio."
         )
+
+    # Si el alta se guardó pero la escritura de ENVIOS_FIRMA falló,
+    # ofrecer reintentar SOLO esa escritura, sin duplicar el oficio en OFICIOS.
+    pendiente_firma = st.session_state.get("alta_envio_firma_pendiente")
+    if pendiente_firma and pendiente_firma.get("area") == _area_activa_validada():
+        st.warning(
+            "El oficio ya fue guardado, pero falta registrar su envío a firma "
+            "para que se refleje en los indicadores. No vuelvas a darlo de alta."
+        )
+        if st.button("Reintentar registro del envío a firma", key="reintentar_alta_envio_firma"):
+            try:
+                _registrar_envio_firma(
+                    pendiente_firma["folio"], pendiente_firma["numero"],
+                    pendiente_firma["nuevo_numero"], pendiente_firma["nuevo_asunto"],
+                )
+                st.session_state.pop("alta_envio_firma_pendiente", None)
+                st.success("Envío a firma registrado con su fecha y hora automáticas.")
+                st.rerun()
+            except Exception as error:
+                st.error("El registro del envío sigue pendiente: " + _mensaje_error_sheets(error))
+        return
 
     # =========================================================
     # FORMULARIO NUEVO OFICIO - DISEÑO COMPACTO
@@ -4242,35 +4361,46 @@ def formulario_nuevo_oficio():
             disabled=not es_firmado
         )
 
-    # Identificador del oficio que saldrá firmado / documento ya firmado.
-    st.markdown(
-        """
-        <div style="
-            color:#E8F0F5;
-            font-size:11px;
-            font-weight:700;
-            margin-top:10px;
-            margin-bottom:4px;
-        ">
-            ▣ Identificación del oficio por firmar
-        </div>
-        """ if registro_solo_numero_salida else """
-        <div style="
-            color:#E8F0F5;
-            font-size:11px;
-            font-weight:700;
-            margin-top:10px;
-            margin-bottom:4px;
-        ">
-            ▣ Oficio firmado
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    # El envío a firma registra la identidad del documento en ENVIOS_FIRMA.
+    # El enlace de Drive permanece bloqueado hasta que el oficio esté firmado.
+    es_en_firma = estatus == "En firma"
+    numero_envio_firma = ""
+    asunto_envio_firma = ""
 
-    col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
-
-    if registro_solo_numero_salida:
+    if es_en_firma:
+        st.markdown("**▣ Identificación del oficio enviado a firma**")
+        col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
+        with col_firmado_nombre:
+            if registro_solo_numero_salida:
+                st.caption("Se utilizará el número de salida como número del oficio enviado a firma.")
+                numero_envio_firma = st.text_input(
+                    "Nombre o número del oficio enviado a firma *",
+                    placeholder="Ej. LFSLPSTL-IB-26-2119",
+                    key=f"nuevo_numero_salida_{version}",
+                )
+                numero = numero_envio_firma.strip()
+            else:
+                numero_envio_firma = st.text_input(
+                    "Nombre o número del oficio enviado a firma *",
+                    placeholder="Ej. LFSLPSTL-IB-26-2119",
+                    key=f"alta_numero_envio_firma_{version}",
+                )
+        with col_firmado_link:
+            st.text_input(
+                "Enlace de Drive · disponible después de firmar",
+                value="", disabled=True,
+                placeholder="Se habilita al registrar el documento firmado",
+                key=f"alta_liga_envio_firma_{version}",
+            )
+        asunto_envio_firma = st.text_area(
+            "Asunto del oficio enviado a firma *",
+            key=f"alta_asunto_envio_firma_{version}", height=75,
+        )
+        nombre_firmado, liga_firmado, firmado = "", "", ""
+        st.caption("La fecha y hora de envío se registrarán automáticamente al guardar el oficio.")
+    elif registro_solo_numero_salida:
+        st.markdown("**▣ Identificación del oficio por firmar**")
+        col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             numero_salida = st.text_input(
                 "Nombre o número del oficio que saldrá firmado",
@@ -4279,7 +4409,6 @@ def formulario_nuevo_oficio():
                 help="Este será el número de oficio con el que se identificará el expediente.",
             )
         with col_firmado_link:
-            # En este tipo de registro todavía no se solicita documento firmado.
             st.text_input(
                 "Enlace de Drive · disponible después de firmar",
                 value="", disabled=True,
@@ -4287,29 +4416,29 @@ def formulario_nuevo_oficio():
                 key=f"nuevo_liga_firmado_sin_folio_{version}",
             )
         numero = numero_salida.strip()
-        nombre_firmado, liga_firmado = "", ""
-        firmado = ""  # No crear un enlace/documento ficticio.
+        nombre_firmado, liga_firmado, firmado = "", "", ""
         st.caption("El número de salida se guardará como número de oficio. "
                    "El enlace podrá añadirse cuando el documento regrese firmado.")
     else:
+        st.markdown("**▣ Oficio firmado**")
+        col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             nombre_firmado = st.text_input(
                 "Nombre del documento",
                 placeholder="Ej. LFSLPSTL-IB-26-2119",
                 key=f"nuevo_nombre_firmado_{version}",
-                disabled=not es_firmado
+                disabled=not es_firmado,
             )
         with col_firmado_link:
             liga_firmado = st.text_input(
                 "Enlace de Drive",
                 placeholder="Pega aquí el enlace de Drive...",
                 key=f"nuevo_liga_firmado_{version}",
-                disabled=not es_firmado
+                disabled=not es_firmado,
             )
         if es_firmado and (nombre_firmado.strip() or liga_firmado.strip()):
             firmado = json.dumps([{
-                "nombre": nombre_firmado.strip(),
-                "url": liga_firmado.strip()
+                "nombre": nombre_firmado.strip(), "url": liga_firmado.strip(),
             }], ensure_ascii=False)
         else:
             firmado = ""
@@ -4460,6 +4589,14 @@ def formulario_nuevo_oficio():
             st.error("Para marcar un oficio como Firmado debes indicar su fecha de entrega.")
             return
 
+        if es_en_firma:
+            if not numero_envio_firma.strip() or not asunto_envio_firma.strip():
+                st.error("Para registrar un oficio en firma debes indicar el nombre o número y el asunto del oficio enviado a firma.")
+                return
+            if len(numero_envio_firma.strip()) > 180 or len(asunto_envio_firma.strip()) > 1000:
+                st.error("El número o el asunto del oficio enviado a firma supera la longitud permitida.")
+                return
+
         if tramite_directo:
             from urllib.parse import urlparse
             link = urlparse(url_principal.strip())
@@ -4530,6 +4667,14 @@ def formulario_nuevo_oficio():
                     observaciones.strip()
                 ]
 
+                # Validación anticipada de la hoja de envíos antes de crear el expediente.
+                # Así se evita guardar un alta cuyos datos de firma ya están ocupados.
+                if es_en_firma:
+                    for envio in _leer_envios_firma():
+                        if normalizar_texto(envio.get("No. de oficio nuevo", "")) == normalizar_texto(numero_envio_firma):
+                            st.error("Este número de oficio enviado a firma ya está registrado en esta mesa.")
+                            return
+
                 # Registrar el oficio y su modalidad. Son dos hojas de un mismo libro;
                 # si la segunda escritura falla se muestra una advertencia específica
                 # para conciliar sin volver a duplicar el oficio.
@@ -4545,6 +4690,29 @@ def formulario_nuevo_oficio():
                              "de modalidad. No lo captures otra vez: solicita la "
                              "conciliación de MODALIDADES_TRAMITE al administrador. "
                              f"Detalle: {error}")
+                    return
+
+            # El envío se registra después de guardar el expediente, utilizando
+            # el mismo registro y sello horario que alimenta los indicadores.
+            if es_en_firma:
+                try:
+                    _registrar_envio_firma(
+                        folio.strip(), numero.strip(),
+                        numero_envio_firma.strip(), asunto_envio_firma.strip(),
+                    )
+                except Exception as error:
+                    st.session_state.alta_envio_firma_pendiente = {
+                        "area": _area_activa_validada(),
+                        "folio": folio.strip(), "numero": numero.strip(),
+                        "nuevo_numero": numero_envio_firma.strip(),
+                        "nuevo_asunto": asunto_envio_firma.strip(),
+                    }
+                    st.error(
+                        "El oficio se guardó en OFICIOS, pero no se pudo registrar "
+                        "el envío a firma. No lo captures otra vez; utiliza el botón "
+                        "de reintento que aparecerá arriba. Detalle: "
+                        + _mensaje_error_sheets(error)
+                    )
                     return
 
             # Reiniciar formulario únicamente
@@ -5375,6 +5543,11 @@ def _panel_revision_tte(registro):
                         st.rerun()
             decision = st.session_state[decision_key]
             with st.form(key=f"tte_form_{clave}"):
+                if decision == "Autorizar para firma":
+                    nuevo_numero_firma = st.text_input("Número del nuevo oficio enviado a firma *", key=f"tte_num_nuevo_{clave}")
+                    nuevo_asunto_firma = st.text_area("Asunto del nuevo oficio *", key=f"tte_asunto_nuevo_{clave}")
+                else:
+                    nuevo_numero_firma, nuevo_asunto_firma = "", ""
                 if decision == "Solicitar correcciones":
                     archivo_tte = st.file_uploader(
                         "Word o PDF con modificaciones de la Tte. (opcional)",
@@ -5414,6 +5587,8 @@ def _panel_revision_tte(registro):
                         # a la devolución vigente en EVENTOS_BORRADORES.
                         if nueva_etapa == ETAPA_CORRECCIONES and archivo_tte is not None:
                             _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
+                        if nueva_etapa == ETAPA_FIRMA:
+                            _registrar_envio_firma(folio, numero, nuevo_numero_firma, nuevo_asunto_firma)
                         _actualizar_oficio_flujo(folio, numero, {
                             "Estatus": "En firma" if nueva_etapa == ETAPA_FIRMA else "En correcciones"
                         }, autorizacion_tte=True)
@@ -6875,6 +7050,7 @@ _FONDOS_SETf_POR_PAGINA = {
     "urgentes": "fondo_setf_urgentes.png",
     "firmados": "fondo_setf_firmados.png",
     "minutas": "fondo_minutas_setf.png",  # Fondo exclusivo del módulo Minutas SETF.
+    "reuniones": "fondo_minutas_setf.png",  # Agenda SETF, reutiliza fondo existente.
 }
 
 
@@ -6934,7 +7110,7 @@ def aplicar_fondo_setf_por_pagina():
     </style>""", unsafe_allow_html=True)
 
 
-if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
     aplicar_fondo_setf_por_pagina()
     mostrar_cabecera_documental()
 
@@ -6944,7 +7120,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
 # =========================================================
 # Mantener la misma estructura de widgets y las mismas claves entre
 # pantallas evita desmontajes innecesarios durante la navegación.
-if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas"):
+if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
     # Imagen de la barra lateral: independiente del fondo del área principal.
     # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
     if _area_activa_validada() == "setf":
@@ -7041,7 +7217,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
     """.replace("__FONDO_SIDEBAR__", fondo_sidebar_css).replace(
         "__ACTIVE_NAV_CSS__",
         '[data-testid="stSidebar"] [class*="st-key-nav_compartida_' +
-        {"oficios": "oficios", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados", "minutas": "minutas"}.get(
+        {"oficios": "oficios", "pendientes": "pendientes", "urgentes": "urgentes", "firmados": "firmados", "minutas": "minutas", "reuniones": "reuniones"}.get(
             st.session_state.menu_activo, "inicio") +
         '"] button {background:linear-gradient(120deg,#4A4C44,#55574D) !important;'
         'border:1px solid #C7A465 !important;border-left:6px solid #E2B66B !important;'
@@ -7084,6 +7260,10 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
         if st.button("▤ Minutas", key="nav_compartida_minutas", use_container_width=True):
             if st.session_state.menu_activo != "minutas":
                 navegar_a("minutas")
+        if _area_activa_validada() == "setf":
+            if st.button("▦ Gestión de reuniones", key="nav_compartida_reuniones", use_container_width=True):
+                if st.session_state.menu_activo != "reuniones":
+                    navegar_a("reuniones")
         st.divider()
 
 # Fondo de trabajo: conserva el plano ferroviario visible detrás de las tarjetas.
@@ -7579,6 +7759,18 @@ def _modulo_lateral_documentos(tipo):
             except (ValueError, TypeError, OverflowError):
                 return None
 
+        try:
+            registros_envios_nuevos = _leer_envios_firma()
+        except Exception as error:
+            registros_envios_nuevos = []
+            st.warning("No se pudo leer ENVIOS_FIRMA. Revisa la conexión: " + _mensaje_error_sheets(error))
+        mapa_envios = {}
+        for registro_envio in registros_envios_nuevos:
+            identidad_envio = (str(registro_envio.get("Folio", "")).strip(),
+                              str(registro_envio.get("No. de oficio origen", "")).strip())
+            if identidad_envio[0] or identidad_envio[1]:
+                mapa_envios[identidad_envio] = registro_envio
+
         firmas_enviadas_hoy = None
         firmas_enviadas_semana = None
         claves_hoy, claves_semana = set(), set()
@@ -7599,6 +7791,14 @@ def _modulo_lateral_documentos(tipo):
                     claves_hoy.add(identidad)
                 if lunes <= fecha_evento <= hoy:
                     claves_semana.add(identidad)
+            # ENVIOS_FIRMA guarda fecha y hora automáticamente en zona México.
+            # Se incluyen los envíos cuyo evento de etapa todavía no sea legible.
+            for identidad_envio, registro_envio in mapa_envios.items():
+                fecha_envio = _fecha_evento_firma(registro_envio.get("Fecha envío"))
+                if fecha_envio == hoy:
+                    claves_hoy.add(identidad_envio)
+                if fecha_envio is not None and lunes <= fecha_envio <= hoy:
+                    claves_semana.add(identidad_envio)
             firmas_enviadas_hoy = len(claves_hoy)
             firmas_enviadas_semana = len(claves_semana)
         except Exception as error:
@@ -7738,6 +7938,9 @@ def _modulo_lateral_documentos(tipo):
         if consulta.strip():
             q = normalizar_texto(consulta)
             lista = [r for r in lista if q in normalizar_texto(
+                " ".join(str(mapa_envios.get((str(r.get("Folio", "")).strip(),
+                   str(r.get("No. de oficio", "")).strip()), {}).get(k, ""))
+                   for k in ("No. de oficio nuevo", "Asunto nuevo")) + " " +
                 " ".join(str(r.get(k, "")) for k in
                          ("Folio", "No. de oficio", "Asunto", "Responsable")) + " " + " ".join(
                 d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
@@ -7756,7 +7959,7 @@ def _modulo_lateral_documentos(tipo):
             f'<div class="firm-label">{html.escape(nombres_vista_firmados[vista_firmados].upper())}</div>',
             unsafe_allow_html=True)
         st.markdown(f'<div class="firm-caption">{len(lista)} expediente(s) · '
-                    'Firmado, Antecedentes y Anexos disponibles según sus vínculos</div>',
+                    'Documentos disponibles según su estado y vínculos</div>',
                     unsafe_allow_html=True)
         if not lista:
             st.markdown('<div class="firm-empty">No se encontraron expedientes '
@@ -7788,6 +7991,11 @@ def _modulo_lateral_documentos(tipo):
                              if archivos_firmados else "")
             if not titulo_firmado or re.fullmatch(r"Documento \d+", titulo_firmado, re.I):
                 titulo_firmado = numero or (f"Folio {folio}" if folio else "Sin número")
+            ficha_envio = mapa_envios.get((folio, numero), {})
+            if vista_firmados in ("hoy", "semana") and ficha_envio:
+                titulo_firmado = str(ficha_envio.get("No. de oficio nuevo", "")).strip() or titulo_firmado
+            asunto_envio = (str(ficha_envio.get("Asunto nuevo", "")).strip()
+                            if vista_firmados in ("hoy", "semana") else "")
             token = hashlib.sha256((folio + "|" + numero + "|" + str(indice)).encode("utf-8")).hexdigest()[:16]
 
             with st.container(key=f"firm_reg_row_{token}"):
@@ -7797,7 +8005,8 @@ def _modulo_lateral_documentos(tipo):
                     st.markdown(
                         f'<div class="firm-inline-file">'
                         f'<div class="firm-inline-name">{html.escape(titulo_firmado)}</div>'
-                        f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
+                        + (f'<div class="firm-inline-meta">Asunto: {html.escape(asunto_envio)}</div>' if asunto_envio else '')
+                        + f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
                         f'· {html.escape(responsable)} · {html.escape(estado_texto)}</div>' 
                         f'</div>', unsafe_allow_html=True)
 
@@ -7809,7 +8018,11 @@ def _modulo_lateral_documentos(tipo):
                 for columna, categoria, etiqueta in acciones:
                     archivos = documentos[categoria]
                     with columna:
-                        if len(archivos) == 1:
+                        if categoria == "firmado" and not firmado_realmente:
+                            st.button("Firmado pendiente", key=f"firm_bloq_{token}",
+                                      disabled=True, use_container_width=True,
+                                      help="La descarga se habilitará cuando regrese el oficio firmado.")
+                        elif len(archivos) == 1:
                             st.link_button(
                                 etiqueta, archivos[0]["url"],
                                 use_container_width=True,
@@ -8804,7 +9017,7 @@ def _vinculos_minutas_setf(libro):
         return {}
     return {str(r[0]).strip(): str(r[1]).strip()
             for fila in ws.get_all_values()[1:]
-            if (r := (list(fila) + ["", ""]))[0].strip() and r[1].strip()}
+            if (r := (list(fila) + ["", ""]))[0].strip()}
 
 
 def _guardar_vinculo_minuta_setf(registro, url):
@@ -8830,6 +9043,35 @@ def _guardar_vinculo_minuta_setf(registro, url):
         else:
             ws.append_row(valores, value_input_option="RAW")
     return url
+
+
+
+
+def _eliminar_vinculo_minuta_setf(registro):
+    """Desvincula una minuta sin eliminar el archivo ni su registro maestro.
+
+    Conserva una fila auxiliar con URL vacía para anular también enlaces
+    originales de MINUTAS_EXTERNAS_APP y dejar trazabilidad de la acción.
+    """
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Esta acción es exclusiva de SETF.")
+    ident = _clave_vinculo_minuta_setf(registro)
+    with _candado_minutas_instancia():
+        libro, _ = _hoja_minutas_setf()
+        ws = _hoja_vinculos_minutas_setf(libro, crear=True)
+        coincidencias = [n for n, v in enumerate(ws.col_values(1), start=1)
+                         if n > 1 and str(v).strip() == ident]
+        if len(coincidencias) > 1:
+            raise ValueError("Hay vínculos duplicados; consulta MINUTAS_ENLACES_APP.")
+        valores = [ident, "", identificador_sesion(),
+                   datetime.now().astimezone().isoformat(timespec="seconds")]
+        if coincidencias:
+            ws.update(range_name=f"A{coincidencias[0]}:D{coincidencias[0]}",
+                      values=[valores], value_input_option="RAW")
+        else:
+            ws.append_row(valores, value_input_option="RAW")
+    return True
 
 
 def _proyecto_form_minuta_setf(clave):
@@ -9146,7 +9388,7 @@ def _modulo_minutas_setf():
         vinculos_manuales = _vinculos_minutas_setf(libro)
         for registro in total:
             enlace_manual = vinculos_manuales.get(_clave_vinculo_minuta_setf(registro))
-            if enlace_manual:
+            if _clave_vinculo_minuta_setf(registro) in vinculos_manuales:
                 registro["enlace"] = enlace_manual
         codigo, fila_reservada, prox = _consecutivo_siguiente_setf(actuales, 2026)
     except Exception as error:
@@ -9304,6 +9546,28 @@ def _modulo_minutas_setf():
                                                key=f"url_minuta_{r['origen']}_{r['fila']}",
                                                placeholder="https://drive.google.com/file/d/...")
                     enviar_vinculo = st.form_submit_button("Guardar enlace de la minuta", use_container_width=True)
+                if r.get("enlace"):
+                    clave_quitar = f"quitar_vinculo_{r['origen']}_{r['fila']}"
+                    if st.button("Quitar enlace de esta minuta", key=clave_quitar,
+                                 use_container_width=True, type="secondary"):
+                        st.session_state[f"confirmar_{clave_quitar}"] = True
+                    if st.session_state.get(f"confirmar_{clave_quitar}", False):
+                        st.warning("Se quitará el enlace de la aplicación. La minuta y el archivo en Drive se conservarán.")
+                        col_si, col_no = st.columns(2)
+                        with col_si:
+                            if st.button("Confirmar eliminación del enlace", key=f"si_{clave_quitar}",
+                                         use_container_width=True):
+                                try:
+                                    _eliminar_vinculo_minuta_setf(r)
+                                    st.session_state.pop(f"confirmar_{clave_quitar}", None)
+                                    st.success("Enlace desvinculado correctamente.")
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"No se pudo desvincular: {error}")
+                        with col_no:
+                            if st.button("Cancelar", key=f"no_{clave_quitar}", use_container_width=True):
+                                st.session_state.pop(f"confirmar_{clave_quitar}", None)
+                                st.rerun()
                 if enviar_vinculo:
                     try:
                         _guardar_vinculo_minuta_setf(r, link_nuevo)
@@ -9326,6 +9590,1164 @@ def _modulo_minutas_diseno_pendiente():
         unsafe_allow_html=True)
     st.info("La gestión de minutas de Diseño Geométrico se implementará más adelante. "
             "Este apartado no consulta ni modifica la información de SETF.")
+
+
+# =========================================================
+# SETF · GESTIÓN DE REUNIONES (ACCESO COMPARTIDO)
+# =========================================================
+# Datos maestros: pestaña nueva REUNIONES_APP del mismo libro de Minutas SETF.
+# La pestaña histórica Reuniones permanece completamente intacta.
+# Metadatos y auditoría nuevos: hojas independientes en el MISMO libro.
+# No compartir con Diseño Geométrico ni exigir rol de administrador.
+
+_REUNIONES_COLUMNAS = (
+    "dia", "fecha", "hora", "asunto", "ubicacion", "asignacion", "antecedente",
+)
+_REUNIONES_ESTADOS = ("Programada", "Realizada", "Cancelada", "Por confirmar")
+_REUNIONES_META_TITULO = "REUNIONES_APP_ESTADOS"
+_REUNIONES_META_CABECERAS = [
+    "Fila origen", "Huella", "Estado", "ID", "Creado por", "Creado el",
+    "Modificado por", "Modificado el",
+]
+_REUNIONES_HIST_TITULO = "REUNIONES_APP_HISTORIAL"
+_REUNIONES_HIST_CABECERAS = [
+    "ID", "Fila origen", "Acción", "Usuario", "Fecha y hora", "Antes (JSON)", "Después (JSON)",
+]
+_REUNIONES_DIAS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+_REUNIONES_MESES = (
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+)
+
+
+def _exigir_reuniones_setf():
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Gestión de reuniones está disponible únicamente para SETF.")
+    # Todos los usuarios autenticados y adscritos a SETF pueden leer y escribir.
+
+
+def _reuniones_ahora():
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Mexico_City"))
+
+
+def _reuniones_fecha(valor):
+    from datetime import date as _date
+    if isinstance(valor, _date):
+        return valor
+    cadena = str(valor or "").strip()
+    if not cadena:
+        return None
+    for patron in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(cadena, patron).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _reuniones_hora(valor):
+    from datetime import time as _time
+    if isinstance(valor, _time):
+        return valor.replace(second=0, microsecond=0)
+    cadena = str(valor or "").strip()
+    if not cadena:
+        return None
+    # El archivo histórico almacena la hora como 1000, 1600, 900, etc.
+    if re.fullmatch(r"\d{1,4}(?:\.0+)?", cadena):
+        digitos = cadena.split(".")[0].zfill(4)
+        hh, mm = int(digitos[:-2]), int(digitos[-2:])
+    else:
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::00)?", cadena)
+        if not m:
+            return None
+        hh, mm = int(m.group(1)), int(m.group(2))
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return _time(hh, mm)
+    return None
+
+
+def _reuniones_hoja():
+    """Agenda NUEVA. No lee ni modifica la pestaña histórica Reuniones."""
+    _exigir_reuniones_setf()
+    libro = _cliente_gspread_minutas_setf().open_by_key(_id_libro_minutas_setf())
+    titulo = "REUNIONES_APP"
+    cabeceras = ["Día", "Fecha", "Hora", "Asunto", "Ubicación", "Asignación", "Antecedente"]
+    try:
+        ws = libro.worksheet(titulo)
+    except gspread.WorksheetNotFound:
+        # La cuenta de servicio necesita permisos de edición en Control Interno SETF.
+        ws = libro.add_worksheet(title=titulo, rows=1000, cols=7)
+        ws.update(range_name="A1:G1", values=[cabeceras], value_input_option="RAW")
+        libro.batch_update({"requests": [{"repeatCell": {
+            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": 7},
+            "cell": {"userEnteredFormat": {"backgroundColor": {"red": .09, "green": .17, "blue": .27},
+                                              "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True}}},
+            "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat"}}]})
+        ws.freeze(rows=1)
+    encabezados = (ws.get("A1:G1", value_render_option="FORMATTED_VALUE") or [[]])[0]
+    canonico = lambda v: "".join(ch for ch in unicodedata.normalize("NFKD", str(v or "").strip().lower()) if ch.isascii() and ch.isalpha())
+    if tuple(canonico(x) for x in (list(encabezados)+[""]*7)[:7]) != _REUNIONES_COLUMNAS:
+        raise ValueError("La pestaña REUNIONES_APP ya existe con columnas distintas. No se sobrescribió ningún dato.")
+    return libro, ws
+
+
+def _reuniones_hoja_auxiliar(libro, titulo, cabeceras, crear=False):
+    try:
+        ws = libro.worksheet(titulo)
+    except gspread.WorksheetNotFound:
+        if not crear:
+            return None
+        ws = libro.add_worksheet(title=titulo, rows=1000, cols=max(len(cabeceras), 8))
+        ws.append_row(cabeceras, value_input_option="RAW")
+    if ws.row_values(1)[:len(cabeceras)] != cabeceras:
+        raise ValueError(f"La pestaña {titulo} tiene encabezados incompatibles; no se realizó el registro.")
+    return ws
+
+
+def _reuniones_huella(fila):
+    # No usa número de fila para detectar registros movidos en la hoja original.
+    datos = (list(fila) + [""] * 7)[:7]
+    origen = "|".join(str(datos[i] or "").strip().casefold() for i in (1, 2, 3))
+    return hashlib.sha256(origen.encode("utf-8")).hexdigest()
+
+
+def _reuniones_colores_heredados(libro, ws, ultimo_renglon):
+    """Detecta verde=realizada, amarillo=programada sin reescribir colores antiguos.
+
+    Si la API no permite consultar formatos, se muestra estado 'Por confirmar'
+    para reuniones vencidas, nunca se afirma que ocurrieron solo por la fecha.
+    """
+    if ultimo_renglon < 5:
+        return {}
+    try:
+        datos = libro.fetch_sheet_metadata(params={
+            "ranges": f"'{ws.title}'!A5:D{ultimo_renglon}",
+            "includeGridData": True,
+            "fields": "sheets(data(startRow,rowData(values(effectiveFormat(backgroundColor)))))",
+        })
+        colores = {}
+        for sheet_data in datos.get("sheets", []):
+            for grid in sheet_data.get("data", []):
+                inicio = int(grid.get("startRow", 4)) + 1
+                for idx, fila in enumerate(grid.get("rowData", [])):
+                    for celda in fila.get("values", []):
+                        rgb = celda.get("effectiveFormat", {}).get("backgroundColor", {})
+                        if not rgb:
+                            continue
+                        r, g, b = (float(rgb.get(x, 0)) for x in ("red", "green", "blue"))
+                        if .26 < g and g > r * 1.25 and g > b * 1.20:
+                            colores[inicio + idx] = "Realizada"
+                            break
+                        if r > .70 and g > .63 and b < .45:
+                            colores[inicio + idx] = "Programada"
+                            break
+        return colores
+    except (ValueError, KeyError, TypeError, AttributeError, requests.RequestException, gspread.exceptions.APIError):
+        return {}
+
+
+def _reuniones_leer(libro, ws):
+    _exigir_reuniones_setf()
+    # A2:G contiene los registros de la pestaña nueva; A1:G1 son encabezados.
+    registros_originales = ws.get("A2:G", value_render_option="FORMATTED_VALUE")
+    auxiliares = _reuniones_hoja_auxiliar(
+        libro, _REUNIONES_META_TITULO, _REUNIONES_META_CABECERAS,
+    )
+    metadatos = {}
+    if auxiliares is not None:
+        for idx, fila in enumerate(auxiliares.get_all_values()[1:], start=2):
+            valores = (list(fila) + [""] * 8)[:8]
+            try:
+                num_fila = int(valores[0])
+            except ValueError:
+                continue
+            if num_fila in metadatos:
+                raise ValueError("Hay filas duplicadas en REUNIONES_APP_ESTADOS. Corrígelas antes de editar.")
+            metadatos[num_fila] = {"meta_fila": idx, "huella": valores[1],
+                                    "estado": valores[2], "id": valores[3],
+                                    "creado_por": valores[4], "creado_el": valores[5]}
+    colores = {}  # La pestaña nueva no depende del coloreado de la histórica.
+    hoy = _reuniones_ahora().date()
+    salida = []
+    for numero_fila, fila in enumerate(registros_originales, start=2):
+        valores = (list(fila) + [""] * 7)[:7]
+        fecha = _reuniones_fecha(valores[1])
+        if not fecha or not any(str(c).strip() for c in valores[2:7]):
+            continue  # Ignorar títulos, leyenda de colores y filas vacías.
+        hora = _reuniones_hora(valores[2])
+        huella = _reuniones_huella(valores)
+        meta = metadatos.get(numero_fila)
+        # Si se reordenó la hoja o se cambió desde Sheets, no asociar un
+        # estado ajeno solo porque sigue ocupando la misma posición.
+        meta = meta if meta and meta["huella"] == huella else None
+        estado = (meta["estado"] if meta and meta["estado"] in _REUNIONES_ESTADOS
+                  else colores.get(numero_fila, "Programada" if fecha >= hoy else "Por confirmar"))
+        salida.append({
+            "fila": numero_fila, "datos": valores, "huella": huella,
+            "fecha": fecha, "hora": hora, "asunto": valores[3],
+            "ubicacion": valores[4], "responsable": valores[5],
+            "antecedente": valores[6], "estado": estado,
+            "id": meta["id"] if meta else "", "meta": meta,
+        })
+    return salida
+
+
+def _reuniones_revisar_datos(fecha, hora, asunto, ubicacion, responsable, antecedente, estado):
+    if not fecha or not hora or not str(asunto or "").strip():
+        raise ValueError("La fecha, la hora y el asunto son obligatorios.")
+    if not str(ubicacion or "").strip() or not str(responsable or "").strip():
+        raise ValueError("Indica ubicación y responsable.")
+    if estado not in _REUNIONES_ESTADOS:
+        raise ValueError("Selecciona un estado válido.")
+    datos = [str(x or "").strip() for x in (asunto, ubicacion, responsable, antecedente)]
+    if any(len(dato) > 1300 for dato in datos):
+        raise ValueError("Alguno de los campos de texto supera el límite permitido.")
+    if datos[3].lower().startswith(("http:", "https:")):
+        _url_minuta_segura(datos[3])
+    return [
+        _REUNIONES_DIAS[fecha.weekday()].capitalize(),
+        fecha.strftime("%d/%m/%Y"),
+        hora.strftime("%H%M"),
+        *(_texto_sheets_seguro(x) for x in datos),
+    ]
+
+
+def _reuniones_fila_libre(ws):
+    """Escribe en una fila VACÍA después del último evento, sin mover la leyenda.
+
+    No usa append_row: esa operación podría colocar datos después de la
+    leyenda de estados u otras notas presentes al final de la pestaña.
+    """
+    todas = ws.get("A2:G", value_render_option="FORMATTED_VALUE")
+    ultima_reunion = 1
+    for idx, datos in enumerate(todas, start=2):
+        fila = (list(datos) + [""] * 7)[:7]
+        if _reuniones_fecha(fila[1]) and any(str(x).strip() for x in fila[2:7]):
+            ultima_reunion = idx
+    fila_destino = ultima_reunion + 1
+    while True:
+        fila = list(todas[fila_destino - 2]) if fila_destino - 2 < len(todas) else []
+        if not any(str(x).strip() for x in fila[:7]):
+            # Una fórmula que muestra "" también parece vacía. No sobrescribirla.
+            valores_formula = ws.get(f"A{fila_destino}:G{fila_destino}",
+                                    value_render_option="FORMULA")
+            if not any(str(x).strip() for x in (valores_formula[0] if valores_formula else [])):
+                break
+        fila_destino += 1
+        if fila_destino > max(10000, ws.row_count + 100):
+            raise ValueError("No se encontró una fila disponible para registrar la reunión.")
+    if fila_destino > ws.row_count:
+        ws.add_rows(max(20, fila_destino - ws.row_count))
+    return fila_destino
+
+
+def _reuniones_color_fila(libro, ws, fila, estado):
+    # Solo cambia el fondo: respeta validación de responsables, fuentes y enlaces.
+    paleta = {
+        "Programada": {"red": 1, "green": .94, "blue": .47},
+        "Realizada": {"red": .35, "green": .73, "blue": .47},
+        "Cancelada": {"red": .96, "green": .79, "blue": .76},
+        "Por confirmar": {"red": .89, "green": .91, "blue": .94},
+    }
+    libro.batch_update({"requests": [{"repeatCell": {
+        "range": {"sheetId": ws.id, "startRowIndex": fila - 1, "endRowIndex": fila,
+                  "startColumnIndex": 0, "endColumnIndex": 7},
+        "cell": {"userEnteredFormat": {"backgroundColor": paleta[estado]}},
+        "fields": "userEnteredFormat.backgroundColor",
+    }}]})
+
+
+def _reuniones_guardar_metadata(libro, fila, huella, estado, id_registro, anterior):
+    ws = _reuniones_hoja_auxiliar(
+        libro, _REUNIONES_META_TITULO, _REUNIONES_META_CABECERAS, crear=True,
+    )
+    usuario = identificador_sesion()
+    momento = _reuniones_ahora().isoformat(timespec="seconds")
+    datos = [str(fila), huella, estado, id_registro,
+             anterior.get("creado_por", usuario) if anterior else usuario,
+             anterior.get("creado_el", momento) if anterior else momento,
+             usuario, momento]
+    if anterior and anterior.get("meta_fila"):
+        indice = anterior["meta_fila"]
+        ws.update(range_name=f"A{indice}:H{indice}", values=[datos], value_input_option="RAW")
+    else:
+        # Detectar metadatos agregados desde la lectura, antes de anexar.
+        ocupadas = {str(f[0]).strip() for f in ws.get_all_values()[1:] if f and str(f[0]).strip()}
+        if str(fila) in ocupadas:
+            raise ValueError("La reunión ya tiene metadatos nuevos. Actualiza la página para evitar duplicados.")
+        ws.append_row(datos, value_input_option="RAW")
+
+
+def _reuniones_registrar_historial(libro, id_registro, fila, accion, antes, despues):
+    ws = _reuniones_hoja_auxiliar(
+        libro, _REUNIONES_HIST_TITULO, _REUNIONES_HIST_CABECERAS, crear=True,
+    )
+    ws.append_row([
+        id_registro, str(fila), accion, identificador_sesion(),
+        _reuniones_ahora().isoformat(timespec="seconds"),
+        json.dumps(antes, ensure_ascii=False),
+        json.dumps(despues, ensure_ascii=False),
+    ], value_input_option="RAW")
+
+
+def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antecedente, estado):
+    _exigir_reuniones_setf()
+    datos = _reuniones_revisar_datos(fecha, hora, asunto, ubicacion, responsable, antecedente, estado)
+    with _candado_minutas_instancia():
+        libro, ws = _reuniones_hoja()
+        fila = _reuniones_fila_libre(ws)
+        if ws.get(f"A{fila}:G{fila}", value_render_option="FORMULA"):
+            raise RuntimeError("La fila de destino ya fue utilizada. Actualiza y vuelve a intentarlo.")
+        ws.update(range_name=f"A{fila}:G{fila}", values=[datos], value_input_option="USER_ENTERED")
+        # Sheets puede mostrar 0900 como 900 o convertir la fecha a número
+        # de serie. Usar el valor FORMATEADO real para enlazar metadatos.
+        fila_guardada = ws.get(f"A{fila}:G{fila}", value_render_option="FORMATTED_VALUE")
+        valores_guardados = (list(fila_guardada[0]) + [""] * 7)[:7] if fila_guardada else datos
+        id_registro = secrets.token_hex(12)
+        try:
+            _reuniones_guardar_metadata(libro, fila, _reuniones_huella(valores_guardados), estado, id_registro, None)
+        except Exception as exc:
+            raise RuntimeError(f"La reunión SÍ se guardó en la fila {fila} de REUNIONES_APP, pero "
+                               "falló el estado auxiliar. No vuelvas a dar de alta el mismo evento. "
+                               f"Detalle: {exc}") from exc
+        try:
+            _reuniones_registrar_historial(libro, id_registro, fila, "Creación", {},
+                                           {"datos": valores_guardados, "estado": estado})
+        except Exception as exc:
+            raise RuntimeError(f"La reunión SÍ se guardó en la fila {fila}; no repitas el alta. "
+                               f"Falló únicamente la bitácora: {exc}") from exc
+        try:
+            _reuniones_color_fila(libro, ws, fila, estado)
+        except Exception:
+            pass  # El color es decorativo: no invalida el registro ni su historial.
+    return fila
+
+
+def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, responsable, antecedente, estado):
+    _exigir_reuniones_setf()
+    datos = _reuniones_revisar_datos(fecha, hora, asunto, ubicacion, responsable, antecedente, estado)
+    with _candado_minutas_instancia():
+        libro, ws = _reuniones_hoja()
+        fila = int(original["fila"])
+        valores_actuales = ws.get(f"A{fila}:G{fila}", value_render_option="FORMATTED_VALUE")
+        valores_actuales = (list(valores_actuales[0]) + [""] * 7)[:7] if valores_actuales else [""] * 7
+        if valores_actuales != original["datos"]:
+            raise ValueError("Otra persona cambió esta reunión desde que la abriste. "
+                             "Actualiza la página antes de editar para evitar sobrescribir cambios.")
+        # No volver a escribir la columna G si mantiene su texto: una celda con
+        # hipervínculo enriquecido perdería la URL al reemplazarla por su etiqueta.
+        actualizaciones = []
+        for indice, (antes, despues) in enumerate(zip(original["datos"], datos)):
+            if indice == 0:
+                # Nombre del día se calcula desde la fecha, no depende de idiomas del servidor.
+                cambiado = antes.strip().casefold() != despues.strip().casefold()
+            elif indice == 1:
+                cambiado = _reuniones_fecha(antes) != fecha
+            elif indice == 2:
+                cambiado = _reuniones_hora(antes) != hora
+            else:
+                cambiado = antes.strip() != despues.strip()
+            if cambiado:
+                columna = "ABCDEFG"[indice]
+                actualizaciones.append({"range": f"{columna}{fila}", "values": [[despues]]})
+        if not actualizaciones and original["estado"] == estado:
+            return False
+        if actualizaciones:
+            originales_formula = ws.get(f"A{fila}:G{fila}", value_render_option="FORMULA")
+            originales_formula = (list(originales_formula[0]) + [""] * 7)[:7] if originales_formula else [""] * 7
+            for cambio in actualizaciones:
+                indice = "ABCDEFG".index(cambio["range"][0])
+                if str(originales_formula[indice]).lstrip().startswith("="):
+                    raise ValueError("El campo que intentas editar está calculado con una fórmula "
+                                     "en Google Sheets. No se reemplazará esa fórmula.")
+            ws.batch_update(actualizaciones, value_input_option="USER_ENTERED")
+        # Volver a consultar datos reales para calcular una huella consistente
+        # aun si Sheets reformateó la fecha o el texto al guardarlo.
+        valores_guardados = ws.get(f"A{fila}:G{fila}", value_render_option="FORMATTED_VALUE")
+        valores_guardados = (list(valores_guardados[0]) + [""] * 7)[:7] if valores_guardados else [""] * 7
+        id_registro = original.get("id") or secrets.token_hex(12)
+        try:
+            _reuniones_guardar_metadata(libro, fila, _reuniones_huella(valores_guardados),
+                                        estado, id_registro, original.get("meta"))
+        except Exception as exc:
+            raise RuntimeError("El contenido de la reunión pudo quedar actualizado, pero "
+                               f"no se guardó su estado auxiliar. Revisa la fila {fila} antes de reintentar: {exc}") from exc
+        try:
+            _reuniones_registrar_historial(libro, id_registro, fila, "Edición",
+                {"datos": original["datos"], "estado": original["estado"]},
+                {"datos": valores_guardados, "estado": estado})
+        except Exception as exc:
+            raise RuntimeError("La reunión SÍ se actualizó; no repitas el cambio sin revisar. "
+                               f"Falló únicamente el historial: {exc}") from exc
+        try:
+            _reuniones_color_fila(libro, ws, fila, estado)
+        except Exception:
+            pass
+    return True
+
+
+def _reuniones_historial(libro, limite=40):
+    ws = _reuniones_hoja_auxiliar(libro, _REUNIONES_HIST_TITULO, _REUNIONES_HIST_CABECERAS)
+    if ws is None:
+        return []
+    historial = []
+    for f in reversed(ws.get_all_values()[1:]):
+        datos = (list(f) + [""] * 7)[:7]
+        if not datos[0]:
+            continue
+        try:
+            antes = json.loads(datos[5]) if datos[5] else {}
+            despues = json.loads(datos[6]) if datos[6] else {}
+            anteriores = antes.get("datos") or []
+            posteriores = despues.get("datos") or []
+            asunto = posteriores[3] if len(posteriores) > 3 else ""
+            if datos[2] == "Creación":
+                cambios = "Registro inicial"
+            else:
+                campos = ["Día", "Fecha", "Hora", "Asunto", "Ubicación", "Asignación", "Antecedente"]
+                modificados = [nombre for i, nombre in enumerate(campos)
+                               if i < len(anteriores) and i < len(posteriores)
+                               and anteriores[i] != posteriores[i]]
+                if antes.get("estado") != despues.get("estado"):
+                    modificados.append("Estado")
+                cambios = ", ".join(modificados) or "Actualización"
+        except (ValueError, TypeError, KeyError, IndexError):
+            asunto, cambios = "", "Sin detalle"
+        historial.append({"Fecha": datos[4], "Usuario": datos[3], "Acción": datos[2],
+                          "Reunión": asunto, "Campos modificados": cambios, "Fila": datos[1]})
+        if len(historial) >= limite:
+            break
+    return historial
+
+
+def _reuniones_calendario_html(reuniones, anio, mes):
+    import calendar
+    calendario = calendar.Calendar(firstweekday=0)
+    dias = calendario.monthdatescalendar(anio, mes)
+    por_fecha = {}
+    for reunion in reuniones:
+        por_fecha.setdefault(reunion["fecha"], []).append(reunion)
+    partes = ['<div class="setf-reun-cal">']
+    for nombre in ("LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM"):
+        partes.append(f'<div class="setf-reun-cal-head">{nombre}</div>')
+    hoy = _reuniones_ahora().date()
+    for semana in dias:
+        for dia in semana:
+            clase = " fuera" if dia.month != mes else ""
+            clase += " actual" if dia == hoy else ""
+            partes.append(f'<div class="setf-reun-cal-dia{clase}"><div class="numero">{dia.day}</div>')
+            eventos = sorted(por_fecha.get(dia, []), key=lambda r: r["hora"] or datetime.min.time())
+            for reunion in eventos[:2]:
+                estado_css = {"Programada": "programada", "Realizada": "realizada",
+                              "Cancelada": "cancelada", "Por confirmar": "pendiente"}[reunion["estado"]]
+                titulo = html.escape(str(reunion["asunto"] or "Sin asunto"), quote=True)
+                etiqueta = html.escape((reunion["hora"].strftime("%H:%M") + " · " if reunion["hora"] else "") +
+                                      (reunion["asunto"] or "Sin asunto")[:48])
+                partes.append(f'<div class="setf-reun-cal-event {estado_css}" title="{titulo}">{etiqueta}</div>')
+            if len(eventos) > 2:
+                partes.append(f'<div class="setf-reun-cal-mas">+{len(eventos) - 2} más</div>')
+            partes.append('</div>')
+    partes.append('</div>')
+    return "".join(partes)
+
+
+def _reuniones_calendario_interactivo(reuniones, anio, mes):
+    """Agenda con controles Streamlit auténticos y fichas de detalle desplegables."""
+    import calendar
+    meses = calendar.Calendar(firstweekday=0).monthdatescalendar(anio, mes)
+    por_fecha = {}
+    for reunion in reuniones:
+        por_fecha.setdefault(reunion["fecha"], []).append(reunion)
+
+    encabezados = st.columns(7, gap="small")
+    for columna, rotulo in zip(encabezados, ("LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM")):
+        with columna:
+            st.markdown(f'<div class="reun-cal-encabezado">{rotulo}</div>', unsafe_allow_html=True)
+
+    hoy = _reuniones_ahora().date()
+    for semana in meses:
+        columnas = st.columns(7, gap="small")
+        for columna, dia in zip(columnas, semana):
+            clase = "fuera" if dia.month != mes else "actual" if dia == hoy else "normal"
+            with columna:
+                with st.container(key=f"reun_dia_{dia:%Y%m%d}_{clase}"):
+                    st.markdown(f'<div class="reun-cal-numero">{dia.day}</div>', unsafe_allow_html=True)
+                    eventos = sorted(por_fecha.get(dia, []), key=lambda r: r["hora"] or datetime.min.time())
+                    for reunion in eventos:
+                        estado = {"Programada": "programada", "Realizada": "realizada",
+                                  "Cancelada": "cancelada", "Por confirmar": "pendiente"}.get(reunion["estado"], "pendiente")
+                        hora = reunion["hora"].strftime("%H:%M") if reunion["hora"] else "S/H"
+                        titulo = reunion["asunto"] or "Reunión sin asunto"
+                        etiqueta = f"{hora} · {titulo[:34]}{'…' if len(titulo) > 34 else ''}"
+                        with st.container(key=f"reun_evento_{estado}_{reunion['fila']}"):
+                            with st.popover(etiqueta, use_container_width=True):
+                                st.markdown("#### Información de la reunión")
+                                st.markdown(f"**{titulo}**")
+                                st.caption(f"{_REUNIONES_DIAS[reunion['fecha'].weekday()].capitalize()} "
+                                           f"{reunion['fecha']:%d/%m/%Y} · {hora}")
+                                st.markdown(f"**Estado:** {reunion['estado']}")
+                                st.markdown(f"**Ubicación:** {reunion['ubicacion'] or 'Por definir'}")
+                                st.markdown(f"**Responsable:** {reunion['responsable'] or 'Sin asignar'}")
+                                antecedente = reunion["antecedente"] or "Sin antecedente"
+                                st.markdown(f"**Antecedente:** {antecedente}")
+                                if antecedente.lower().startswith("https://"):
+                                    st.link_button("Abrir antecedente ↗", antecedente,
+                                                   use_container_width=True)
+                                st.caption("Para modificarla, utiliza la pestaña Editar reuniones.")
+
+
+def _responsables_reuniones_setf():
+    """Integrantes SETF configurados en Secrets, incluidas cuentas de dos áreas."""
+    _exigir_reuniones_setf()
+    nombres = []
+    usuarios = st.secrets["usuarios"]
+    for identificador, datos in usuarios.items():
+        if not hasattr(datos, "get"):
+            continue
+        es_setf = str(datos.get("area", "diseno")).strip().lower() == "setf"
+        es_doble_area = str(identificador).strip().lower() in USUARIOS_DOS_AREAS
+        if not (es_setf or es_doble_area):
+            continue
+        # Los tratamientos institucionales son etiquetas explícitas: no dependen
+        # del traductor del navegador ni cambian el nombre guardado en Sheets.
+        uid = str(identificador).strip().lower()
+        tratamientos = {"alondra": "Tte. Alondra", "francely": "Lic. Francely",
+                        "arturo": "Ing. Arturo"}
+        nombre = tratamientos.get(uid) or str(datos.get("responsable") or datos.get("nombre") or "").strip()
+        if nombre and nombre.casefold() not in [x.casefold() for x in nombres]:
+            nombres.append(nombre)
+    # Catálogo adicional configurable sin editar Python.
+    for nombre in st.secrets.get("setf", {}).get("responsables", []):
+        nombre = str(nombre).strip()
+        if nombre and nombre.casefold() not in [x.casefold() for x in nombres]:
+            nombres.append(nombre)
+    # También normaliza nombres configurados en la lista adicional [setf].responsables.
+    def etiqueta_institucional(valor):
+        normal = unicodedata.normalize("NFKD", valor).encode("ascii", "ignore").decode().casefold()
+        if "alondra" in normal:
+            return "Tte. Alondra"
+        if "francely" in normal:
+            return "Lic. Francely"
+        if "arturo" in normal:
+            return "Ing. Arturo"
+        return valor
+    salida = []
+    for nombre in sorted(nombres, key=str.casefold):
+        etiqueta = etiqueta_institucional(nombre)
+        if etiqueta.casefold() not in [x.casefold() for x in salida]:
+            salida.append(etiqueta)
+    return sorted(salida, key=str.casefold)
+
+
+def _modulo_reuniones_setf():
+    _exigir_reuniones_setf()
+    # El fondo de Reuniones se instala para TODO el módulo, no solo la tabla.
+    # El CSS se emite únicamente cuando esta sección está activa: no afecta a DG,
+    # Minutas, Oficios ni la pantalla de selección de áreas.
+    ruta_fondo_reuniones = ASSETS_DIR / "fondo_consulta_reuniones_setf.png"
+    if ruta_fondo_reuniones.is_file():
+        imagen_fondo_reuniones = base64.b64encode(
+            ruta_fondo_reuniones.read_bytes()
+        ).decode("ascii")
+        st.markdown(
+            '<style>'
+            '[data-testid="stAppViewContainer"] {'
+            'background-image:linear-gradient(rgba(250,249,246,.10),rgba(250,249,246,.10)),'
+            f'url("data:image/png;base64,{imagen_fondo_reuniones}") !important;'
+            'background-color:#FAF9F6!important;'
+            'background-size:cover!important;'
+            'background-position:center center!important;'
+            'background-repeat:no-repeat!important;'
+            'background-attachment:fixed!important;'
+            '}'
+            '[data-testid="stHeader"] {background:transparent!important;}'
+            '</style>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning(
+            "No se encontró el fondo del módulo Reuniones en: "
+            + str(ruta_fondo_reuniones)
+            + ". Comprueba el nombre y que el archivo esté en la carpeta assets del proyecto."
+        )
+    st.markdown("""
+    <style>
+    .setf-reun-hero {background:linear-gradient(110deg,#142b3e,#23495a);border-radius:16px;
+        border:1px solid rgba(197,157,91,.65);border-left:5px solid #d2a866;
+        color:white;padding:24px 31px;margin:12px 0 22px;box-shadow:0 7px 24px rgba(17,43,58,.13)}
+    .setf-reun-hero small {font-size:11px;color:#dcc49d!important;letter-spacing:2.2px;font-weight:700}
+    .setf-reun-hero h2 {color:#ffffff!important;font-size:30px;font-weight:800;margin:8px 0 4px}
+    .setf-reun-hero p {color:#d1dde4!important;font-size:14px;margin:0}
+    .setf-reun-kpi {background:rgba(255,255,255,.94);border:1px solid #dfe4e6;border-top:3px solid #c6a16c;
+        border-radius:13px;padding:15px 19px;box-shadow:0 5px 16px rgba(19,44,60,.06);margin-bottom:12px}
+    .setf-reun-kpi strong {font-size:29px;display:block;color:#173347;line-height:1.2}
+    .setf-reun-kpi span {color:#647788;font-size:12px}
+    .setf-reun-seccion {font-size:21px;font-weight:800;color:#183348;margin:13px 0}
+    .setf-reun-sub {color:#607485;font-size:13px;margin:-8px 0 14px}
+    .setf-reun-cal {display:grid;grid-template-columns:repeat(7,minmax(0,1fr));border:1px solid #d9e1e5;
+        border-radius:14px;overflow:hidden;background:#fff;box-shadow:0 5px 18px rgba(18,40,55,.07)}
+    .setf-reun-cal-head {padding:12px 4px;background:#1b3b50;color:#f6f6f4;text-align:center;
+        font-size:11px;font-weight:750;letter-spacing:.8px}
+    .setf-reun-cal-dia {min-height:105px;padding:8px;border-right:1px solid #e5e9ec;
+        border-bottom:1px solid #e5e9ec;overflow:hidden}
+    .setf-reun-cal-dia.fuera {background:#f4f6f7;color:#9aa6ad}
+    .setf-reun-cal-dia.actual {box-shadow:inset 0 0 0 2px #c8a369}
+    .setf-reun-cal-dia .numero {font-size:12px;font-weight:800;color:#3d5361;margin:0 0 6px}
+    .setf-reun-cal-event {font-size:10px;line-height:1.3;border-radius:5px;padding:5px;
+        margin-bottom:4px;white-space:normal;overflow-wrap:anywhere}
+    .setf-reun-cal-event.programada {background:#fbf0ba;color:#6d5825}
+    .setf-reun-cal-event.realizada {background:#d8f0dd;color:#275c38}
+    .setf-reun-cal-event.cancelada {background:#fce3e0;color:#953e39}
+    .setf-reun-cal-event.pendiente {background:#ebedf2;color:#4f5b6b}
+    .setf-reun-cal-mas {font-size:10px;color:#536c81;font-weight:750}
+    .setf-reun-prox {background:#fff;border:1px solid #e1e4e5;border-left:4px solid #bc995e;
+        border-radius:11px;padding:14px 17px;margin:7px 0;box-shadow:0 3px 13px rgba(15,39,55,.05)}
+    .setf-reun-prox strong {color:#173349;font-size:15px}
+    .setf-reun-prox p {color:#637687;font-size:12px;margin:4px 0 0}
+    @media(max-width:700px) {.setf-reun-cal-dia {min-height:76px;padding:3px}
+        .setf-reun-cal-event {font-size:9px;padding:3px}.setf-reun-hero h2 {font-size:24px}}
+    /* Identidad propia: agenda editorial clara en lugar de la cabecera azul de oficios. */
+    .setf-reun-hero {position:relative;isolation:isolate;overflow:hidden;display:flex;min-height:236px;
+      align-items:center;justify-content:space-between;background:linear-gradient(112deg,#fcfaf5 0%,#f3eee3 60%,#e9e6de 100%)!important;
+      border:1px solid #dcd5c6!important;border-radius:20px!important;border-left:0!important;
+      padding:28px 42px!important;box-shadow:0 15px 35px rgba(29,48,59,.10)!important;
+      margin:12px 0 24px!important;color:#1b3849!important}
+    .setf-reun-hero:before {content:"";position:absolute;top:0;left:0;bottom:0;width:5px;background:linear-gradient(#c39347,#e2c68e,#af813d)}
+    .setf-reun-hero:after {content:"";position:absolute;inset:0;opacity:.5;pointer-events:none;
+      background:repeating-linear-gradient(90deg,transparent 0 95px,rgba(170,143,99,.09) 96px,transparent 97px)}
+    .setf-reun-hero-copy {position:relative;z-index:2;max-width:650px}
+    .setf-reun-eyebrow {display:flex;align-items:center;gap:10px;color:#9b723d!important;font-size:10px;
+      font-weight:850;letter-spacing:2px;margin-bottom:21px}
+    .setf-reun-eyebrow-line {width:28px;height:2px;background:#b68a4b}
+    .setf-reun-hero-topline {font-size:11px;font-weight:800;letter-spacing:3px;color:#607484;margin-bottom:1px}
+    .setf-reun-hero h2 {font-size:clamp(36px,4vw,55px)!important;letter-spacing:-2px!important;
+      line-height:1.12!important;color:#19394b!important;margin:5px 0 12px!important;font-weight:850!important}
+    .setf-reun-hero-dot {color:#bb914b}
+    .setf-reun-hero p {color:#556a76!important;font-size:14px!important;line-height:1.65!important;
+      max-width:540px;margin:0!important}
+    .setf-reun-hero-foot {font-weight:800;color:#456171;font-size:10px;letter-spacing:1.4px;margin-top:24px}
+    .setf-reun-live-dot {display:inline-block;width:7px;height:7px;border-radius:50%;background:#74a498;margin-right:7px}
+    .setf-reun-foot-sep {color:#b68b4b;margin:0 13px}
+    .setf-reun-art {width:240px;min-width:190px;height:210px;position:relative;z-index:1;margin-left:20px}
+    .setf-reun-art-ring {position:absolute;border:1px solid rgba(163,130,78,.24);border-radius:50%;top:50%;left:50%;transform:translate(-50%,-50%)}
+    .setf-reun-art-ring.ring-a {width:245px;height:245px}.setf-reun-art-ring.ring-b {width:195px;height:195px}
+    .setf-reun-art-tile {position:absolute;top:17px;left:57px;width:131px;height:147px;border:1px solid #ccba98;
+      border-radius:14px;background:linear-gradient(155deg,#fffefa,#f3ecdc);box-shadow:0 15px 32px rgba(48,63,66,.16);
+      display:flex;flex-direction:column;align-items:center;padding-top:23px;transform:rotate(7deg)}
+    .setf-reun-art-tile .tile-bind {position:absolute;left:22px;right:22px;top:-6px;height:12px;
+      background:repeating-linear-gradient(90deg,#b58e50 0 6px,transparent 6px 21px)}
+    .setf-reun-art-tile span {font-size:11px;color:#ac874d;font-weight:800;letter-spacing:3px}
+    .setf-reun-art-tile strong {font-size:65px;color:#19394b;line-height:1.13;font-weight:850}
+    .setf-reun-art-tile em {font-style:normal;font-size:9px;letter-spacing:2px;color:#8d806b;font-weight:800}
+    .setf-reun-art-tag {position:absolute;bottom:2px;right:0;color:#977a56;letter-spacing:1px;font-size:8px;line-height:1.8;font-weight:750}
+    /* Barra de opciones: controles segmentados con selección contrastante y sin subrayado básico. */
+    div[data-testid="stTabs"] > div[data-baseweb="tab-list"] {background:rgba(248,247,242,.94)!important;
+      padding:6px!important;border:1px solid #deddd5;border-radius:13px!important;gap:5px!important;
+      box-shadow:0 5px 18px rgba(22,45,58,.06);margin:12px 0 18px}
+    div[data-testid="stTabs"] button[data-baseweb="tab"] {border-radius:9px!important;border:1px solid transparent!important;
+      background:transparent!important;color:#526a79!important;padding:12px 18px!important;font-weight:750!important;
+      transition:background .18s ease,color .18s ease,box-shadow .18s ease!important}
+    div[data-testid="stTabs"] button[data-baseweb="tab"]:hover {background:#ece8de!important;color:#203c4e!important}
+    div[data-testid="stTabs"] button[data-baseweb="tab"][aria-selected="true"] {background:#1b3c50!important;
+      color:#fff!important;box-shadow:0 5px 12px rgba(18,49,68,.2)!important;border-color:#274c60!important}
+    div[data-testid="stTabs"] [data-baseweb="tab-highlight"],div[data-testid="stTabs"] [data-baseweb="tab-border"] {display:none!important}
+    /* Botones secundarios del calendario, sin alterar el menú lateral ni botones de otros módulos. */
+    [class*="st-key-reun_mes_anterior"] button,[class*="st-key-reun_mes_siguiente"] button {
+      border:1px solid #c9c4b9!important;background:linear-gradient(180deg,#fffefa,#f2efe8)!important;
+      color:#294558!important;box-shadow:0 4px 11px rgba(24,47,58,.09)!important;border-radius:11px!important;
+      min-height:42px!important;font-size:13px!important;font-weight:750!important;
+      transition:transform .15s ease,background .15s ease,box-shadow .15s ease!important}
+    [class*="st-key-reun_mes_anterior"] button:hover,[class*="st-key-reun_mes_siguiente"] button:hover {
+      color:#fff!important;background:#21495e!important;transform:translateY(-2px)!important;
+      border-color:#21495e!important;box-shadow:0 7px 15px rgba(24,47,58,.17)!important}
+    [class*="st-key-reun_mes_anterior"] button:focus-visible,[class*="st-key-reun_mes_siguiente"] button:focus-visible {
+      outline:2px solid #bd9657!important;outline-offset:2px!important}
+    .setf-reun-kpi {border-top:0!important;border-left:3px solid #bb9255!important;
+      border-radius:14px!important;box-shadow:0 8px 20px rgba(23,45,58,.08)!important}
+    .setf-reun-seccion {letter-spacing:-.4px}
+    @media(max-width:850px){.setf-reun-art {display:none}.setf-reun-hero {padding:25px!important;min-height:195px}
+      div[data-testid="stTabs"] button[data-baseweb="tab"]{padding:10px!important;font-size:12px!important}}
+
+    /* REUNIONES v3: densidad visual y acabado institucional, únicamente en esta vista. */
+    .setf-reun-hero {min-height:0!important;height:auto!important;padding:19px 30px!important;
+      margin:2px 0 11px!important;border-radius:16px!important;box-shadow:0 9px 25px rgba(24,49,63,.09)!important}
+    .setf-reun-eyebrow {margin-bottom:8px!important;font-size:9px!important}
+    .setf-reun-hero-topline {font-size:9px!important;letter-spacing:2.1px!important}
+    .setf-reun-hero h2 {font-size:clamp(29px,3.2vw,40px)!important;letter-spacing:-1px!important;
+      margin:2px 0 7px!important}
+    .setf-reun-hero p {font-size:12px!important;line-height:1.45!important;max-width:630px}
+    .setf-reun-hero-foot {margin-top:12px!important;font-size:9px!important}
+    .setf-reun-art {height:132px!important;width:164px!important;min-width:164px!important;margin-left:10px!important}
+    .setf-reun-art-ring.ring-a {width:164px!important;height:164px!important}
+    .setf-reun-art-ring.ring-b {width:129px!important;height:129px!important}
+    .setf-reun-art-tile {left:45px!important;top:8px!important;width:84px!important;height:104px!important;
+      padding-top:15px!important;border-radius:10px!important}
+    .setf-reun-art-tile strong {font-size:42px!important}
+    .setf-reun-art-tile span {font-size:8px!important}
+    .setf-reun-art-tile em {font-size:7px!important}
+    .setf-reun-art-tag {font-size:6px!important;bottom:0!important}
+    .setf-reun-kpi {padding:11px 15px!important;margin:0 0 3px!important;min-height:74px;
+      border-left:3px solid #b68c46!important;box-shadow:0 3px 13px rgba(24,47,58,.07)!important}
+    .setf-reun-kpi strong {font-size:24px!important}
+    .setf-reun-kpi span {font-size:11px!important}
+    /* Streamlit usa role=tab en versiones recientes; incluir ambos selectores. */
+    [data-testid="stTabs"] [data-baseweb="tab-list"],
+    [data-testid="stTabs"] [role="tablist"] {
+      display:flex!important;flex-wrap:wrap!important;gap:9px!important;
+      padding:10px!important;background:rgba(247,244,237,.92)!important;
+      border:1px solid #ded3bd!important;border-radius:15px!important;
+      box-shadow:0 7px 22px rgba(20,40,53,.08)!important;
+      margin:7px 0 15px!important;height:auto!important}
+    [data-testid="stTabs"] [data-baseweb="tab"],
+    [data-testid="stTabs"] [role="tab"] {
+      min-height:43px!important;padding:10px 17px!important;border-radius:10px!important;
+      border:1px solid #cfb784!important;background:linear-gradient(180deg,#fffdf8,#f5eddf)!important;
+      color:#294252!important;font-size:13px!important;font-weight:750!important;
+      box-shadow:0 3px 8px rgba(27,49,60,.07)!important;
+      transition:transform .17s ease,box-shadow .17s ease,background .17s ease!important;
+      text-decoration:none!important;white-space:nowrap!important}
+    [data-testid="stTabs"] [data-baseweb="tab"]:hover,
+    [data-testid="stTabs"] [role="tab"]:hover {
+      background:linear-gradient(180deg,#e6bb70,#d49a3e)!important;color:#172d3c!important;
+      box-shadow:0 6px 14px rgba(98,75,40,.18)!important;transform:translateY(-1px)}
+    [data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"],
+    [data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+      background:linear-gradient(125deg,#183448,#29576c)!important;color:#fff!important;
+      border-color:#ba944f!important;box-shadow:0 6px 16px rgba(25,53,70,.22)!important}
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"],
+    [data-testid="stTabs"] [data-baseweb="tab-border"] {display:none!important}
+    /* Formularios: panel, etiquetas y controles con acabado discreto y premium. */
+    [data-testid="stForm"] {background:linear-gradient(145deg,rgba(255,253,247,.98),rgba(247,245,239,.96))!important;
+      border:1px solid #dbcbae!important;border-left:4px solid #c79c55!important;
+      border-radius:17px!important;padding:24px!important;
+      box-shadow:0 10px 28px rgba(25,47,60,.10)!important}
+    [data-testid="stForm"] label p {color:#294455!important;font-size:13px!important;font-weight:700!important}
+    [data-testid="stForm"] [data-baseweb="input"]>div,
+    [data-testid="stForm"] [data-baseweb="select"]>div,
+    [data-testid="stForm"] [data-baseweb="base-input"] {
+      background:#fffefa!important;border-color:#d4d0c5!important;border-radius:10px!important}
+    [data-testid="stForm"] input:focus-visible {outline-color:#c29a5c!important}
+    [data-testid="stForm"] [data-testid="stFormSubmitButton"] button,
+    [data-testid="stForm"] button[kind="primary"] {
+      background:linear-gradient(135deg,#d69d3f,#c58a2e)!important;color:#fff!important;
+      border:1px solid #bd852b!important;border-radius:11px!important;
+      min-height:47px!important;font-weight:800!important;font-size:14px!important;
+      box-shadow:0 6px 15px rgba(145,103,39,.20)!important;
+      transition:transform .18s ease,box-shadow .18s ease!important}
+    [data-testid="stForm"] [data-testid="stFormSubmitButton"] button:hover,
+    [data-testid="stForm"] button[kind="primary"]:hover {
+      background:linear-gradient(135deg,#bd8432,#aa7223)!important;
+      box-shadow:0 9px 19px rgba(145,103,39,.27)!important;transform:translateY(-1px)}
+    [class*="st-key-reun_mes_anterior"] button,[class*="st-key-reun_mes_siguiente"] button {
+      background:linear-gradient(135deg,#fff9ed,#eddbb9)!important;
+      border:1px solid #c79c55!important;color:#294354!important;border-radius:10px!important;
+      min-height:41px!important;box-shadow:0 4px 10px rgba(27,49,60,.09)!important}
+    @media(max-width:850px) {.setf-reun-hero {padding:19px 20px!important}
+      .setf-reun-art {display:none!important}
+      [data-testid="stTabs"] [role="tab"] {padding:9px 11px!important;font-size:11px!important}}
+
+    /* Ajustes finos de jerarquía y tarjetas, limitados a Reuniones SETF. */
+    .setf-reun-kpi {background:linear-gradient(150deg,#ffffff,#fcfaf6)!important;
+       border:1px solid #dce3e6!important;border-left:3px solid #b78a49!important;
+       box-shadow:0 7px 18px rgba(25,48,64,.09)!important;
+       border-radius:15px!important;transition:transform .18s ease,box-shadow .18s ease!important}
+    .setf-reun-kpi:hover {transform:translateY(-2px);box-shadow:0 12px 24px rgba(25,48,64,.12)!important}
+    .setf-reun-kpi strong {font-size:27px!important;letter-spacing:-.4px}
+    .setf-reun-prox {padding:17px 21px!important;border-left:5px solid #c59b53!important;
+       border-radius:15px!important;background:linear-gradient(110deg,#fff,#fcfaf5)!important;
+       box-shadow:0 9px 24px rgba(20,44,61,.10)!important;margin:11px 0!important}
+    .setf-reun-prox strong {display:block;font-size:17px!important;letter-spacing:-.25px;margin:6px 0!important}
+    .setf-reun-prox p {font-size:13px!important;line-height:1.6!important;color:#4e6374!important}
+    .reun-prox-superior {display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .reun-prox-etiqueta {font-size:10px;font-weight:800;letter-spacing:1.5px;color:#a78046}
+    .reun-prox-estado {background:#f7ecd5;border:1px solid #e7ce9d;border-radius:20px;
+       padding:3px 9px;font-size:11px;font-weight:750;color:#785c2e}
+    .reun-cal-encabezado {background:#1b3b50;color:#fff;border-radius:8px 8px 4px 4px;
+       padding:12px 3px;text-align:center;font-size:11px;font-weight:800;letter-spacing:.9px}
+    [class*="st-key-reun_dia_"] {background:#fff;border:1px solid #dfe5e9;border-radius:10px;
+       padding:8px!important;min-height:104px;margin:0 0 5px!important;
+       box-shadow:0 3px 11px rgba(30,54,70,.04)}
+    [class*="st-key-reun_dia_"] [data-testid="stVerticalBlock"] {gap:5px!important}
+    [class*="st-key-reun_dia_"] .reun-cal-numero {color:#284356;font-size:12px;font-weight:800}
+    [class*="st-key-reun_dia_"][class*="_fuera"] {background:#f1f4f6;opacity:.72}
+    [class*="st-key-reun_dia_"][class*="_actual"] {border:2px solid #c69a52;box-shadow:0 0 0 2px rgba(198,154,82,.10)}
+    [class*="st-key-reun_evento_"] button {width:100%!important;white-space:normal!important;
+       height:auto!important;min-height:30px!important;text-align:left!important;justify-content:flex-start!important;
+       line-height:1.3!important;font-size:10px!important;border:1px solid transparent!important;
+       padding:6px!important;border-radius:7px!important;font-weight:700!important;
+       box-shadow:none!important;overflow-wrap:anywhere!important}
+    [class*="st-key-reun_evento_programada"] button {background:#fff0b8!important;color:#745617!important}
+    [class*="st-key-reun_evento_realizada"] button {background:#d9f0dd!important;color:#245f3b!important}
+    [class*="st-key-reun_evento_cancelada"] button {background:#fce3e0!important;color:#993f39!important}
+    [class*="st-key-reun_evento_pendiente"] button {background:#e8edf1!important;color:#516170!important}
+    [class*="st-key-reun_evento_"] button:hover {filter:brightness(.96);border-color:#bd9a60!important;
+       transform:translateY(-1px);box-shadow:0 3px 8px rgba(20,42,56,.12)!important}
+    @media(max-width:850px){[class*="st-key-reun_dia_"]{padding:4px!important;min-height:78px}
+       [class*="st-key-reun_evento_"] button{font-size:9px!important;padding:3px!important}}
+    /* Indicadores compactos, con jerarquía institucional e iconografía discreta. */
+    .setf-reun-kpi {position:relative!important;overflow:hidden!important;min-height:112px!important;
+      padding:16px 20px 13px!important;background:linear-gradient(138deg,#ffffff 0%,#fbfaf6 100%)!important;
+      border:1px solid #e0e4e6!important;border-top:3px solid #c69a54!important;border-left:1px solid #e0e4e6!important;
+      box-shadow:0 8px 22px rgba(24,46,60,.10)!important;border-radius:17px!important}
+    .setf-reun-kpi:after {content:"";position:absolute;right:-24px;bottom:-38px;width:105px;height:105px;
+      border:1px solid rgba(185,145,79,.14);border-radius:50%;pointer-events:none}
+    .setf-reun-kpi-top {display:flex;align-items:center;justify-content:space-between;gap:5px}
+    .setf-reun-kpi .setf-reun-kpi-label {color:#647987!important;font-size:11px!important;
+      font-weight:800!important;letter-spacing:.45px!important;text-transform:uppercase}
+    .setf-reun-kpi .setf-reun-kpi-icon {width:30px;height:30px;border-radius:9px;
+      display:flex;align-items:center;justify-content:center;background:#f6eddc!important;
+      color:#a47b3d!important;font-size:18px!important;font-weight:800}
+    .setf-reun-kpi strong {display:block;font-size:32px!important;line-height:1.15!important;
+      color:#17364a!important;margin-top:1px!important;font-weight:850!important}
+    .setf-reun-kpi-foot {width:33px;height:2px;border-radius:3px;background:#cca365;margin-top:6px}
+    .setf-reun-kpi-realizadas {border-top-color:#6b9e8d!important}
+    .setf-reun-kpi-realizadas .setf-reun-kpi-icon {background:#e7f2ed!important;color:#488b71!important}
+    .setf-reun-kpi-pendientes {border-top-color:#8297a6!important}
+    .setf-reun-kpi-pendientes .setf-reun-kpi-icon {background:#e8eff3!important;color:#587588!important}
+    .setf-reun-hero h2 {font-size:clamp(27px,3vw,38px)!important}
+    /* Ficha de próxima reunión: datos operativos como elementos principales. */
+    .setf-reun-prox {padding:19px 24px 20px!important;background:linear-gradient(120deg,#fff,#faf8f2)!important;
+      box-shadow:0 10px 26px rgba(22,45,62,.12)!important;border:1px solid #e0e5e6!important;
+      border-left:5px solid #c39850!important}
+    .setf-reun-prox strong {font-size:19px!important;color:#16344a!important;margin:12px 0 14px!important}
+    .reun-prox-detalles {display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+    .reun-prox-detalle {background:#f3f6f7;border:1px solid #dde5e9;border-radius:10px;
+       padding:9px 12px;min-width:118px;display:flex;align-items:center;gap:8px;color:#1c4054}
+    .reun-prox-detalle.lugar {flex:1;min-width:230px}
+    .reun-prox-ico {font-size:17px;color:#ad8140;font-weight:900}
+    .reun-prox-micro {display:block;font-size:9px;color:#697d8a;font-weight:850;
+       letter-spacing:1.1px;text-transform:uppercase}
+    .reun-prox-valor {display:block;font-size:13px;color:#16364b;font-weight:800;line-height:1.35}
+    .reun-prox-responsable {color:#657987;font-size:12px;margin-top:13px;font-weight:650}
+    /* Contenedor de la tabla sin afectar tablas de los otros módulos. */
+    .st-key-reun_tabla_institucional {background:rgba(255,255,255,.98);padding:9px!important;
+       border:1px solid #d9e2e7;border-top:3px solid #bb914d;border-radius:15px;
+       box-shadow:0 9px 24px rgba(20,44,62,.09);overflow:hidden}
+    .st-key-reun_tabla_institucional [data-testid="stDataFrame"] {border-radius:10px!important;overflow:hidden}
+    .reun-tabla-intro {display:flex;align-items:center;justify-content:space-between;
+       padding:10px 11px 13px;color:#153649;font-weight:800;font-size:13px}
+    .reun-tabla-intro span {font-size:10px;color:#987445;letter-spacing:1.3px;font-weight:850}
+    @media(max-width:780px){.reun-prox-detalle{flex:1}.reun-prox-detalle.lugar{min-width:190px}}
+
+    /* Consulta de reuniones SETF: scope aislado del resto de los módulos. */
+    .st-key-reun_consulta_area {border-radius:20px!important;padding:26px 26px 22px!important;
+      border:1px solid rgba(217,205,183,.76)!important;box-shadow:0 15px 40px rgba(22,46,59,.075)!important;
+      background-color:#FAF9F6!important;background-position:center center!important;
+      background-repeat:no-repeat!important;background-size:cover!important;}
+    .st-key-reun_consulta_area .reun-consulta-encabezado {padding:2px 0 17px;border-bottom:1px solid #e8e0d5;margin-bottom:14px}
+    .st-key-reun_consulta_area .reun-consulta-encabezado>span {color:#a17d43;font-size:10px;font-weight:850;letter-spacing:2px}
+    .st-key-reun_consulta_area .reun-consulta-encabezado h3 {font-size:24px!important;letter-spacing:-.65px;
+      color:#193b51!important;margin:8px 0 4px;font-weight:850}
+    .st-key-reun_consulta_area .reun-consulta-encabezado p {font-size:13px;color:#647785;margin:0}
+    .st-key-reun_consulta_area .reun-filtros-titulo {font-weight:800;font-size:13px;color:#223f53;margin:5px 0 6px}
+    .st-key-reun_consulta_area [data-testid="stTextInput"] input,
+    .st-key-reun_consulta_area [data-testid="stSelectbox"] [data-baseweb="select"] > div {background:#fff!important;
+       border:1px solid #dce3e8!important;border-radius:11px!important;min-height:46px!important;
+       box-shadow:0 2px 6px rgba(27,52,68,.035)!important;color:#18374a!important;}
+    .st-key-reun_consulta_area [data-testid="stTextInput"] input:focus {border-color:#be9655!important;box-shadow:0 0 0 3px rgba(190,150,85,.12)!important}
+    .st-key-reun_consulta_area [class*="st-key-reun_limpiar_filtros"] button {background:#fff!important;
+       color:#264456!important;border:1px solid #d5c19e!important;border-radius:10px!important;
+       font-weight:750!important;min-height:42px!important;box-shadow:0 3px 9px rgba(40,54,62,.06)!important;}
+    .st-key-reun_consulta_area [class*="st-key-reun_limpiar_filtros"] button:hover {background:#f7f1e7!important;
+       border-color:#bf9250!important;color:#153246!important}
+    .st-key-reun_consulta_area .st-key-reun_tabla_institucional {background:rgba(255,255,255,.98)!important;
+       border:1px solid #dde4e8!important;border-top:4px solid #b89150!important;border-radius:16px!important;
+       box-shadow:0 9px 27px rgba(22,45,60,.085)!important;padding:14px!important;margin-top:14px!important}
+    .st-key-reun_consulta_area .reun-tabla-intro {padding:8px 7px 15px!important;font-size:16px!important}
+    .st-key-reun_consulta_area [data-testid="stDataFrame"] {border:1px solid #e2e8eb!important;border-radius:10px!important;overflow:hidden!important}
+    .st-key-reun_consulta_area [data-testid="stDataFrame"] canvas {border-radius:10px!important}
+    @media(max-width:720px){.st-key-reun_consulta_area {padding:15px 12px!important}
+      .st-key-reun_consulta_area .reun-consulta-encabezado h3 {font-size:20px!important}}
+    </style>
+    <section class="setf-reun-hero notranslate" translate="no" lang="es-MX" aria-label="Agenda institucional SETF">
+      <div class="setf-reun-hero-copy">
+        <div class="setf-reun-eyebrow"><span class="setf-reun-eyebrow-line"></span> SETF / COORDINACIÓN INSTITUCIONAL</div>
+        <div class="setf-reun-hero-topline">AGENDA Y COORDINACIÓN</div>
+        <h2 class="notranslate" translate="no" lang="es-MX">Gestión de reuniones<span class="setf-reun-hero-dot">.</span></h2>
+        <p>Planeación, acuerdos y seguimiento de la Mesa de Sistemas Eléctricos de Tracción Ferroviaria.</p>
+        <div class="setf-reun-hero-foot"><span class="setf-reun-live-dot"></span> ESPACIO COMPARTIDO <span class="setf-reun-foot-sep">/</span> CONTROL DOCUMENTAL</div>
+      </div>
+      <div class="setf-reun-art" aria-hidden="true">
+        <div class="setf-reun-art-ring ring-a"></div>
+        <div class="setf-reun-art-ring ring-b"></div>
+        <div class="setf-reun-art-tile"><div class="tile-bind"></div><span>SETF</span><strong>✦</strong><em>AGENDA</em></div>
+        <div class="setf-reun-art-tag">01 — PLANIFICACIÓN<br>02 — SEGUIMIENTO</div>
+      </div>
+    </section>""", unsafe_allow_html=True)
+    # La consulta comparte ahora el mismo fondo del módulo completo.
+    try:
+        libro, ws = _reuniones_hoja()
+        reuniones = _reuniones_leer(libro, ws)
+    except Exception as error:
+        st.error(f"No se pudo consultar la agenda SETF: {error}")
+        st.info("Comprueba que [setf].minutas_spreadsheet_id apunte a Control Interno SETF, "
+                "que la cuenta de servicio pueda editarlo y que pueda crear la pestaña REUNIONES_APP. La pestaña Reuniones original no se modifica.")
+        return
+    if st.session_state.pop("reun_exito", ""):
+        st.success("La reunión se guardó en Control Interno SETF y se registró su historial.")
+
+    hoy = _reuniones_ahora().date()
+    from datetime import timedelta as _timedelta_reun
+    lunes = hoy - _timedelta_reun(days=hoy.weekday())
+    domingo = lunes + _timedelta_reun(days=6)
+    programadas = sum(r["estado"] == "Programada" for r in reuniones)
+    en_semana = sum(lunes <= r["fecha"] <= domingo and r["estado"] != "Cancelada" for r in reuniones)
+    realizadas = sum(r["estado"] == "Realizada" for r in reuniones)
+    pendientes = sum(r["estado"] == "Por confirmar" for r in reuniones)
+    for columna, (cantidad, texto, simbolo, clase) in zip(st.columns(4, gap="small"), [
+        (programadas, "Programadas", "◷", "programadas"),
+        (en_semana, "Esta semana", "▦", "semana"),
+        (realizadas, "Realizadas", "✓", "realizadas"),
+        (pendientes, "Por confirmar", "◇", "pendientes"),
+    ]):
+        with columna:
+            st.markdown(
+                f'<div class="setf-reun-kpi setf-reun-kpi-{clase}">' 
+                f'<div class="setf-reun-kpi-top"><span class="setf-reun-kpi-label">{texto}</span>'
+                f'<span class="setf-reun-kpi-icon" aria-hidden="true">{simbolo}</span></div>'
+                f'<strong>{cantidad}</strong><div class="setf-reun-kpi-foot"></div></div>',
+                unsafe_allow_html=True)
+
+    st.caption("Acceso compartido: cualquier integrante autenticado de SETF puede crear, "
+               "consultar y modificar todas las reuniones. Los cambios quedan registrados por usuario.")
+
+    pestana_agenda, pestana_registro, pestana_editar, pestana_historial = st.tabs([
+        "▦ Agenda y calendario", "＋ Nueva reunión", "✎ Editar reuniones", "◷ Historial",
+    ])
+    # El catálogo se obtiene de las cuentas SETF, NO de las reuniones registradas.
+    # Incluye a usuarios con acceso a ambas áreas y responsables adicionales de Secrets.
+    responsables = _responsables_reuniones_setf()
+    # Conservar responsables de reuniones históricas para consultar/editar sin perder datos.
+    responsables_historicos = sorted({str(r["responsable"]).strip() for r in reuniones
+                                     if str(r["responsable"]).strip()}, key=str.casefold)
+    opciones_responsables = ["— Selecciona responsable —", *responsables,
+                             "Otro responsable (externo)…"]
+    opciones_filtro_responsables = sorted(set(responsables + responsables_historicos), key=str.casefold)
+
+    with pestana_agenda:
+        st.markdown('<div class="setf-reun-seccion">Agenda mensual</div>', unsafe_allow_html=True)
+        if "reun_cal_ano" not in st.session_state:
+            st.session_state.reun_cal_ano = hoy.year
+            st.session_state.reun_cal_mes = hoy.month
+        col_prev, col_mes, col_next = st.columns([1, 5, 1], vertical_alignment="center")
+        with col_prev:
+            if st.button("← Anterior", key="reun_mes_anterior", use_container_width=True):
+                st.session_state.reun_cal_mes -= 1
+                if st.session_state.reun_cal_mes == 0:
+                    st.session_state.reun_cal_mes = 12
+                    st.session_state.reun_cal_ano -= 1
+                st.rerun()
+        with col_mes:
+            st.markdown(f'<h3 style="text-align:center;color:#173549;margin:2px 0">'
+                        f'{_REUNIONES_MESES[st.session_state.reun_cal_mes - 1].capitalize()} '
+                        f'{st.session_state.reun_cal_ano}</h3>', unsafe_allow_html=True)
+        with col_next:
+            if st.button("Siguiente →", key="reun_mes_siguiente", use_container_width=True):
+                st.session_state.reun_cal_mes += 1
+                if st.session_state.reun_cal_mes == 13:
+                    st.session_state.reun_cal_mes = 1
+                    st.session_state.reun_cal_ano += 1
+                st.rerun()
+        _reuniones_calendario_interactivo(reuniones, st.session_state.reun_cal_ano,
+                                         st.session_state.reun_cal_mes)
+        st.caption("Amarillo: programada · Verde: realizada · Rojo: cancelada · Gris: por confirmar.")
+        st.markdown('<div class="setf-reun-seccion">Próximas reuniones</div>', unsafe_allow_html=True)
+        proximas = sorted((r for r in reuniones if r["fecha"] >= hoy and r["estado"] in
+                          ("Programada", "Por confirmar")),
+                          key=lambda r: (r["fecha"], r["hora"] or datetime.min.time()))[:6]
+        if not proximas:
+            st.info("No hay próximas reuniones pendientes en el calendario.")
+        for r in proximas:
+            fecha_texto = f'{_REUNIONES_DIAS[r["fecha"].weekday()].capitalize()}, {r["fecha"].strftime("%d/%m/%Y")}'
+            hora_texto = r["hora"].strftime("%H:%M") if r["hora"] else "Horario por confirmar"
+            # Presentación reforzada con datos escapados para evitar HTML de usuario.
+            fecha_destacada = html.escape(fecha_texto)
+            hora_destacada = html.escape(hora_texto)
+            lugar_destacado = html.escape(r["ubicacion"] or "Por definir")
+            responsable_destacado = html.escape(r["responsable"] or "Por asignar")
+            st.markdown(
+                '<div class="setf-reun-prox notranslate" translate="no" lang="es-MX">'
+                '<div class="reun-prox-superior">'
+                '<span class="reun-prox-etiqueta">PRÓXIMA REUNIÓN</span>'
+                '<span class="reun-prox-estado">' + html.escape(r["estado"]) + '</span></div>'
+                '<strong>' + html.escape(r["asunto"] or "Reunión sin asunto") + '</strong>'
+                '<div class="reun-prox-detalles">'
+                '<div class="reun-prox-detalle"><span class="reun-prox-ico">▦</span><div>'
+                '<span class="reun-prox-micro">Fecha</span><span class="reun-prox-valor">' + fecha_destacada + '</span></div></div>'
+                '<div class="reun-prox-detalle"><span class="reun-prox-ico">◷</span><div>'
+                '<span class="reun-prox-micro">Hora</span><span class="reun-prox-valor">' + hora_destacada + '</span></div></div>'
+                '<div class="reun-prox-detalle lugar"><span class="reun-prox-ico">⌖</span><div>'
+                '<span class="reun-prox-micro">Lugar o enlace</span><span class="reun-prox-valor">' + lugar_destacado + '</span></div></div>'
+                '</div><div class="reun-prox-responsable">Responsable: ' + responsable_destacado +
+                '</div></div>', unsafe_allow_html=True)
+        with st.container(key="reun_consulta_area"):
+            st.markdown('<div class="setf-reun-seccion">Consultar todas las reuniones</div>', unsafe_allow_html=True)
+            st.markdown('<div class="reun-consulta-encabezado"><span>CONSULTA DOCUMENTAL · SETF</span><h3>Directorio institucional</h3><p>Localiza reuniones por asunto, ubicación, antecedentes o responsable.</p></div>', unsafe_allow_html=True)
+            st.markdown('<div class="reun-filtros-titulo">⌕ &nbsp; Búsqueda y filtros</div>', unsafe_allow_html=True)
+            consulta, filtro_estado, filtro_resp = st.columns([3, 1.5, 2], gap="medium")
+            with consulta:
+                busqueda = st.text_input("Buscar reunión", placeholder="Buscar por asunto, lugar, antecedente o responsable...", key="reun_buscar")
+            with filtro_estado:
+                filtra_estado = st.selectbox("Estado", ["Todos", *_REUNIONES_ESTADOS], key="reun_filtro_estado")
+            with filtro_resp:
+                filtra_resp = st.selectbox("Responsable", ["Todos", *opciones_filtro_responsables], key="reun_filtro_responsable")
+            limpiar_col, explicacion_col = st.columns([1.25, 4.75], vertical_alignment="center")
+            with limpiar_col:
+                if st.button("↺ Limpiar filtros", key="reun_limpiar_filtros", use_container_width=True):
+                    for clave in ("reun_buscar", "reun_filtro_estado", "reun_filtro_responsable"):
+                        st.session_state.pop(clave, None)
+                    st.rerun()
+            with explicacion_col:
+                st.caption("Los filtros se aplican al instante, sin alterar la información registrada.")
+            filtradas = []
+            for r in reuniones:
+                texto = " ".join((r["asunto"], r["ubicacion"], r["antecedente"], r["responsable"])).casefold()
+                if busqueda.strip().casefold() not in texto:
+                    continue
+                if filtra_estado != "Todos" and r["estado"] != filtra_estado:
+                    continue
+                if filtra_resp != "Todos" and r["responsable"] != filtra_resp:
+                    continue
+                filtradas.append(r)
+            filas_tabla = [{"Fecha": r["fecha"].strftime("%d/%m/%Y"),
+                            "Hora": r["hora"].strftime("%H:%M") if r["hora"] else r["datos"][2],
+                            "Asunto": r["asunto"], "Ubicación": r["ubicacion"],
+                            "Asignación": r["responsable"], "Estado": r["estado"],
+                            "Antecedente": r["antecedente"], "Fila": r["fila"]}
+                           for r in sorted(filtradas, key=lambda r: (r["fecha"], r["hora"] or datetime.min.time()), reverse=True)]
+            with st.container(key="reun_tabla_institucional"):
+                st.markdown(
+                    f'<div class="reun-tabla-intro"><div>Directorio de reuniones</div>'
+                    f'<span>{len(filas_tabla)} REGISTROS</span></div>',
+                    unsafe_allow_html=True)
+                tabla_df = pd.DataFrame(filas_tabla, columns=[
+                    "Fecha", "Hora", "Asunto", "Ubicación", "Asignación", "Estado", "Antecedente", "Fila"])
+                # Los valores originales permanecen intactos; el formato solo cambia la vista.
+                def estilo_fila_reuniones(row):
+                    tonos = {"Programada": "#fff9eb", "Realizada": "#edf7f1",
+                             "Cancelada": "#fff0ef", "Por confirmar": "#f1f5f7"}
+                    color = tonos.get(str(row.get("Estado", "")), "#ffffff")
+                    return [f"background-color: {color}; color: #193b51;" if col == "Estado" else "color: #193b51;" for col in row.index]
+                tabla_estilizada = tabla_df.style.apply(estilo_fila_reuniones, axis=1)
+                st.dataframe(
+                    tabla_estilizada, use_container_width=True, hide_index=True, row_height=47,
+                    column_config={
+                        "Fecha": st.column_config.TextColumn("FECHA", width="small"),
+                        "Hora": st.column_config.TextColumn("HORA", width="small"),
+                        "Asunto": st.column_config.TextColumn("ASUNTO", width="large"),
+                        "Ubicación": st.column_config.TextColumn("UBICACIÓN", width="medium"),
+                        "Asignación": st.column_config.TextColumn("RESPONSABLE", width="medium"),
+                        "Estado": st.column_config.TextColumn("ESTADO", width="small"),
+                        "Antecedente": st.column_config.TextColumn("ANTECEDENTE", width="medium"),
+                        "Fila": None,
+                    },
+                    key="reun_tabla_consulta",
+                )
+            st.caption("Los antecedentes se registran en la nueva pestaña REUNIONES_APP. "
+                       "La hoja histórica Reuniones permanece independiente.")
+
+    with pestana_registro:
+        st.markdown('<div class="setf-reun-seccion">Programar una reunión</div>', unsafe_allow_html=True)
+        st.markdown('<div class="setf-reun-sub">Cada alta se guarda en la pestaña REUNIONES_APP, '
+                    'con usuario, fecha y estado registrados en las hojas auxiliares.</div>', unsafe_allow_html=True)
+        with st.form("reun_nueva_form", clear_on_submit=True):
+            asunto_n = st.text_input("Asunto de la reunión *", key="reun_n_asunto")
+            fn1, fn2 = st.columns(2)
+            with fn1:
+                fecha_n = st.date_input("Fecha *", value=hoy, format="DD/MM/YYYY", key="reun_n_fecha")
+            with fn2:
+                from datetime import time as _time_reun
+                hora_n = st.time_input("Hora *", value=_time_reun(9, 0), step=1800, key="reun_n_hora")
+            ubicacion_n = st.text_input("Ubicación o enlace de reunión *",
+                                        placeholder="Campamento, sala o URL de Meet", key="reun_n_ubicacion")
+            asignacion_n = st.selectbox("Responsable asignado *", opciones_responsables,
+                                        key="reun_n_responsable")
+            manual_n = st.text_input("Nombre del responsable externo",
+                                     key="reun_n_responsable_otro")
+            antecedente_n = st.text_input("Antecedente (oficio, referencia o enlace)",
+                                           key="reun_n_antecedente")
+            estado_n = st.selectbox("Estado", _REUNIONES_ESTADOS, key="reun_n_estado")
+            registrar = st.form_submit_button("Guardar reunión", type="primary", use_container_width=True)
+        if registrar:
+            try:
+                responsable_n = manual_n.strip() if asignacion_n == "Otro responsable (externo)…" else asignacion_n
+                if responsable_n == "— Selecciona responsable —":
+                    raise ValueError("Selecciona a la persona responsable de la reunión.")
+                _reuniones_guardar_nueva(fecha_n, hora_n, asunto_n, ubicacion_n,
+                                         responsable_n, antecedente_n, estado_n)
+                st.session_state.reun_exito = "Registro correcto"
+                st.rerun()
+            except Exception as error:
+                st.error(f"No se pudo completar el registro: {error}")
+
+    with pestana_editar:
+        st.markdown('<div class="setf-reun-seccion">Edición compartida</div>', unsafe_allow_html=True)
+        st.markdown('<div class="setf-reun-sub">Todos los integrantes de SETF pueden modificar cualquier '
+                    'reunión. Para evitar sobrescrituras, se comprueba que el registro no haya cambiado.</div>',
+                    unsafe_allow_html=True)
+        if not reuniones:
+            st.info("No hay reuniones con una fecha reconocible para editar.")
+        else:
+            ordenadas = sorted(reuniones, key=lambda r: (r["fecha"], r["fila"]), reverse=True)
+            por_fila = {r["fila"]: r for r in ordenadas}
+            seleccion = st.selectbox("Selecciona la reunión", list(por_fila),
+                                     format_func=lambda fila: f'{por_fila[fila]["fecha"].strftime("%d/%m/%Y")} · '
+                                         f'{por_fila[fila]["asunto"] or "Sin asunto"} · fila {fila}',
+                                     key="reun_editar_seleccion")
+            r = por_fila[seleccion]
+            if not r["hora"]:
+                st.warning("El registro tiene una hora antigua no reconocible. Indica la hora correcta antes de guardar.")
+            with st.form(key=f"reun_editar_form_{seleccion}"):
+                asunto_e = st.text_input("Asunto *", value=r["asunto"])
+                c1, c2 = st.columns(2)
+                with c1:
+                    fecha_e = st.date_input("Fecha *", value=r["fecha"], format="DD/MM/YYYY")
+                with c2:
+                    from datetime import time as _time_reun
+                    hora_e = st.time_input("Hora *", value=r["hora"] or _time_reun(9, 0), step=1800)
+                ubicacion_e = st.text_input("Ubicación o enlace *", value=r["ubicacion"])
+                opciones_edicion = ["— Selecciona responsable —", *opciones_filtro_responsables]
+                if r["responsable"] and r["responsable"] not in opciones_edicion:
+                    opciones_edicion.append(r["responsable"])
+                if "Otro responsable (externo)…" not in opciones_edicion:
+                    opciones_edicion.append("Otro responsable (externo)…")
+                responsable_e = st.selectbox("Responsable *", opciones_edicion,
+                    index=opciones_edicion.index(r["responsable"]) if r["responsable"] in opciones_edicion else 0)
+                manual_e = st.text_input("Nombre del responsable externo")
+                antecedente_e = st.text_input("Antecedente", value=r["antecedente"],
+                    help="Si ya existe un hipervínculo con texto en Google Sheets, déjalo igual para conservar su URL.")
+                estado_e = st.selectbox("Estado", _REUNIONES_ESTADOS,
+                                        index=_REUNIONES_ESTADOS.index(r["estado"]))
+                guardar_e = st.form_submit_button("Guardar cambios", type="primary", use_container_width=True)
+            if guardar_e:
+                try:
+                    asignado_e = manual_e.strip() if responsable_e == "Otro responsable (externo)…" else responsable_e
+                    if asignado_e == "— Selecciona responsable —":
+                        raise ValueError("Selecciona a la persona responsable de la reunión.")
+                    _reuniones_guardar_edicion(r, fecha_e, hora_e, asunto_e, ubicacion_e,
+                                               asignado_e, antecedente_e, estado_e)
+                    st.session_state.reun_exito = "Actualización correcta"
+                    st.rerun()
+                except Exception as error:
+                    st.error(f"No se pudo completar la edición: {error}")
+            st.caption("Antecedente original: " + (r["antecedente"] or "Sin antecedente") +
+                       f" · Consulta en la hoja Reuniones, fila {seleccion}.")
+
+    with pestana_historial:
+        st.markdown('<div class="setf-reun-seccion">Historial de modificaciones</div>', unsafe_allow_html=True)
+        st.caption("Se registra quién creó o editó cada reunión y la fecha exacta. "
+                   "Las modificaciones realizadas antes de habilitar este módulo no disponen de historial.")
+        try:
+            historial = _reuniones_historial(libro)
+            if historial:
+                st.dataframe(pd.DataFrame(historial), use_container_width=True, hide_index=True)
+            else:
+                st.info("Todavía no hay cambios registrados desde la aplicación.")
+        except Exception as error:
+            st.error(f"No se pudo cargar la bitácora: {error}")
 
 
 if st.session_state.menu_activo == "home":
@@ -9421,7 +10843,7 @@ if st.session_state.menu_activo == "home":
        font-size:24px;box-shadow:0 5px 14px rgba(9,28,44,.23);}}
     .home-institutional-name {{font-size:21px;font-weight:800;color:#ffffff;margin-top:12px;line-height:1.2;}}
     .home-institutional-description {{font-size:14px;color:#d2e0e6;line-height:1.4;margin-top:11px;}}
-    [class*="st-key-home_oficios"] button,[class*="st-key-home_diseno"] button {{
+    [class*="st-key-home_oficios"] button,[class*="st-key-home_diseno"] button,[class*="st-key-home_reuniones"] button {{
        min-height:43px!important;border-radius:9px!important;font-size:13px!important;
        font-weight:750!important;margin-top:3px!important;
     }}
@@ -9429,6 +10851,8 @@ if st.session_state.menu_activo == "home":
     [class*="st-key-home_oficios"] button:hover {{background:#306b83!important;color:white!important;}}
     [class*="st-key-home_diseno"] button {{background:#2d5b60!important;color:white!important;border:1px solid #79a39e!important;}}
     [class*="st-key-home_diseno"] button:hover {{background:#397379!important;color:#fff!important;}}
+    [class*="st-key-home_reuniones"] button {{background:#23566b!important;color:white!important;border:1px solid #79a3aa!important;}}
+    [class*="st-key-home_reuniones"] button:hover {{background:#32758a!important;color:#fff!important;}}
     .home-institutional-footer {{text-align:center;font-size:11px;color:#637585;margin-top:5px;}}
     /* Encabezado y tarjetas visibles sin desplazamiento a tamaño de escritorio. */
     [data-testid="stAppViewContainer"]:has(.home-institutional-marker) {{overflow-y:auto!important;}}
@@ -9503,7 +10927,13 @@ if st.session_state.menu_activo == "home":
       <div class="home-institutional-subtitle">Elige el módulo que deseas consultar.</div>
      </div>"""), unsafe_allow_html=True)
 
-    _, col_oficios, col_ingenieria, _ = st.columns([.4, 4.8, 4.8, .4], gap="large")
+    # SETF tiene tres entradas reales: Oficios, Reuniones y Módulo de planos.
+    # El home de Diseño Geométrico conserva su diseño de dos tarjetas.
+    if _area_activa_validada() == "setf":
+        _, col_oficios, col_reuniones, col_ingenieria, _ = st.columns(
+            [.3, 4.8, 4.8, 4.8, .3], gap="medium")
+    else:
+        _, col_oficios, col_ingenieria, _ = st.columns([.4, 4.8, 4.8, .4], gap="large")
     with col_oficios:
         imagen = f'background-image:url(\'{foto_oficios}\')' if foto_oficios else 'background:linear-gradient(120deg,#1d3d56,#547a8d)'
         st.markdown(f"""<div class="home-institutional-card featured">
@@ -9514,6 +10944,20 @@ if st.session_state.menu_activo == "home":
           </div> </div>""", unsafe_allow_html=True)
         if st.button("Ingresar a Oficios en trámite  →", key="home_oficios", use_container_width=True):
             navegar_a("oficios")
+    if _area_activa_validada() == "setf":
+        with col_reuniones:
+            imagen = 'background:linear-gradient(120deg,#21445a,#55717a)'
+            st.markdown(f"""<div class="home-institutional-card">
+              <div class="home-institutional-photo" style="{imagen}">
+                <div class="home-institutional-status">▦ &nbsp; AGENDA COMPARTIDA</div>
+              </div>
+              <div class="home-institutional-content">
+                <div class="home-institutional-icon">▦</div>
+                <div class="home-institutional-name">Gestión de reuniones</div>
+                <div class="home-institutional-description">Programa, consulta y actualiza reuniones de SETF.</div>
+              </div></div>""", unsafe_allow_html=True)
+            if st.button("Ingresar a Gestión de reuniones  →", key="home_reuniones", use_container_width=True):
+                navegar_a("reuniones")
     with col_ingenieria:
         # SETF tiene un Módulo de planos visual; su gestión funcional queda para otra etapa.
         # En Diseño Geométrico se conserva Ingeniería de detalle sin modificaciones.
@@ -14089,7 +15533,52 @@ elif st.session_state.menu_activo == "oficios":
                         "con una cuenta de administrador o propietario."
                     )
             elif len(oficios_seleccionados) > 1:
-                st.info("Selecciona solo un oficio para habilitar la eliminación.")
+                if puede_administrar_oficios_actual():
+                    identidades_lote = sorted(set(
+                        identidad_oficio(fila) for _, fila in oficios_seleccionados.iterrows()
+                    ))
+                    total_lote = len(identidades_lote)
+                    sello_lote = hashlib.sha256(repr(identidades_lote).encode()).hexdigest()[:12]
+                    st.markdown("**Eliminación administrativa de varios oficios**")
+                    if st.button(f"🗑 Eliminar {total_lote} oficios seleccionados",
+                                 key=f"abrir_lote_{sello_lote}", use_container_width=True):
+                        st.session_state["eliminacion_lote_pendiente"] = sello_lote
+                    if st.session_state.get("eliminacion_lote_pendiente") == sello_lote:
+                        st.warning(f"Vas a eliminar {total_lote} expedientes de Google Sheets, incluyendo "
+                                   "sus borradores, eventos y modalidades. Los archivos de Drive se conservarán. "
+                                   "Esta acción no se puede deshacer desde la aplicación.")
+                        st.write("**Oficios seleccionados:**")
+                        for folio, numero in identidades_lote:
+                            st.caption(f"• Folio {folio} — {numero}")
+                        acepto = st.checkbox("Confirmo que revisé todos los oficios del lote.",
+                                             key=f"acepto_lote_{sello_lote}")
+                        frase = f"ELIMINAR {total_lote}"
+                        escrito = st.text_input(f"Para confirmar, escribe exactamente: {frase}",
+                                                key=f"texto_lote_{sello_lote}")
+                        col_borrar, col_cancelar = st.columns([2, 1])
+                        with col_borrar:
+                            if st.button("Eliminar definitivamente el lote", type="secondary",
+                                         disabled=not (acepto and escrito.strip() == frase),
+                                         key=f"confirmacion_lote_{sello_lote}", use_container_width=True):
+                                try:
+                                    with st.spinner("Registrando auditoría y eliminando expedientes..."):
+                                        _eliminar_oficios_lote_confirmado(identidades_lote)
+                                    st.session_state.oficios_marcados = set()
+                                    st.session_state.pdf_reporte_generado = None
+                                    st.session_state.epoch_editor = st.session_state.get("epoch_editor", 0) + 1
+                                    st.session_state.pop("eliminacion_lote_pendiente", None)
+                                    st.success(f"Se eliminaron {total_lote} oficios.")
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"Eliminación múltiple incompleta: {error}")
+                        with col_cancelar:
+                            if st.button("Cancelar", key=f"cancelar_lote_{sello_lote}",
+                                         use_container_width=True):
+                                st.session_state.pop("eliminacion_lote_pendiente", None)
+                                st.rerun()
+                else:
+                    st.info("La eliminación múltiple está reservada a las cuentas con permisos "
+                            "de administración de oficios de esta área.")
             else:
                 st.session_state.pop("eliminacion_pendiente", None)
 
@@ -14110,6 +15599,7 @@ elif st.session_state.menu_activo == "oficios":
                 if st.button("Limpiar selección", use_container_width=True,
                              key="limpiar_seleccion_oficios"):
                     st.session_state.oficios_marcados = set()
+                    st.session_state.pop("eliminacion_lote_pendiente", None)
                     st.session_state.pdf_reporte_generado = None
                     st.session_state.epoch_editor = st.session_state.get("epoch_editor", 0) + 1
                     # Nuevo editor para reflejar todas las casillas desmarcadas.
@@ -14148,6 +15638,9 @@ elif st.session_state.menu_activo == "minutas":
         _modulo_minutas_setf()
     else:
         _modulo_minutas_diseno_pendiente()
+
+elif st.session_state.menu_activo == "reuniones":
+    _modulo_reuniones_setf()
 
 elif st.session_state.menu_activo == "diseno":
     if st.button("← Volver al Menú Principal", key="volver_diseno"):
