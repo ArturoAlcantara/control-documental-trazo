@@ -9899,7 +9899,10 @@ def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antece
     with _candado_minutas_instancia():
         libro, ws = _reuniones_hoja()
         fila = _reuniones_fila_libre(ws)
-        if ws.get(f"A{fila}:G{fila}", value_render_option="FORMULA"):
+        # Google Sheets puede devolver una lista con celdas vacías: [["", ...]].
+        # La presencia de una fila en la respuesta no significa que esté ocupada.
+        comprobacion = ws.get(f"A{fila}:G{fila}", value_render_option="FORMULA")
+        if any(str(celda).strip() for renglon in comprobacion for celda in renglon):
             raise RuntimeError("La fila de destino ya fue utilizada. Actualiza y vuelve a intentarlo.")
         ws.update(range_name=f"A{fila}:G{fila}", values=[datos], value_input_option="USER_ENTERED")
         # Sheets puede mostrar 0900 como 900 o convertir la fecha a número
