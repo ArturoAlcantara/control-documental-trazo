@@ -2484,7 +2484,7 @@ def _adjuntos_tte_expediente(folio, numero):
     return grupos
 
 
-def _mostrar_adjunto_tte(archivo, folio, numero, *, historico=False):
+def _mostrar_adjunto_tte(archivo, folio, numero, *, historico=False, instancia=""):
     """Permite descargar el adjunto privado a quien consulta el expediente."""
     drive_id = archivo["id"]
     formato = archivo["formato"]
@@ -2492,7 +2492,10 @@ def _mostrar_adjunto_tte(archivo, folio, numero, *, historico=False):
     version_texto = " (histórico)" if historico else ""
     st.markdown(f"**Documento de correcciones de la Tte.: {html.escape(nombre)}{version_texto}**")
     identificador = hashlib.sha256(f"{folio}|{numero}|{drive_id}".encode()).hexdigest()[:18]
-    clave = f"tte_archivo_{identificador}"
+    # El mismo adjunto puede mostrarse en la sección vigente y en el historial.
+    # Cada instancia necesita claves distintas, conservando los bytes en
+    # session_state por archivo para evitar descargas innecesarias.
+    clave = f"tte_archivo_{identificador}_{'historial' if historico else 'actual'}_{instancia}"
     izquierda, derecha = st.columns(2)
     with izquierda:
         url = archivo["url"]
@@ -2654,9 +2657,9 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                 if adjuntos_por_version:
                     st.markdown("**Documentos devueltos por la Tte. · Historial**")
                     for numero_version in sorted(adjuntos_por_version, reverse=True):
-                        for adjunto in adjuntos_por_version[numero_version]:
+                        for indice_adjunto, adjunto in enumerate(adjuntos_por_version[numero_version]):
                             st.caption(f"Versión revisada V{numero_version:02d} · {adjunto['fecha']}")
-                            _mostrar_adjunto_tte(adjunto, folio, numero, historico=True)
+                            _mostrar_adjunto_tte(adjunto, folio, numero, historico=True, instancia=f"v{numero_version}_{indice_adjunto}")
     else:
         st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
 
