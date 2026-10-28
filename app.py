@@ -7875,23 +7875,6 @@ def _modulo_lateral_documentos(tipo):
                 str(r.get("No. de oficio", "")).strip()
             ) in firmados_semana_claves]
 
-        if vista_firmados in ("hoy", "semana"):
-            if firmas_enviadas_hoy is None:
-                st.warning("No hay información disponible de los envíos a firma "
-                           "porque no se pudo leer la bitácora.")
-            else:
-                ids_enviados = claves_hoy if vista_firmados == "hoy" else claves_semana
-                ids_vinculados = {
-                    (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
-                    for r in lista
-                }
-                sin_ficha = ids_enviados - ids_vinculados
-                if sin_ficha:
-                    st.info(f"{len(sin_ficha)} envío(s) registrado(s) en la bitácora "
-                            "no tienen una ficha vinculada en OFICIOS. "
-                            "El indicador incluye esos envíos, pero aquí solo se muestran "
-                            "expedientes disponibles para consulta.")
-
         st.markdown(
             '<div class="firm-vista-activa">'
             f'Vista: {html.escape(nombres_vista_firmados[vista_firmados])}'
@@ -7904,6 +7887,49 @@ def _modulo_lateral_documentos(tipo):
             # Los callbacks se ejecutan antes de instanciar los widgets del rerun.
             st.session_state["buscar_firmados"] = ""
             st.session_state["firm_orden"] = "Más recientes"
+
+        # VISTA DE ENVÍOS A FIRMA: tarjetas independientes del archivo OFICIOS.
+        # La bitácora y ENVIOS_FIRMA son las fuentes de estos dos indicadores.
+        # No exigimos que exista una ficha de origen ni mostramos anexos,
+        # antecedentes, asunto, responsable o fechas adicionales.
+        if vista_firmados in ("hoy", "semana"):
+            claves_vista = claves_hoy if vista_firmados == "hoy" else claves_semana
+            tarjetas_envio = []
+            for identidad in claves_vista:
+                registro_envio = mapa_envios.get(identidad, {})
+                nombre_oficio = str(registro_envio.get("No. de oficio nuevo", "") or "").strip()
+                # Las entradas históricas de EVENTOS_BORRADORES pueden no contar
+                # con nombre nuevo en ENVIOS_FIRMA. Mostrar entonces el número
+                # de oficio que consta en la propia bitácora, sin inventar datos.
+                if not nombre_oficio:
+                    nombre_oficio = identidad[1] or (f"Folio {identidad[0]}" if identidad[0] else "Sin nombre registrado")
+                tarjetas_envio.append(nombre_oficio)
+            tarjetas_envio.sort(key=normalizar_texto)
+            st.markdown("""
+                <style>
+                .firm-envios-head {margin:18px 0 12px;color:#314F3D;
+                    font-size:12px;font-weight:800;letter-spacing:1.3px;}
+                .firm-envio-tarjeta {background:rgba(255,255,253,.97);
+                    border:1px solid #CAD7C9;border-left:5px solid #B9985F;
+                    border-radius:13px;padding:22px 26px;margin:0 0 12px;
+                    box-shadow:0 7px 20px rgba(34,58,43,.09);}
+                .firm-envio-nombre {color:#183A2D;font-size:17px;
+                    line-height:1.4;font-weight:750;overflow-wrap:anywhere;}
+                @media(max-width:700px){.firm-envio-tarjeta{padding:17px 18px}}
+                </style>
+                """, unsafe_allow_html=True)
+            st.markdown('<div class="firm-envios-head">OFICIOS ENVIADOS A FIRMA</div>',
+                        unsafe_allow_html=True)
+            if not tarjetas_envio:
+                st.info("No se registraron envíos a firma en este periodo.")
+            else:
+                for nombre_oficio in tarjetas_envio:
+                    st.markdown(
+                        '<div class="firm-envio-tarjeta"><div class="firm-envio-nombre">'
+                        + html.escape(nombre_oficio) + '</div></div>',
+                        unsafe_allow_html=True,
+                    )
+            return
 
         # Barra institucional de consulta: un solo contenedor visual para
         # búsqueda, ordenamiento y limpieza. Conserva las claves y callbacks.
