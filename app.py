@@ -7688,6 +7688,63 @@ def _modulo_lateral_documentos(tipo):
                 font-size:11px!important;padding:6px!important;
             }
         }
+        /* ===== FIRMADOS / nueva jerarquía visual: tinta ciruela + cobre ===== */
+        [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero {
+            background:linear-gradient(114deg,#42383B 0%,#574A45 68%,#6D584B 100%)!important;
+            border:1px solid #A98668!important;border-left:5px solid #C68D60!important;
+            border-radius:19px!important;padding:24px 30px!important;
+            margin:5px 0 17px!important;box-shadow:0 10px 27px rgba(61,43,42,.17)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero h1 {
+            font-size:32px!important;letter-spacing:-.7px!important;color:#FFF9F2!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero p {color:#F0E7DD!important;font-size:13px!important;}
+        .firm-hero .eyebrow {color:#E4B989!important;}
+        .firm-hero .firm-ornament {opacity:.33!important;width:27%!important;}
+        .firm-hero .firm-signature {color:#F1CC9F!important;}
+        .firm-label {color:#644A45!important;margin:10px 0 8px!important;font-size:10px!important;}
+        [class*="st-key-firm_kpi_"] button {
+            background:rgba(255,252,247,.98)!important;color:#493B3B!important;
+            border:1px solid #DECFC1!important;border-top:3px solid #B98763!important;
+            border-left:1px solid #DECFC1!important;border-radius:15px!important;
+            min-height:107px!important;padding:12px 16px 22px!important;
+            box-shadow:0 5px 16px rgba(66,50,42,.09)!important;
+        }
+        [class*="st-key-firm_kpi_"] button strong {color:#48383B!important;font-size:30px!important;}
+        [class*="st-key-firm_kpi_"] button p {color:#514243!important;font-size:12px!important;}
+        [class*="st-key-firm_kpi_"] button::after {left:17px!important;bottom:7px!important;color:#9A8072!important;font-size:10px!important;}
+        [class*="st-key-firm_kpi_"] button[kind="primary"],
+        [class*="st-key-firm_kpi_"] button[data-testid="stBaseButton-primary"] {
+            background:#F6E9DD!important;border-color:#C49170!important;
+            box-shadow:inset 0 0 0 1px #C49170,0 7px 19px rgba(85,56,45,.12)!important;
+        }
+        [class*="st-key-firm_kpi_"] button[kind="primary"]::before,
+        [class*="st-key-firm_kpi_"] button[data-testid="stBaseButton-primary"]::before {
+            content:"● Seleccionado"!important;color:#875A43!important;font-size:9px!important;top:7px!important;
+        }
+        .firm-summary-foot {margin:8px 0 12px!important;color:#76655C!important;font-size:11px!important;}
+        .firm-vista-activa {
+            background:#F5EEE7!important;border:1px solid #DFD1C3!important;
+            border-left:3px solid #B88768!important;color:#634A42!important;
+            margin:10px 0 8px!important;padding:9px 13px!important;
+        }
+        [class*="st-key-firm_kpi_ver_todos"] button {
+            min-height:35px!important;width:auto!important;padding:6px 14px!important;
+            border-radius:10px!important;color:#644A43!important;
+            background:#FFF9F2!important;border:1px solid #D6BCAB!important;
+            font-size:11px!important;box-shadow:none!important;
+        }
+        .firm-envios-head {margin:14px 0 9px!important;color:#6E5045!important;font-size:11px!important;}
+        .firm-envio-tarjeta {
+            background:#FFFCF8!important;border:1px solid #E2D1C2!important;
+            border-left:4px solid #B98158!important;border-radius:13px!important;
+            padding:18px 23px!important;box-shadow:0 5px 16px rgba(78,54,44,.08)!important;
+        }
+        .firm-envio-nombre {color:#47393B!important;}
+        @media(max-width:750px) {
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero {padding:19px!important;}
+            .firm-hero .firm-ornament {display:none!important;}
+        }
         /* Ornamentación técnica propia del archivo de firmados */
         .firm-hero {position:relative;overflow:hidden;isolation:isolate;}
         .firm-hero > .eyebrow,.firm-hero > h1,.firm-hero > p {position:relative;z-index:2;max-width:67%;}
@@ -7764,6 +7821,12 @@ def _modulo_lateral_documentos(tipo):
         except Exception as error:
             registros_envios_nuevos = []
             st.warning("No se pudo leer ENVIOS_FIRMA. Revisa la conexión: " + _mensaje_error_sheets(error))
+        # Los registros eliminados de OFICIOS NO deben mantenerse en los
+        # indicadores de actividad vigente, aunque la bitácora histórica persista.
+        identidades_vigentes = {
+            (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
+            for r in registros
+        }
         mapa_envios = {}
         for registro_envio in registros_envios_nuevos:
             identidad_envio = (str(registro_envio.get("Folio", "")).strip(),
@@ -7787,6 +7850,8 @@ def _modulo_lateral_documentos(tipo):
                 if not fecha_evento or not (folio_evento or numero_evento):
                     continue
                 identidad = (folio_evento, numero_evento)
+                if identidad not in identidades_vigentes:
+                    continue
                 if fecha_evento == hoy:
                     claves_hoy.add(identidad)
                 if lunes <= fecha_evento <= hoy:
@@ -7794,6 +7859,8 @@ def _modulo_lateral_documentos(tipo):
             # ENVIOS_FIRMA guarda fecha y hora automáticamente en zona México.
             # Se incluyen los envíos cuyo evento de etapa todavía no sea legible.
             for identidad_envio, registro_envio in mapa_envios.items():
+                if identidad_envio not in identidades_vigentes:
+                    continue
                 fecha_envio = _fecha_evento_firma(registro_envio.get("Fecha envío"))
                 if fecha_envio == hoy:
                     claves_hoy.add(identidad_envio)
@@ -7813,7 +7880,7 @@ def _modulo_lateral_documentos(tipo):
             for r in lista
             if (fecha := _fecha_firma(r)) is not None and lunes <= fecha <= hoy
         }
-        st.markdown('<div class="firm-label">MOVIMIENTO DE FIRMAS · SEMANA EN CURSO</div>',
+        st.markdown('<div class="firm-label">RESUMEN DE FIRMAS · SELECCIONA UNA TARJETA PARA VER LOS OFICIOS</div>',
                     unsafe_allow_html=True)
 
         # Cada indicador conduce al listado correspondiente; no se confunden
@@ -7853,7 +7920,7 @@ def _modulo_lateral_documentos(tipo):
         st.markdown(
             f'<div class="firm-summary-foot">Semana del {lunes.strftime("%d/%m/%Y")} '
             f'al {hoy.strftime("%d/%m/%Y")} · '
-            'Enviados: bitácora de autorización · Firmados: fecha de recepción registrada.</div>',
+            'Se muestran únicamente oficios existentes · Firmados: fecha de recepción registrada.</div>',
             unsafe_allow_html=True)
 
         vista_firmados = st.session_state["firmados_kpi_filtro"]
@@ -7918,7 +7985,7 @@ def _modulo_lateral_documentos(tipo):
                 @media(max-width:700px){.firm-envio-tarjeta{padding:17px 18px}}
                 </style>
                 """, unsafe_allow_html=True)
-            st.markdown('<div class="firm-envios-head">OFICIOS ENVIADOS A FIRMA</div>',
+            st.markdown('<div class="firm-envios-head">DOCUMENTOS DEL PERIODO</div>',
                         unsafe_allow_html=True)
             if not tarjetas_envio:
                 st.info("No se registraron envíos a firma en este periodo.")
