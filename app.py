@@ -2682,7 +2682,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
             '</div>', unsafe_allow_html=True,
         )
     else:
-        st.caption(f"Versión V{int(ultimo['Version']):02d} · {len(versiones)} archivo(s) conservado(s)")
+        if ultimo:
+            st.caption(f"Versión V{int(ultimo['Version']):02d} · {len(versiones)} archivo(s) conservado(s)")
     _mostrar_observaciones_revisor(folio, numero, etapa)
     _word_tte_devolucion(folio, numero, etapa)
     if ultimo:
@@ -2713,7 +2714,8 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                             st.caption(f"Versión revisada V{numero_version:02d} · {adjunto['fecha']}")
                             _mostrar_adjunto_tte(adjunto, folio, numero, historico=True, instancia=f"v{numero_version}_{indice_adjunto}")
     else:
-        st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
+        if not compacto:
+            st.info("Aún no hay un Word registrado. Puedes comenzar aquí, incluso si el archivo llegó por USB o correo.")
 
 
     admin = puede_gestionar_borradores()
@@ -2724,7 +2726,10 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                     and etapa in (ETAPA_BORRADOR, ETAPA_ENVIADO,
                                   ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)))
     if puede_subir:
-        with st.expander("＋ Cargar primera versión" if not ultimo else "＋ Cargar nueva versión corregida", expanded=not ultimo):
+        titulo_carga = ("☁ Cargar documento Word (.docx)" if compacto and not ultimo else
+                        "☁ Cargar nueva versión (.docx)" if compacto else
+                        "＋ Cargar primera versión" if not ultimo else "＋ Cargar nueva versión corregida")
+        with st.expander(titulo_carga, expanded=(not ultimo and not compacto)):
             with st.form(key=f"doc_carga_{folio}_{numero}"):
                 archivo = st.file_uploader("Documento Word editable (.docx)", type=["docx"],
                                            key=f"doc_archivo_{folio}_{numero}")
@@ -4334,9 +4339,12 @@ def formulario_nuevo_oficio():
             st.text_input("Estatus", value="En revisión · trámite directo",
                           disabled=True, key=f"estado_directo_{version}")
         else:
-            # El estatus Firmado también es válido para registros sin folio
-            # ni antecedentes: puede tratarse de un oficio ya formalizado.
-            estados_registro = ESTATUS_OFICIOS
+            # Un oficio sin folio ni antecedentes se registra antes de que
+            # exista la versión firmada. Su estado se actualizará después.
+            estados_registro = (
+                [e for e in ESTATUS_OFICIOS if e != "Firmado"]
+                if registro_solo_numero_salida else ESTATUS_OFICIOS
+            )
             estatus = st.selectbox(
                 "Estatus", estados_registro, key=f"estatus_{version}"
             )
@@ -4396,36 +4404,26 @@ def formulario_nuevo_oficio():
         nombre_firmado, liga_firmado, firmado = "", "", ""
         st.caption("La fecha y hora de envío se registrarán automáticamente al guardar el oficio.")
     elif registro_solo_numero_salida:
-        st.markdown("**▣ Identificación del oficio firmado**" if es_firmado
-                    else "**▣ Identificación del oficio por firmar**")
+        st.markdown("**▣ Identificación del oficio por firmar**")
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             numero_salida = st.text_input(
-                "Nombre o número del oficio firmado *" if es_firmado
-                else "Nombre o número del oficio que saldrá firmado",
+                "Nombre o número del oficio que saldrá firmado",
                 placeholder="Ej. LFSLPSTL-IB-26-2119",
                 key=f"nuevo_numero_salida_{version}",
-                help="Este número identificará el expediente en la hoja OFICIOS.",
+                help="Este será el número de oficio con el que se identificará el expediente.",
             )
-        numero = numero_salida.strip()
-        nombre_firmado = numero if es_firmado else ""
         with col_firmado_link:
-            liga_firmado = st.text_input(
-                "Enlace de Drive · documento firmado" if es_firmado
-                else "Enlace de Drive · disponible después de firmar",
-                value="", disabled=not es_firmado,
-                placeholder=("https://drive.google.com/..." if es_firmado
-                             else "Se habilita al registrar el documento firmado"),
+            st.text_input(
+                "Enlace de Drive · disponible después de firmar",
+                value="", disabled=True,
+                placeholder="Se habilita al registrar el documento firmado",
                 key=f"nuevo_liga_firmado_sin_folio_{version}",
             )
-        firmado = (json.dumps([{"nombre": nombre_firmado, "url": liga_firmado.strip()}],
-                              ensure_ascii=False)
-                   if es_firmado and liga_firmado.strip() else "")
-        if es_firmado:
-            st.caption("Se guardará directamente como Firmado. Indica también la fecha de entrega.")
-        else:
-            st.caption("El número de salida se guardará como número de oficio. "
-                       "El enlace podrá añadirse cuando el documento regrese firmado.")
+        numero = numero_salida.strip()
+        nombre_firmado, liga_firmado, firmado = "", "", ""
+        st.caption("El número de salida se guardará como número de oficio. "
+                   "El enlace podrá añadirse cuando el documento regrese firmado.")
     else:
         st.markdown("**▣ Oficio firmado**")
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
@@ -4950,8 +4948,9 @@ def _panel_gestion_vinculos(oficio, categoria, etiqueta, icono, clave):
                         st.error(f"No se pudo agregar el vínculo: {error}")
 
 
-def mostrar_documentos(oficio):
-    st.subheader("Expediente documental")
+def mostrar_documentos(oficio, titulo=True):
+    if titulo:
+        st.subheader("Expediente documental")
 
     firmado = oficio.get("Firmado", "")
 
@@ -6137,11 +6136,553 @@ def _vista_firma_externa(registros):
         )
     st.markdown("".join(tarjetas), unsafe_allow_html=True)
 
+# =========================================================
+# SETF - CENTRO DE PENDIENTES (CONSULTA COMPARTIDA)
+# =========================================================
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _setf_borradores_compartidos():
+    # Solo SETF: no reutilizar datos ni caché de Diseño Geométrico.
+    return _leer_registros_borradores_por_area("setf")
+
+
+def _setf_ultimo_word_enviado(folio, numero, borradores):
+    """Devuelve el último Word efectivamente enviado (no el borrador aún sin enviar).
+
+    El estado se lee de BORRADORES y no se deduce del orden de carga.
+    """
+    elegibles = []
+    for b in borradores:
+        if (str(b.get("Folio", "")).strip(), str(b.get("No. de oficio", "")).strip()) != (folio, numero):
+            continue
+        etapa = str(b.get("Etapa", "")).strip()
+        # Archivo con etapa Borrador cargado aún NO fue enviado oficialmente.
+        if not etapa or etapa == ETAPA_BORRADOR:
+            continue
+        ident = str(b.get("Drive ID", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", ident):
+            continue
+        try:
+            version = int(b.get("Version") or 0)
+        except (ValueError, TypeError):
+            continue
+        elegibles.append((version, b))
+    return max(elegibles, key=lambda par: par[0])[1] if elegibles else None
+
+
+def _setf_documento_compartido(folio, numero, borradores, identificador, mostrar_titulo=True):
+    """Consulta/descarga; no expone Drive ID ni habilita escritura documental."""
+    ultimo = _setf_ultimo_word_enviado(folio, numero, borradores)
+    if not ultimo:
+        st.caption("No hay una versión Word enviada oficialmente para este oficio.")
+        return
+    nombre = Path(str(ultimo.get("Nombre") or "oficio.docx")).name
+    if not nombre.lower().endswith(".docx"):
+        nombre += ".docx"
+    if mostrar_titulo:
+        st.markdown("**Último Word enviado**")
+    st.caption(f"Versión {ultimo.get('Version')} · {html.escape(nombre)} · {ultimo.get('Etapa', '')}")
+    clave = f"setf_word_{identificador}"
+    if st.button("Preparar descarga del Word editable", key=f"{clave}_preparar"):
+        try:
+            exigir_sesion()
+            if _area_activa_validada() != "setf":
+                raise PermissionError("Este acceso es exclusivo de SETF.")
+            # Revalidar que el oficio sigue activo, que pertenece a SETF y
+            # que el archivo sigue siendo el último enviado en BORRADORES.
+            vigentes = obtener_oficios_por_area("setf")
+            actual = vigentes.loc[
+                (vigentes["Folio"].fillna("").astype(str).str.strip() == folio) &
+                (vigentes["No. de oficio"].fillna("").astype(str).str.strip() == numero)
+            ]
+            if len(actual) != 1 or str(actual.iloc[0].get("Estatus", "")).strip() not in {
+                "En elaboración", "En revisión", "En correcciones", "En firma", "Recaído"
+            }:
+                raise ValueError("El expediente ya no está disponible entre los pendientes activos.")
+            _leer_registros_borradores_por_area.clear()
+            confirmado = _setf_ultimo_word_enviado(folio, numero, _setf_borradores_compartidos())
+            if not confirmado or str(confirmado.get("Drive ID", "")) != str(ultimo.get("Drive ID", "")):
+                raise ValueError("El documento cambió. Actualiza la página antes de descargar.")
+            contenido = _descargar_docx_drive(str(confirmado["Drive ID"]))
+            st.session_state[clave] = {"bytes": contenido, "nombre": nombre,
+                                           "version": str(confirmado.get("Version", ""))}
+        except Exception as error:
+            st.session_state.pop(clave, None)
+            st.error(f"No se pudo preparar el Word: {error}")
+    listo = st.session_state.get(clave)
+    if listo and listo["version"] == str(ultimo.get("Version", "")):
+        st.download_button("⬇ Descargar última versión enviada (.docx)", data=listo["bytes"],
+                           file_name=listo["nombre"],
+                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                           key=f"{clave}_descargar", use_container_width=True)
+
+
+def _setf_vista_pendientes_generales():
+    """Directorio visual SETF en modo consulta, sin modificar permisos ni flujo documental."""
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("El directorio general solo está disponible para SETF.")
+
+    # Diseño restringido a esta vista. Los botones son widgets reales de Streamlit.
+    st.markdown("""
+    <style>
+      .setf-mesa-cabecera {margin:0 0 14px;}
+      .setf-mesa-cabecera .eyebrow {font-size:10px;letter-spacing:1.9px;color:#A47D50;font-weight:800;margin-bottom:6px;}
+      .setf-mesa-cabecera h2 {font-size:clamp(23px,2.1vw,30px);line-height:1.12;margin:0 0 5px;color:#203946;font-weight:800;}
+      .setf-mesa-cabecera p {font-size:13px;line-height:1.45;color:#647681;margin:0;}
+      .setf-mesa-kpi {background:rgba(255,253,249,.97);border:1px solid #DCD7CE;
+          border-top:3px solid #BA9561;border-radius:13px;min-height:102px;padding:15px 18px;
+          display:flex;align-items:center;justify-content:space-between;gap:16px;
+          box-shadow:0 5px 18px rgba(24,44,49,.075);}
+      .setf-mesa-kpi .numero {font-size:30px;color:#203B45;font-weight:850;line-height:1;
+          font-variant-numeric:tabular-nums;letter-spacing:-.7px;}
+      .setf-mesa-kpi .rotulo {margin-top:9px;font-size:12.5px;font-weight:700;color:#536A73;}
+      .setf-mesa-kpi .simbolo {width:39px;height:39px;border-radius:12px;display:grid;
+          place-items:center;background:#F2E9DC;color:#A07540;font-size:21px;flex-shrink:0;}
+      .setf-mesa-kpi.revision {border-top-color:#7797B1;}
+      .setf-mesa-kpi.revision .simbolo {background:#EAF1F6;color:#5A7E99;}
+      .setf-mesa-kpi.firma {border-top-color:#78A08B;}
+      .setf-mesa-kpi.firma .simbolo {background:#E8F1EB;color:#547E63;}
+      .setf-mesa-directorio {margin:15px 0 11px;display:flex;align-items:center;
+          justify-content:space-between;gap:10px;flex-wrap:wrap;}
+      .setf-mesa-directorio strong {font-size:17px;font-weight:800;color:#203946;}
+      .setf-mesa-directorio .contador {font-size:11px;font-weight:700;
+          color:#755B37;background:#F6EFE4;border:1px solid #E5D7C3;border-radius:999px;
+          padding:5px 11px;white-space:nowrap;}
+      [class*="st-key-setf_mesa_filtros"] {padding:14px 17px 10px!important;
+          background:rgba(255,253,250,.90)!important;border:1px solid #E5DFD4!important;
+          border-radius:14px!important;margin-bottom:10px!important;}
+      [class*="st-key-setf_mesa_filtros"] label {font-weight:650!important;color:#36505C!important;}
+      [class*="st-key-setf_mesa_tarjeta_"] {background:rgba(255,254,251,.98)!important;
+          border:1px solid #E1D9CD!important;border-left:4px solid #BB915C!important;
+          border-radius:15px!important;padding:15px 18px!important;margin-bottom:11px!important;
+          box-shadow:0 5px 18px rgba(29,48,54,.065)!important;}
+      [class*="st-key-setf_mesa_tarjeta_"][class*="_abierta"] {
+          border-color:#D5C3A8!important;border-left-color:#A77741!important;
+          box-shadow:0 8px 22px rgba(29,48,54,.10)!important;}
+      .setf-mesa-exp {display:flex;align-items:flex-start;gap:15px;min-width:0;}
+      .setf-mesa-exp-icon {display:flex;align-items:center;justify-content:center;
+          width:45px;height:45px;min-width:45px;border-radius:12px;background:#F3EDE4;
+          color:#9B7548;font-size:21px;}
+      .setf-mesa-exp-datos {min-width:0;flex:1;}
+      .setf-mesa-exp-top {display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:5px;}
+      .setf-mesa-exp-numero {font-size:16px;line-height:1.2;font-weight:800;color:#263C47;}
+      .setf-mesa-exp-estado {font-size:10px;font-weight:750;line-height:1.3;
+          background:#FAF2E5;color:#976A33;border:1px solid #E8D9BD;
+          border-radius:100px;padding:4px 9px;white-space:nowrap;}
+      .setf-mesa-exp-estado.revision {background:#E9F0F5;border-color:#C6D6E0;color:#4B738A;}
+      .setf-mesa-exp-estado.firma {background:#E8F2EA;border-color:#BDD7C4;color:#4B7859;}
+      .setf-mesa-exp-estado.correcciones {background:#FAECE8;border-color:#EBC5B8;color:#98624F;}
+      .setf-mesa-exp-estado.recaido {background:#F5EAEE;border-color:#DFC8D1;color:#885A70;}
+      .setf-mesa-exp-asunto {margin:0 0 10px;font-size:13.5px;line-height:1.35;color:#38505B;
+          overflow-wrap:anywhere;}
+      .setf-mesa-exp-meta {display:flex;align-items:center;flex-wrap:wrap;gap:5px 15px;
+          color:#657682;font-size:11.5px;line-height:1.45;}
+      .setf-mesa-exp-meta strong {color:#415B66;font-weight:750;}
+      .setf-mesa-exp-word {font-weight:750;color:#46785B;}
+      .setf-mesa-exp-word.no-word {color:#927765;}
+      [class*="st-key-setf_mesa_tarjeta_"] [data-testid="stButton"] button {
+          min-height:42px!important;border-radius:10px!important;font-size:13px!important;
+          font-weight:750!important;border:1px solid #C7D2D9!important;
+          background:#FAFCFD!important;color:#284653!important;box-shadow:none!important;}
+      [class*="st-key-setf_mesa_tarjeta_"] [data-testid="stButton"] button:hover {
+          background:#EAF1F3!important;border-color:#7E9EA8!important;color:#173945!important;}
+      [class*="st-key-setf_mesa_archivo_"] {border-top:1px solid #E7DED1!important;
+          padding:13px 3px 3px!important;margin-top:12px!important;}
+      .setf-mesa-word-head {display:flex;align-items:center;gap:10px;color:#263F4B;
+          font-weight:750;font-size:14px;margin-bottom:5px;}
+      .setf-mesa-word-head span {font-size:18px;color:#688C9A;}
+      [class*="st-key-setf_mesa_archivo_"] .stDownloadButton button {
+          background:#26454C!important;color:white!important;border-color:#26454C!important;}
+      .setf-mesa-readonly {color:#6F7A81;font-size:11px;margin-top:4px;}
+      @media (max-width:850px) {
+        .setf-mesa-kpi {min-height:89px;padding:12px 13px;}
+        .setf-mesa-kpi .numero {font-size:26px;}
+        .setf-mesa-kpi .simbolo {width:34px;height:34px;min-width:34px;}
+        [class*="st-key-setf_mesa_tarjeta_"] {padding:12px!important;}
+        .setf-mesa-exp {gap:10px;}
+        .setf-mesa-exp-icon {width:38px;height:38px;min-width:38px;}
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="setf-mesa-cabecera">'
+        '<div class="eyebrow">SETF · SEGUIMIENTO COMPARTIDO</div>'
+        '<h2>Pendientes de la mesa</h2>'
+        '<p>Consulta los oficios pendientes de SETF y descarga la última versión Word enviada oficialmente.</p>'
+        '</div>', unsafe_allow_html=True
+    )
+
+    df = obtener_oficios_por_area("setf").copy()
+    activos = {"En elaboración", "En correcciones", "En revisión", "En firma", "Recaído"}
+    requeridas = {"Folio", "No. de oficio", "Estatus", "Responsable"}
+    if not requeridas.issubset(df.columns):
+        st.error("No fue posible consultar las columnas necesarias del libro SETF.")
+        return
+    df = df.loc[df["Estatus"].fillna("").astype(str).str.strip().isin(activos)].copy()
+
+    totales = (
+        ("Pendientes totales", len(df), "total", "▤"),
+        ("En revisión", int((df["Estatus"].fillna("").astype(str).str.strip() == "En revisión").sum()), "revision", "◷"),
+        ("En firma", int((df["Estatus"].fillna("").astype(str).str.strip() == "En firma").sum()), "firma", "✎"),
+    )
+    columnas_resumen = st.columns(3, gap="small")
+    for columna, (etiqueta, cantidad, clase, icono) in zip(columnas_resumen, totales):
+        with columna:
+            st.markdown(
+                f'<div class="setf-mesa-kpi {clase}">'
+                f'<div><div class="numero">{cantidad:02d}</div>'
+                f'<div class="rotulo">{html.escape(etiqueta)}</div></div>'
+                f'<div class="simbolo" aria-hidden="true">{icono}</div></div>',
+                unsafe_allow_html=True,
+            )
+    if df.empty:
+        st.info("No hay oficios pendientes en SETF.")
+        return
+
+    # La cabecera se rellena en su posición original DESPUÉS de filtrar.
+    titulo_directorio = st.empty()
+    with st.container(key="setf_mesa_filtros"):
+        qcol, rcol, ecol = st.columns([2.1, 1.1, 1.1], gap="small")
+        with qcol:
+            buscar = st.text_input("Buscar expediente", placeholder="Folio, asunto, responsable o proyecto…",
+                                   key="setf_gral_buscar")
+        with rcol:
+            responsables = sorted({str(v).strip() for v in df["Responsable"].dropna()
+                                   if str(v).strip()})
+            elegido = st.selectbox("Responsable", ["Todos"] + responsables, key="setf_gral_responsable")
+        with ecol:
+            estado = st.selectbox("Estado", ["Todos"] + sorted(activos), key="setf_gral_estado")
+
+    if elegido != "Todos":
+        df = df.loc[df["Responsable"].fillna("").astype(str).str.strip() == elegido]
+    if estado != "Todos":
+        df = df.loc[df["Estatus"].fillna("").astype(str).str.strip() == estado]
+    if buscar.strip():
+        columnas = [col for col in ("Folio", "No. de oficio", "Asunto", "Proyecto", "Responsable") if col in df.columns]
+        consulta = normalizar_texto(buscar)
+        df = df.loc[df[columnas].fillna("").astype(str).apply(
+            lambda fila: any(consulta in normalizar_texto(campo) for campo in fila), axis=1)]
+
+    total_filtrado = len(df)
+    titulo_directorio.markdown(
+        '<div class="setf-mesa-directorio"><strong>Directorio de expedientes</strong>'
+        f'<span class="contador">{total_filtrado} registro(s) · Solo lectura</span></div>',
+        unsafe_allow_html=True,
+    )
+    if df.empty:
+        st.info("No hay expedientes que coincidan con los filtros actuales.")
+        return
+
+    try:
+        borradores = _setf_borradores_compartidos()
+        word_disponible = True
+    except Exception as error:
+        st.warning(f"No fue posible consultar las versiones Word: {_mensaje_error_sheets(error)}")
+        borradores = []
+        word_disponible = False
+
+    registros_por_pagina = 8
+    paginas = (total_filtrado + registros_por_pagina - 1) // registros_por_pagina
+    if paginas > 1:
+        infocol, pagcol = st.columns([3.6, 1.0], gap="small", vertical_alignment="center")
+        with infocol:
+            st.caption(f"Mostrando hasta {registros_por_pagina} expedientes por página")
+        with pagcol:
+            pagina = st.selectbox("Página", list(range(1, paginas + 1)),
+                                  key="setf_mesa_pagina", format_func=lambda x: f"{x} de {paginas}")
+    else:
+        pagina = 1
+    desde = (pagina - 1) * registros_por_pagina
+    pagina_df = df.iloc[desde:desde + registros_por_pagina]
+
+    def texto_campo(fila, clave, predeterminado="No registrado"):
+        valor = fila.get(clave)
+        if valor is None or (not isinstance(valor, (list, dict)) and pd.isna(valor)):
+            return predeterminado
+        valor = str(valor).strip()
+        return valor or predeterminado
+
+    for indice, (_, oficio) in enumerate(pagina_df.iterrows(), start=desde):
+        folio = texto_campo(oficio, "Folio", "")
+        numero = texto_campo(oficio, "No. de oficio", "")
+        asunto = texto_campo(oficio, "Asunto", "Sin asunto registrado")
+        responsable = texto_campo(oficio, "Responsable", "Sin asignar")
+        proyecto = texto_campo(oficio, "Proyecto", "Sin proyecto")
+        estatus = texto_campo(oficio, "Estatus", "Sin estado")
+        token = hashlib.sha1(f"{folio}|{numero}|{indice}".encode("utf-8")).hexdigest()[:14]
+        id_expediente = f"{folio}|{numero}|{token}"
+        abierto = st.session_state.get("setf_mesa_expediente_abierto") == id_expediente
+        ultimo = _setf_ultimo_word_enviado(folio, numero, borradores) if word_disponible else None
+        estado_clase = {
+            "En revisión": "revision", "En firma": "firma", "En correcciones": "correcciones",
+            "Recaído": "recaido",
+        }.get(estatus, "normal")
+        if not word_disponible:
+            word_texto, word_clase = "Información Word no disponible", "no-word"
+        elif ultimo:
+            word_texto, word_clase = f"Word enviado · versión {ultimo.get('Version', '—')}", ""
+        else:
+            word_texto, word_clase = "Sin Word enviado oficialmente", "no-word"
+
+        sufijo = "abierta" if abierto else "cerrada"
+        with st.container(key=f"setf_mesa_tarjeta_{token}_{sufijo}"):
+            contenido, accion = st.columns([4.4, 1.12], gap="medium", vertical_alignment="center")
+            with contenido:
+                st.markdown(
+                    '<div class="setf-mesa-exp">'
+                    '<span class="setf-mesa-exp-icon" aria-hidden="true">▤</span>'
+                    '<div class="setf-mesa-exp-datos">'
+                    '<div class="setf-mesa-exp-top">'
+                    f'<span class="setf-mesa-exp-numero">Oficio {html.escape(numero or folio or "Sin número")}</span>'
+                    f'<span class="setf-mesa-exp-estado {estado_clase}">{html.escape(estatus)}</span>'
+                    '</div>'
+                    f'<p class="setf-mesa-exp-asunto">{html.escape(asunto)}</p>'
+                    '<div class="setf-mesa-exp-meta">'
+                    f'<span><strong>Responsable:</strong> {html.escape(responsable)}</span>'
+                    f'<span><strong>Proyecto:</strong> {html.escape(proyecto)}</span>'
+                    f'<span><strong>Folio:</strong> {html.escape(folio or "No registrado")}</span>'
+                    f'<span class="setf-mesa-exp-word {word_clase}">{html.escape(word_texto)}</span>'
+                    '</div></div></div>',
+                    unsafe_allow_html=True,
+                )
+            with accion:
+                if st.button("Cerrar expediente" if abierto else "Ver expediente",
+                             key=f"setf_mesa_abrir_{token}", use_container_width=True):
+                    st.session_state["setf_mesa_expediente_abierto"] = None if abierto else id_expediente
+                    st.rerun()
+            if abierto:
+                with st.container(key=f"setf_mesa_archivo_{token}"):
+                    st.markdown(
+                        '<div class="setf-mesa-word-head"><span aria-hidden="true">▤</span>'
+                        'Último documento Word enviado</div>', unsafe_allow_html=True,
+                    )
+                    _setf_documento_compartido(folio, numero, borradores, token, mostrar_titulo=False)
+                    st.markdown('<div class="setf-mesa-readonly">Consulta y descarga. La revisión, edición y firma mantienen los permisos originales.</div>',
+                                unsafe_allow_html=True)
+
 def mostrar_mis_pendientes():
     """Acceso rápido a los oficios activos, respetando los permisos existentes."""
     import html
 
     mostrar_sesion()
+    if _area_activa_validada() == "setf":
+        st.markdown("""<style>
+        [class*="st-key-setf_pend_vista"] [data-baseweb="tab"] {font-weight:650}
+        </style>""", unsafe_allow_html=True)
+        st.markdown("""<div class="setf-pend-switch-title">CENTRO DE PENDIENTES</div>
+        <div class="setf-pend-switch-sub">Elige entre tu trabajo y el seguimiento de toda la mesa</div>""", unsafe_allow_html=True)
+        st.markdown("""<style>
+        .setf-pend-switch-title {font-size:13px;font-weight:850;letter-spacing:2px;color:#825C38;margin:0 0 4px}
+        .setf-pend-switch-sub {font-size:13px;color:#64717A;margin-bottom:8px}
+        [class*="st-key-pend_nav_"] {border-width:2px!important;box-shadow:0 8px 22px rgba(38,47,49,.14)!important;background:linear-gradient(140deg,rgba(255,252,246,.98),rgba(245,238,227,.94))!important}
+        [class*="st-key-pend_nav_"][class*="_revision_"] {background:linear-gradient(135deg,#edf3f8,#e3edf4)!important;border-color:#809EB2!important}
+        [class*="st-key-pend_nav_"][class*="_firma_"] {background:linear-gradient(135deg,#eaf3ec,#dceade)!important;border-color:#7DAB8C!important}
+        [class*="st-key-pend_nav_"] .pend-tile-name {font-size:clamp(18px,1.45vw,23px)!important}
+        [class*="st-key-pend_nav_"] button {min-height:43px!important;font-weight:750!important;border-radius:9px!important}
+        /* SETF: tres accesos equilibrados, sin afectar la navegación de DG. */
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] {
+            min-height: 202px !important;
+            height: 100% !important;
+            padding: 18px 19px !important;
+            border-radius: 15px !important;
+            box-sizing: border-box !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-head {
+            min-height: 66px !important;
+            display:flex !important;
+            align-items:center !important;
+            gap:12px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-name {
+            font-family:inherit !important;
+            font-size:18px !important;
+            font-weight:750 !important;
+            letter-spacing:-.25px !important;
+            line-height:1.24 !important;
+            margin:0 !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-sub {
+            font-size:12px !important;
+            font-weight:650 !important;
+            line-height:1.4 !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-copy {
+            font-size:12px !important;
+            line-height:1.5 !important;
+            min-height:36px !important;
+            margin:7px 0 10px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] button {
+            min-height:42px !important;
+            font-size:13px !important;
+            font-weight:700 !important;
+            width:100% !important;
+        }
+        /* Separación más corta entre cabecera y bandejas. */
+        .stMainBlockContainer:has(.pend-hero) .pend-nav-head {
+            margin-top:8px !important;
+            margin-bottom:8px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {margin-bottom:2px !important;}
+        /* Sección Word destacada y disponible sin desplegar otro acordeón. */
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_word_acciones_"] {
+            background:#FBFAF7 !important;
+            border:1px solid #D7C8B3 !important;
+            border-left:4px solid #B78F58 !important;
+            border-radius:12px !important;
+            padding:16px 20px !important;
+            margin:12px 0 !important;
+        }
+        .pend-word-heading {display:flex;flex-direction:column;gap:4px;margin:0 0 12px;}
+        .pend-word-heading span {color:#916D43;font-size:10px;font-weight:800;letter-spacing:1.8px;}
+        .pend-word-heading strong {color:#20394A;font-size:17px;font-weight:750;}
+        .stMainBlockContainer:has(.pend-hero) [data-testid="stExpander"]:has(summary) {
+            border-color:#D5D5D0 !important;border-radius:10px !important;
+            background:rgba(255,253,248,.94) !important;
+        }
+        @media (max-width:1000px) {
+            .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] {min-height:195px!important;}
+        }
+        /* SETF: quitar el hueco heredado bajo la navegación superior. */
+        @media (min-width: 900px) {
+          body .stMainBlockContainer:has(.setf-pend-switch-title) {
+            padding-top: 0 !important;
+            margin-top: -18px !important;
+          }
+          body .stMainBlockContainer:has(.setf-pend-switch-title) > div:first-child {
+            padding-top: 0 !important;
+          }
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title) .setf-pend-switch-title {
+          margin-top:0!important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title) .setf-pend-switch-sub {
+          margin-bottom:5px!important;
+        }
+        /* Tres tarjetas de igual altura, incluso si cambia la descripción. */
+        .stMainBlockContainer:has(.pend-hero) [data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) {
+          align-items:stretch!important;
+          gap:16px!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [data-testid="column"]:has([class*="st-key-pend_nav_"]) {
+          display:flex!important;
+          flex-direction:column!important;
+          align-self:stretch!important;
+          min-width:0!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] {
+          height:206px!important;
+          min-height:206px!important;
+          max-height:206px!important;
+          width:100%!important;
+          display:flex!important;
+          flex-direction:column!important;
+          justify-content:flex-start!important;
+          padding:17px 19px!important;
+          box-sizing:border-box!important;
+          overflow:hidden!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] > div[data-testid="stVerticalBlock"] {
+          height:100%!important;
+          flex:1!important;
+          display:flex!important;
+          flex-direction:column!important;
+          justify-content:flex-start!important;
+          gap:0!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] [data-testid="stElementContainer"]:has([data-testid="stButton"]) {
+          margin-top:auto!important;
+          width:100%!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-head {
+          min-height:60px!important;
+          height:60px!important;
+          margin:0!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-name {
+          font-size:18px!important;
+          line-height:1.2!important;
+          font-weight:750!important;
+          font-family:inherit!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] .pend-tile-copy {
+          min-height:31px!important;
+          margin:4px 0 7px!important;
+          font-size:12px!important;
+        }
+        .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] [data-testid="stButton"] button {
+          height:42px!important;
+          min-height:42px!important;
+          font-size:13px!important;
+          font-weight:700!important;
+        }
+        @media (max-width:700px) {
+          .stMainBlockContainer:has(.pend-hero) [class*="st-key-pend_nav_"] {
+            height:auto!important;
+            min-height:190px!important;
+            max-height:none!important;
+          }
+        }
+        </style>""", unsafe_allow_html=True)
+        # Selector interactivo nativo de Streamlit. El estado se conserva entre reruns.
+        vista_actual = st.session_state.get("setf_pend_vista", "Mis pendientes")
+        if vista_actual not in ("Mis pendientes", "Pendientes de la mesa"):
+            vista_actual = "Mis pendientes"
+            st.session_state["setf_pend_vista"] = vista_actual
+        st.markdown("""<style>
+        /* Solo SETF y exclusivamente el selector de este módulo. */
+        [class*="st-key-setf_pend_btn_mis"] button,
+        [class*="st-key-setf_pend_btn_mesa"] button {
+            min-height: 56px !important;
+            border-radius: 12px !important;
+            font-size: 15px !important;
+            font-weight: 740 !important;
+            letter-spacing: .05px !important;
+            box-shadow: 0 3px 10px rgba(27,43,50,.08) !important;
+            border: 1px solid #D1C0AB !important;
+            transition: background-color .15s, border-color .15s, box-shadow .15s !important;
+        }
+        [class*="st-key-setf_pend_btn_mis"] button[kind="primary"],
+        [class*="st-key-setf_pend_btn_mesa"] button[kind="primary"] {
+            background: #263F47 !important;
+            color: #FFFFFF !important;
+            border-color: #C6A16E !important;
+            box-shadow: 0 5px 16px rgba(24,50,57,.19) !important;
+        }
+        [class*="st-key-setf_pend_btn_mis"] button[kind="secondary"],
+        [class*="st-key-setf_pend_btn_mesa"] button[kind="secondary"] {
+            background: #FBF8F2 !important;
+            color: #253F47 !important;
+        }
+        [class*="st-key-setf_pend_btn_mis"] button:hover,
+        [class*="st-key-setf_pend_btn_mesa"] button:hover {
+            border-color: #B88E55 !important;
+            box-shadow: 0 7px 18px rgba(31,45,50,.15) !important;
+        }
+        .setf-pend-switch-title {margin:0 0 3px !important;}
+        .setf-pend-switch-sub {margin:0 0 10px !important;}
+        </style>""", unsafe_allow_html=True)
+        boton_mis, boton_mesa = st.columns(2, gap="small")
+        with boton_mis:
+            if st.button("▤  Mis pendientes",
+                         key="setf_pend_btn_mis", use_container_width=True,
+                         type="primary" if vista_actual == "Mis pendientes" else "secondary"):
+                st.session_state["setf_pend_vista"] = "Mis pendientes"
+                st.rerun()
+        with boton_mesa:
+            if st.button("♧  Pendientes de la mesa",
+                         key="setf_pend_btn_mesa", use_container_width=True,
+                         type="primary" if vista_actual == "Pendientes de la mesa" else "secondary"):
+                st.session_state["setf_pend_vista"] = "Pendientes de la mesa"
+                st.rerun()
+        if vista_actual == "Pendientes de la mesa":
+            _setf_vista_pendientes_generales()
+            return
     # Compactar 75 % el espacio entre la cabecera institucional y el panel
     # principal de Mis pendientes, tanto en Diseño Geométrico como en SETF.
     # Mayor especificidad para prevalecer sobre los estilos heredados.
@@ -6162,6 +6703,33 @@ def mostrar_mis_pendientes():
         }
       }
     </style>""", unsafe_allow_html=True)
+    # Ajuste FINAL de composición SETF, sin trasladar la cabecera con márgenes negativos.
+    if _area_activa_validada() == "setf":
+        st.markdown("""<style>
+        /* El hueco era padding heredado y márgenes incompatibles; no mover el banner. */
+        body [data-testid="stAppViewContainer"] .block-container:has(.setf-pend-switch-title) {
+            padding-top: 0.35rem !important;
+            margin-top: 0 !important;
+        }
+        body .stMainBlockContainer:has(.setf-pend-switch-title) {
+            padding-top: 0 !important;
+            margin-top: 0 !important;
+        }
+        body .stMainBlockContainer:has(.setf-pend-switch-title) .setf-pend-switch-title {
+            margin: 0 0 3px !important;
+        }
+        body .stMainBlockContainer:has(.setf-pend-switch-title) .setf-pend-switch-sub {
+            margin: 0 0 6px !important;
+        }
+        body .stMainBlockContainer:has(.setf-pend-switch-title) .pend-hero {
+            margin-top: 12px !important;
+            margin-bottom: 10px !important;
+            transform: none !important;
+        }
+        body .stMainBlockContainer:has(.setf-pend-switch-title) .pend-nav-head {
+            margin: 5px 2px 8px !important;
+        }
+        </style>""", unsafe_allow_html=True)
     # Imagen con transparencia solicitada; un SVG técnico queda como respaldo.
     imagen_pendientes = (_imagen_selector("banner_mis_pendientes.png")
                           or _imagen_selector("trazo_pendientes.png"))
@@ -6258,14 +6826,11 @@ def mostrar_mis_pendientes():
         ("Mis oficios", "▤", "Expedientes asignados", "Consulta y seguimiento de tus oficios."),
         ("Por revisar", "▣", "Validación documental", "Revisa los documentos que esperan autorización."),
         ("En proceso de firma", "✎", "Seguimiento de firmas", "Consulta los documentos enviados a firma."),
-        ("Nuevo oficio", "+", "Registro documental", "Crea y registra un oficio en el sistema."),
     ]
     # Solo se dibujan las bandejas autorizadas: ninguna tarjeta deshabilitada.
     opciones_visibles = [(i, nombre, icono, subtitulo, descripcion)
                          for i, (nombre, icono, subtitulo, descripcion) in enumerate(opciones_nav)
-                         if nombre in etiquetas or (
-                             nombre == "Nuevo oficio" and not puede_realizar_revision_final()
-                         )]
+                         if nombre in etiquetas]
     # Ilustraciones locales para la navegación; no se envían a Drive.
     imagenes_bandejas = {
         "Por revisar": _imagen_selector("tarjeta_por_revisar.png"),
@@ -6283,33 +6848,306 @@ def mostrar_mis_pendientes():
     ]
     if recursos_faltantes and puede_realizar_revision_final():
         st.caption("Imágenes no encontradas en assets/: " + ", ".join(recursos_faltantes))
-    cols_nav = st.columns(len(opciones_visibles), gap="medium")
+    # Bandejas SETF V2: diseño único, sin los estilos heredados que se contradecían.
+    # Los botones siguen siendo st.button y conservan la navegación y los permisos.
+    vista_setf = _area_activa_validada() == "setf"
+    if vista_setf:
+        st.markdown("""<style>
+        /* Alcance estricto: solo Centro de pendientes SETF. Se usan llaves nuevas
+           para no heredar reglas antiguas de st-key-pend_nav_. */
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          [data-testid="stHorizontalBlock"]:has([class*="st-key-setf_pend_card_"]) {
+            gap: clamp(12px, 1.2vw, 20px) !important;
+            align-items: stretch !important;
+            margin: 0 !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          [data-testid="stHorizontalBlock"]:has([class*="st-key-setf_pend_card_"])
+          > [data-testid="stColumn"] {
+            min-width:0 !important;
+            display:flex !important;
+            flex-direction:column !important;
+            align-self:stretch !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"] {
+            box-sizing:border-box !important;
+            position:relative !important;
+            isolation:isolate !important;
+            width:100% !important;
+            height:218px !important;
+            min-height:218px !important;
+            max-height:218px !important;
+            padding:18px 19px 15px !important;
+            border:1.5px solid #c99c78 !important;
+            border-left:4px solid #c19164 !important;
+            border-radius:17px !important;
+            background:rgba(252,248,243,.97) !important;
+            box-shadow:0 8px 20px rgba(48,47,44,.09) !important;
+            overflow:hidden !important;
+            display:flex !important;
+            flex-direction:column !important;
+            justify-content:flex-start !important;
+            flex:1 1 auto !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"][class*="_revision_"] {
+            border-color:#d1a988 !important;
+            border-left-color:#b8875e !important;
+            background:#fbf5ed !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"][class*="_firma_"] {
+            border-color:#a9c1ac !important;
+            border-left-color:#6b9880 !important;
+            background:#f2f7f2 !important;
+        }
+        /* Cubrir las dos variantes habituales de estructura interna de Streamlit. */
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"] :is(
+            [data-testid="stVerticalBlock"],
+            [data-testid="stVerticalBlockBorderWrapper"]
+          ) {
+            min-height:0 !important;
+            height:100% !important;
+            display:flex !important;
+            flex-direction:column !important;
+            justify-content:flex-start !important;
+            gap:0 !important;
+            flex:1 1 auto !important;
+            width:100% !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"]
+          [data-testid="stElementContainer"]:has(.setf-pend-tile) {
+            width:100% !important;
+            min-width:0 !important;
+            flex:1 1 auto !important;
+            margin:0 !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"]
+          [data-testid="stElementContainer"]:has([data-testid="stButton"]) {
+            width:100% !important;
+            flex:0 0 42px !important;
+            margin-top:auto !important;
+            margin-bottom:0 !important;
+            position:static !important;
+            inset:auto !important;
+        }
+        .setf-pend-tile {
+            position:relative !important;
+            margin:0 !important;
+            padding:0 !important;
+            width:100% !important;
+            display:flex !important;
+            flex-direction:column !important;
+            z-index:1 !important;
+        }
+        .setf-pend-tile-heading {
+            display:grid !important;
+            grid-template-columns:54px minmax(0,1fr) !important;
+            align-items:center !important;
+            gap:13px !important;
+            height:67px !important;
+            min-height:67px !important;
+            max-height:67px !important;
+            margin:0 !important;
+        }
+        .setf-pend-tile-icon {
+            width:54px !important;
+            height:54px !important;
+            border-radius:50% !important;
+            border:1px solid #dfbfa8 !important;
+            background:#ecdbce !important;
+            color:#8a5f40 !important;
+            display:flex !important;
+            align-items:center !important;
+            justify-content:center !important;
+            font-size:26px !important;
+            line-height:1 !important;
+            flex-shrink:0 !important;
+            margin:0 !important;
+        }
+        div[class*="st-key-setf_pend_card_"][class*="_firma_"] .setf-pend-tile-icon {
+            color:#416a55 !important;
+            background:#dcebdd !important;
+            border-color:#bfd6c0 !important;
+        }
+        .setf-pend-tile-text {min-width:0 !important; align-self:center !important;}
+        .setf-pend-tile-title {
+            font-family:inherit !important;
+            font-size:18px !important;
+            font-weight:750 !important;
+            line-height:1.18 !important;
+            letter-spacing:0 !important;
+            color:#3a343b !important;
+            margin:0 0 5px !important;
+            padding:0 !important;
+        }
+        .setf-pend-tile-sub {
+            display:block !important;
+            font-family:inherit !important;
+            font-size:12px !important;
+            font-weight:650 !important;
+            line-height:1.25 !important;
+            color:#9b6848 !important;
+            margin:0 !important;
+            padding:0 !important;
+        }
+        div[class*="st-key-setf_pend_card_"][class*="_firma_"] .setf-pend-tile-sub {
+            color:#527c5d !important;
+        }
+        .setf-pend-tile-desc {
+            position:relative !important;
+            margin:9px 0 0 !important;
+            padding:0 !important;
+            font-family:inherit !important;
+            font-size:12px !important;
+            font-weight:400 !important;
+            line-height:1.45 !important;
+            color:#655d5a !important;
+            max-width:96% !important;
+            min-height:35px !important;
+        }
+        .setf-pend-tile-art {
+            position:absolute !important;
+            right:0 !important;
+            top:14px !important;
+            width:38% !important;
+            height:110px !important;
+            background-size:contain !important;
+            background-repeat:no-repeat !important;
+            background-position:right center !important;
+            opacity:.10 !important;
+            pointer-events:none !important;
+            z-index:-1 !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"] [data-testid="stButton"] {
+            width:100% !important;
+            margin:0 !important;
+            position:static !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"] [data-testid="stButton"] button {
+            width:100% !important;
+            height:42px !important;
+            min-height:42px !important;
+            margin:0 !important;
+            border:1px solid #e0bea4 !important;
+            border-radius:9px !important;
+            background:#f8f0e9 !important;
+            color:#905838 !important;
+            font-family:inherit !important;
+            font-size:13px !important;
+            font-weight:680 !important;
+            display:flex !important;
+            align-items:center !important;
+            justify-content:center !important;
+        }
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"] [data-testid="stButton"] button:hover {
+            background:#f1e1d2 !important;
+            border-color:#b98964 !important;
+        }
+        /* La tarjeta activa conserva su identidad en el borde; el botón siempre
+           mantiene el mismo estilo y contraste que los de las otras bandejas. */
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          div[class*="st-key-setf_pend_card_"][class*="_activo"] [data-testid="stButton"] button {
+            background:#f8f0e9 !important;
+            color:#905838 !important;
+            border-color:#e0bea4 !important;
+        }
+        /* Compactar únicamente el hueco ENTRE la barra de navegación y
+           'Centro de pendientes'. No se desplaza la cabecera ni el banner.
+           La compensación se aplica al elemento de flujo que inicia la sección:
+           el contenido siguiente acompaña el cambio naturalmente. */
+        @media (min-width: 900px) {
+          body .stMainBlockContainer:has(.setf-pend-switch-title)
+            [data-testid="stElementContainer"]:has(.setf-pend-switch-title) {
+              margin-top: -44px !important;
+          }
+        }
+        @media (min-width: 650px) and (max-width: 899px) {
+          body .stMainBlockContainer:has(.setf-pend-switch-title)
+            [data-testid="stElementContainer"]:has(.setf-pend-switch-title) {
+              margin-top: -22px !important;
+          }
+        }
+        /* Mantener aire bajo el selector y antes de la tarjeta principal. */
+        .stMainBlockContainer:has(.setf-pend-switch-title)
+          [data-testid="stHorizontalBlock"]:has([class*="st-key-setf_pend_btn_"]) {
+            margin-bottom: 8px !important;
+        }
+        /* Eliminar el salto exagerado entre las bandejas y los indicadores. */
+        .stMainBlockContainer:has(.setf-pend-switch-title) .pend-section-label {
+            margin-top:12px !important;
+            margin-bottom:7px !important;
+        }
+        @media(max-width:850px) {
+            .stMainBlockContainer:has(.setf-pend-switch-title)
+              div[class*="st-key-setf_pend_card_"] {
+                min-height:218px !important;
+                height:218px !important;
+                max-height:218px !important;
+            }
+        }
+        </style>""", unsafe_allow_html=True)
+
+    cols_nav = st.columns(len(opciones_visibles), gap="small")
     for columna, (i, nombre, icono, subtitulo, descripcion) in zip(cols_nav, opciones_visibles):
         with columna:
             activo = nombre == bandeja_actual
             categoria_visual = {"Por revisar": "revision", "En proceso de firma": "firma"}.get(nombre, "general")
             tarjeta_imagen = imagenes_bandejas.get(nombre, "")
-            fondo_tarjeta = (
-                f'<span class="pend-tile-art" style="background-image:url(\'{tarjeta_imagen}\')" aria-hidden="true"></span>'
-                if tarjeta_imagen else ''
-            )
-            with st.container(key=f"pend_nav_{i}_{categoria_visual}_{'activo' if activo else 'normal'}"):
-                st.markdown(
-                    fondo_tarjeta + '<div class="pend-tile-head">'
-                    f'<span class="pend-tile-icon">{icono}</span>'
-                    '<div class="pend-tile-body">'
-                    f'<h3 class="pend-tile-name">{html.escape(nombre)}</h3>'
-                    f'<span class="pend-tile-sub">{html.escape(subtitulo)}</span>'
-                    '</div></div>'
-                    f'<p class="pend-tile-copy">{html.escape(descripcion)}</p>',
-                    unsafe_allow_html=True,
+            if vista_setf:
+                # El bloque de información ocupa una altura uniforme y el botón
+                # queda aparte como control nativo, sin capas absolutas.
+                fondo = (
+                    f'<span class="setf-pend-tile-art" style="background-image:url(\'{tarjeta_imagen}\')" '
+                    'aria-hidden="true"></span>' if tarjeta_imagen else ''
                 )
-                etiqueta_boton = "Registrar oficio  ↗" if nombre == "Nuevo oficio" else (
-                    "Bandeja activa  →" if activo else "Abrir bandeja  →")
-                if st.button(etiqueta_boton, key=f"pend_action_{i}", use_container_width=True):
-                    if nombre == "Nuevo oficio":
-                        navegar_a("oficios")
-                    else:
+                with st.container(key=f"setf_pend_card_{i}_{categoria_visual}_{'activo' if activo else 'normal'}"):
+                    st.markdown(
+                        '<div class="setf-pend-tile">'
+                        + fondo
+                        + '<div class="setf-pend-tile-heading">'
+                        f'<span class="setf-pend-tile-icon">{html.escape(icono)}</span>'
+                        '<div class="setf-pend-tile-text">'
+                        f'<div class="setf-pend-tile-title">{html.escape(nombre)}</div>'
+                        f'<span class="setf-pend-tile-sub">{html.escape(subtitulo)}</span>'
+                        '</div></div>'
+                        f'<p class="setf-pend-tile-desc">{html.escape(descripcion)}</p>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Mismo texto para la bandeja seleccionada y las demás.
+                    # El estado activo se indica en la propia tarjeta, nunca en el botón.
+                    etiqueta_boton = "Abrir bandeja  →"
+                    if st.button(etiqueta_boton, key=f"pend_action_{i}", use_container_width=True):
+                        st.session_state.pend_bandeja = nombre
+                        st.session_state.pend_expediente_abierto = None
+                        st.rerun()
+            else:
+                # El resto del proyecto mantiene su presentación original.
+                fondo_tarjeta = (
+                    f'<span class="pend-tile-art" style="background-image:url(\'{tarjeta_imagen}\')" aria-hidden="true"></span>'
+                    if tarjeta_imagen else ''
+                )
+                with st.container(key=f"pend_nav_{i}_{categoria_visual}_{'activo' if activo else 'normal'}"):
+                    st.markdown(
+                        fondo_tarjeta + '<div class="pend-tile-head">'
+                        f'<span class="pend-tile-icon">{icono}</span>'
+                        '<div class="pend-tile-body">'
+                        f'<h3 class="pend-tile-name">{html.escape(nombre)}</h3>'
+                        f'<span class="pend-tile-sub">{html.escape(subtitulo)}</span>'
+                        '</div></div>'
+                        f'<p class="pend-tile-copy">{html.escape(descripcion)}</p>',
+                        unsafe_allow_html=True,
+                    )
+                    etiqueta_boton = "Bandeja activa  →" if activo else "Abrir bandeja  →"
+                    if st.button(etiqueta_boton, key=f"pend_action_{i}", use_container_width=True):
                         st.session_state.pend_bandeja = nombre
                         st.session_state.pend_expediente_abierto = None
                         st.rerun()
@@ -6419,113 +7257,282 @@ def mostrar_mis_pendientes():
                                            else es_administrador_documental_setf())
                         if not autorizado:
                             st.info("Tienes acceso de consulta, pero no permiso para editar este oficio.")
-                        if edicion_general:
-                            # Se conserva el encabezado del oficio; solo cambia el panel editable.
-                            with st.container(border=True, key="pend_editor"):
-                                st.markdown(
-                                    '<div class="pend-editor-header">'
-                                    '<span class="pend-editor-kicker">ADMINISTRACIÓN DOCUMENTAL</span>'
-                                    '<div class="pend-editor-title">Editar oficio</div>'
-                                    '<div class="pend-editor-sub">Actualización y seguimiento del expediente</div>'
-                                    '</div>', unsafe_allow_html=True
-                                )
-                                st.markdown('<div class="pend-editor-section">01 &nbsp; Datos principales</div>',
-                                            unsafe_allow_html=True)
-                                # Selector fuera del formulario para que Firmado despliegue campos al instante.
-                                opciones = ESTATUS_OFICIOS.copy()
-                                if estatus not in opciones:
-                                    opciones.insert(0, estatus)
-                                clave_estado = f"pend_estado_{folio}_{numero}"
-                                if clave_estado not in st.session_state:
-                                    st.session_state[clave_estado] = estatus
-                                nuevo_estado = st.selectbox("Estatus", opciones, key=clave_estado)
-
-                                documentos_actuales = leer_documentos(oficio.get("Firmado", ""))
-                                firmado_actual = documentos_actuales[0] if documentos_actuales else {"nombre": "", "url": ""}
-                                fecha_guardada = campo("Fecha de entrega")
-                                fecha_inicial = None
-                                for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                        if _area_activa_validada() == "setf":
+                            # Ficha SETF según boceto aprobado: una sola tarjeta Word (65 %)
+                            # y una tarjeta de documentación relacionada (35 %).
+                            # No se tocan los permisos ni las funciones de Drive/Sheets.
+                            panel_word, panel_adjuntos = st.columns([1.85, 1], gap="small", vertical_alignment="top")
+                            with panel_word:
+                                with st.container(border=True, key=f"setf_word_panel_{indice}"):
+                                    st.markdown(
+                                        '<div class="setf-exp-panel-title">'
+                                        '<span class="setf-exp-panel-icon">▣</span>'
+                                        '<strong>Documento Word</strong>'
+                                        '</div>', unsafe_allow_html=True
+                                    )
                                     try:
-                                        fecha_inicial = datetime.strptime(fecha_guardada, formato).date()
-                                        break
-                                    except ValueError:
-                                        pass
-
-                                with st.form(key=f"pend_form_{indice}"):
-                                    nuevo_asunto = st.text_area("Asunto", value=campo("Asunto"), height=90)
-                                    nuevo_proyecto = st.text_input("Proyecto", value=campo("Proyecto"))
-                                    st.markdown('<div class="pend-editor-section">02 &nbsp; Seguimiento del trámite</div>',
-                                                unsafe_allow_html=True)
-                                    if nuevo_estado == "Firmado":
-                                        st.markdown('<div class="pend-editor-sign">▣ &nbsp; Oficio firmado</div>',
-                                                    unsafe_allow_html=True)
-                                        col_nombre, col_url = st.columns([1, 1.6])
-                                        with col_nombre:
-                                            nombre_firmado = st.text_input(
-                                                "Nombre del documento", value=firmado_actual["nombre"],
-                                                placeholder="Ej. Oficio firmado 21845"
+                                        documentos_setf = _setf_borradores_compartidos()
+                                        enviado = _setf_ultimo_word_enviado(folio, numero, documentos_setf)
+                                        if enviado:
+                                            st.markdown(
+                                                '<div class="setf-word-version">'
+                                                '<span>VERSIÓN ACTUAL · ÚLTIMA ENVIADA</span>'
+                                                f'<strong>Versión {html.escape(str(enviado.get("Version", "—")))}</strong>'
+                                                '<small>Disponible para consulta y descarga.</small>'
+                                                '</div>', unsafe_allow_html=True
                                             )
-                                        with col_url:
-                                            enlace_firmado = st.text_input(
-                                                "Enlace de Drive", value=firmado_actual["url"],
-                                                placeholder="https://drive.google.com/..."
+                                            ident_word = hashlib.sha1(f"{folio}|{numero}".encode()).hexdigest()[:12]
+                                            _setf_documento_compartido(folio, numero, documentos_setf, "personal_" + ident_word, mostrar_titulo=False)
+                                        else:
+                                            st.markdown(
+                                                '<div class="setf-word-version">'
+                                                '<span>VERSIÓN ACTUAL</span>'
+                                                '<strong>Sin documento enviado</strong>'
+                                                '<small>Carga un Word para comenzar el flujo documental.</small>'
+                                                '</div>', unsafe_allow_html=True
                                             )
-                                        fecha_entrega = st.date_input(
-                                            "Fecha de entrega", value=fecha_inicial, format="DD/MM/YYYY"
+                                    except Exception as error:
+                                        st.warning(f"No fue posible consultar el Word enviado: {_mensaje_error_sheets(error)}")
+                                    if autorizado:
+                                        # El modo compacto quita las cabeceras duplicadas y
+                                        # contrae la carga inicial, pero mantiene todas las acciones.
+                                        mostrar_borradores_pendiente(folio, numero, responsable, compacto=True)
+                                    else:
+                                        st.caption("Solo consulta. La carga y autorización respetan los permisos existentes.")
+                            with panel_adjuntos:
+                                with st.container(border=True, key=f"setf_documentos_laterales_{indice}"):
+                                    st.markdown(
+                                        '<div class="setf-exp-panel-title">'
+                                        '<span class="setf-exp-panel-icon">▱</span>'
+                                        '<strong>Documentación relacionada</strong>'
+                                        '</div>', unsafe_allow_html=True
+                                    )
+                                    with st.expander("Antecedentes", expanded=False):
+                                        enlaces = leer_documentos(oficio.get("Antecedente", ""))
+                                        if not enlaces:
+                                            st.caption("Sin antecedentes registrados")
+                                        for doc in enlaces:
+                                            if doc.get("url"):
+                                                st.link_button(doc.get("nombre") or "Abrir antecedente", doc["url"], use_container_width=True)
+                                    with st.expander("Anexos", expanded=False):
+                                        enlaces = leer_documentos(oficio.get("Anexo", ""))
+                                        if not enlaces:
+                                            st.caption("Sin anexos registrados")
+                                        for doc in enlaces:
+                                            if doc.get("url"):
+                                                st.link_button(doc.get("nombre") or "Abrir anexo", doc["url"], use_container_width=True)
+                                    st.markdown('<div class="setf-exp-state-label">ESTADO DEL EXPEDIENTE</div>', unsafe_allow_html=True)
+                                    st.markdown(f'<div class="setf-exp-state">{html.escape(estatus)}</div>', unsafe_allow_html=True)
+                            # Editor completo bajo ambas columnas, plegado de forma predeterminada.
+                            if edicion_general:
+                                with st.expander("✎ Editar oficio · datos y estado", expanded=False):
+                                    # Se conserva el encabezado del oficio; solo cambia el panel editable.
+                                    with st.container(border=True, key="pend_editor"):
+                                        st.markdown(
+                                            '<div class="pend-editor-header">'
+                                            '<span class="pend-editor-kicker">ADMINISTRACIÓN DOCUMENTAL</span>'
+                                            '<div class="pend-editor-title">Editar oficio</div>'
+                                            '<div class="pend-editor-sub">Actualización y seguimiento del expediente</div>'
+                                            '</div>', unsafe_allow_html=True
                                         )
-                                    else:
-                                        nombre_firmado = firmado_actual["nombre"]
-                                        enlace_firmado = firmado_actual["url"]
-                                        fecha_entrega = fecha_inicial
-                                        st.caption("El nombre, enlace y fecha de entrega se habilitan al seleccionar Firmado.")
-                                    nuevas_observaciones = st.text_area(
-                                        "Observaciones", value=campo("Observaciones"), height=90
-                                    )
-                                    st.markdown('<div class="pend-editor-divider"></div>', unsafe_allow_html=True)
-                                    guardar = st.form_submit_button(
-                                        "Guardar cambios en la base general", type="primary",
-                                        use_container_width=True
-                                    )
+                                        st.markdown('<div class="pend-editor-section">01 &nbsp; Datos principales</div>',
+                                                    unsafe_allow_html=True)
+                                        # Selector fuera del formulario para que Firmado despliegue campos al instante.
+                                        opciones = ESTATUS_OFICIOS.copy()
+                                        if estatus not in opciones:
+                                            opciones.insert(0, estatus)
+                                        clave_estado = f"pend_estado_{folio}_{numero}"
+                                        if clave_estado not in st.session_state:
+                                            st.session_state[clave_estado] = estatus
+                                        nuevo_estado = st.selectbox("Estatus", opciones, key=clave_estado)
 
-                                if guardar:
-                                    error_validacion = None
-                                    if nuevo_estado == "Firmado":
-                                        if not nombre_firmado.strip():
-                                            error_validacion = "Indica el nombre del documento firmado."
-                                        elif not enlace_firmado.strip().startswith(("https://", "http://")):
-                                            error_validacion = "Introduce un enlace válido del documento firmado (https://...)."
-                                        elif fecha_entrega is None:
-                                            error_validacion = "Indica la fecha de entrega del oficio firmado."
-                                    if error_validacion:
-                                        st.error(error_validacion)
-                                    else:
-                                        cambios = {
-                                            "Estatus": nuevo_estado,
-                                            "Asunto": nuevo_asunto.strip(),
-                                            "Proyecto": nuevo_proyecto.strip(),
-                                            "Observaciones": nuevas_observaciones.strip(),
-                                            "Fecha de entrega": (
-                                                fecha_entrega.isoformat() if nuevo_estado == "Firmado" else ""
-                                            ),
-                                        }
-                                        if nuevo_estado == "Firmado":
-                                            cambios["Firmado"] = json.dumps(
-                                                [{"nombre": nombre_firmado.strip(),
-                                                  "url": enlace_firmado.strip()}], ensure_ascii=False
+                                        documentos_actuales = leer_documentos(oficio.get("Firmado", ""))
+                                        firmado_actual = documentos_actuales[0] if documentos_actuales else {"nombre": "", "url": ""}
+                                        fecha_guardada = campo("Fecha de entrega")
+                                        fecha_inicial = None
+                                        for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                                            try:
+                                                fecha_inicial = datetime.strptime(fecha_guardada, formato).date()
+                                                break
+                                            except ValueError:
+                                                pass
+
+                                        with st.form(key=f"pend_form_{indice}"):
+                                            nuevo_asunto = st.text_area("Asunto", value=campo("Asunto"), height=90)
+                                            nuevo_proyecto = st.text_input("Proyecto", value=campo("Proyecto"))
+                                            st.markdown('<div class="pend-editor-section">02 &nbsp; Seguimiento del trámite</div>',
+                                                        unsafe_allow_html=True)
+                                            if nuevo_estado == "Firmado":
+                                                st.markdown('<div class="pend-editor-sign">▣ &nbsp; Oficio firmado</div>',
+                                                            unsafe_allow_html=True)
+                                                col_nombre, col_url = st.columns([1, 1.6])
+                                                with col_nombre:
+                                                    nombre_firmado = st.text_input(
+                                                        "Nombre del documento", value=firmado_actual["nombre"],
+                                                        placeholder="Ej. Oficio firmado 21845"
+                                                    )
+                                                with col_url:
+                                                    enlace_firmado = st.text_input(
+                                                        "Enlace de Drive", value=firmado_actual["url"],
+                                                        placeholder="https://drive.google.com/..."
+                                                    )
+                                                fecha_entrega = st.date_input(
+                                                    "Fecha de entrega", value=fecha_inicial, format="DD/MM/YYYY"
+                                                )
+                                            else:
+                                                nombre_firmado = firmado_actual["nombre"]
+                                                enlace_firmado = firmado_actual["url"]
+                                                fecha_entrega = fecha_inicial
+                                                st.caption("El nombre, enlace y fecha de entrega se habilitan al seleccionar Firmado.")
+                                            nuevas_observaciones = st.text_area(
+                                                "Observaciones", value=campo("Observaciones"), height=90
                                             )
+                                            st.markdown('<div class="pend-editor-divider"></div>', unsafe_allow_html=True)
+                                            guardar = st.form_submit_button(
+                                                "Guardar cambios en la base general", type="primary",
+                                                use_container_width=True
+                                            )
+
+                                        if guardar:
+                                            error_validacion = None
+                                            if nuevo_estado == "Firmado":
+                                                if not nombre_firmado.strip():
+                                                    error_validacion = "Indica el nombre del documento firmado."
+                                                elif not enlace_firmado.strip().startswith(("https://", "http://")):
+                                                    error_validacion = "Introduce un enlace válido del documento firmado (https://...)."
+                                                elif fecha_entrega is None:
+                                                    error_validacion = "Indica la fecha de entrega del oficio firmado."
+                                            if error_validacion:
+                                                st.error(error_validacion)
+                                            else:
+                                                cambios = {
+                                                    "Estatus": nuevo_estado,
+                                                    "Asunto": nuevo_asunto.strip(),
+                                                    "Proyecto": nuevo_proyecto.strip(),
+                                                    "Observaciones": nuevas_observaciones.strip(),
+                                                    "Fecha de entrega": (
+                                                        fecha_entrega.isoformat() if nuevo_estado == "Firmado" else ""
+                                                    ),
+                                                }
+                                                if nuevo_estado == "Firmado":
+                                                    cambios["Firmado"] = json.dumps(
+                                                        [{"nombre": nombre_firmado.strip(),
+                                                          "url": enlace_firmado.strip()}], ensure_ascii=False
+                                                    )
+                                                try:
+                                                    with st.spinner("Actualizando el expediente en Google Sheets..."):
+                                                        guardar_edicion_pendiente(folio, numero, cambios)
+                                                    st.session_state.pend_guardado = True
+                                                    st.rerun()
+                                                except Exception as error:
+                                                    st.error(f"No fue posible completar el guardado: {error}")
+                        else:
+                            if edicion_general:
+                                # Se conserva el encabezado del oficio; solo cambia el panel editable.
+                                with st.container(border=True, key="pend_editor"):
+                                    st.markdown(
+                                        '<div class="pend-editor-header">'
+                                        '<span class="pend-editor-kicker">ADMINISTRACIÓN DOCUMENTAL</span>'
+                                        '<div class="pend-editor-title">Editar oficio</div>'
+                                        '<div class="pend-editor-sub">Actualización y seguimiento del expediente</div>'
+                                        '</div>', unsafe_allow_html=True
+                                    )
+                                    st.markdown('<div class="pend-editor-section">01 &nbsp; Datos principales</div>',
+                                                unsafe_allow_html=True)
+                                    # Selector fuera del formulario para que Firmado despliegue campos al instante.
+                                    opciones = ESTATUS_OFICIOS.copy()
+                                    if estatus not in opciones:
+                                        opciones.insert(0, estatus)
+                                    clave_estado = f"pend_estado_{folio}_{numero}"
+                                    if clave_estado not in st.session_state:
+                                        st.session_state[clave_estado] = estatus
+                                    nuevo_estado = st.selectbox("Estatus", opciones, key=clave_estado)
+
+                                    documentos_actuales = leer_documentos(oficio.get("Firmado", ""))
+                                    firmado_actual = documentos_actuales[0] if documentos_actuales else {"nombre": "", "url": ""}
+                                    fecha_guardada = campo("Fecha de entrega")
+                                    fecha_inicial = None
+                                    for formato in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
                                         try:
-                                            with st.spinner("Actualizando el expediente en Google Sheets..."):
-                                                guardar_edicion_pendiente(folio, numero, cambios)
-                                            st.session_state.pend_guardado = True
-                                            st.rerun()
-                                        except Exception as error:
-                                            st.error(f"No fue posible completar el guardado: {error}")
-                        # Borradores: solo usuarios con acceso al oficio.
-                        if autorizado:
-                            with st.container(border=True):
-                                mostrar_borradores_pendiente(folio, numero, responsable)
-                        # Mostrar documentos existentes después del formulario.
-                        mostrar_documentos(oficio)
+                                            fecha_inicial = datetime.strptime(fecha_guardada, formato).date()
+                                            break
+                                        except ValueError:
+                                            pass
+
+                                    with st.form(key=f"pend_form_{indice}"):
+                                        nuevo_asunto = st.text_area("Asunto", value=campo("Asunto"), height=90)
+                                        nuevo_proyecto = st.text_input("Proyecto", value=campo("Proyecto"))
+                                        st.markdown('<div class="pend-editor-section">02 &nbsp; Seguimiento del trámite</div>',
+                                                    unsafe_allow_html=True)
+                                        if nuevo_estado == "Firmado":
+                                            st.markdown('<div class="pend-editor-sign">▣ &nbsp; Oficio firmado</div>',
+                                                        unsafe_allow_html=True)
+                                            col_nombre, col_url = st.columns([1, 1.6])
+                                            with col_nombre:
+                                                nombre_firmado = st.text_input(
+                                                    "Nombre del documento", value=firmado_actual["nombre"],
+                                                    placeholder="Ej. Oficio firmado 21845"
+                                                )
+                                            with col_url:
+                                                enlace_firmado = st.text_input(
+                                                    "Enlace de Drive", value=firmado_actual["url"],
+                                                    placeholder="https://drive.google.com/..."
+                                                )
+                                            fecha_entrega = st.date_input(
+                                                "Fecha de entrega", value=fecha_inicial, format="DD/MM/YYYY"
+                                            )
+                                        else:
+                                            nombre_firmado = firmado_actual["nombre"]
+                                            enlace_firmado = firmado_actual["url"]
+                                            fecha_entrega = fecha_inicial
+                                            st.caption("El nombre, enlace y fecha de entrega se habilitan al seleccionar Firmado.")
+                                        nuevas_observaciones = st.text_area(
+                                            "Observaciones", value=campo("Observaciones"), height=90
+                                        )
+                                        st.markdown('<div class="pend-editor-divider"></div>', unsafe_allow_html=True)
+                                        guardar = st.form_submit_button(
+                                            "Guardar cambios en la base general", type="primary",
+                                            use_container_width=True
+                                        )
+
+                                    if guardar:
+                                        error_validacion = None
+                                        if nuevo_estado == "Firmado":
+                                            if not nombre_firmado.strip():
+                                                error_validacion = "Indica el nombre del documento firmado."
+                                            elif not enlace_firmado.strip().startswith(("https://", "http://")):
+                                                error_validacion = "Introduce un enlace válido del documento firmado (https://...)."
+                                            elif fecha_entrega is None:
+                                                error_validacion = "Indica la fecha de entrega del oficio firmado."
+                                        if error_validacion:
+                                            st.error(error_validacion)
+                                        else:
+                                            cambios = {
+                                                "Estatus": nuevo_estado,
+                                                "Asunto": nuevo_asunto.strip(),
+                                                "Proyecto": nuevo_proyecto.strip(),
+                                                "Observaciones": nuevas_observaciones.strip(),
+                                                "Fecha de entrega": (
+                                                    fecha_entrega.isoformat() if nuevo_estado == "Firmado" else ""
+                                                ),
+                                            }
+                                            if nuevo_estado == "Firmado":
+                                                cambios["Firmado"] = json.dumps(
+                                                    [{"nombre": nombre_firmado.strip(),
+                                                      "url": enlace_firmado.strip()}], ensure_ascii=False
+                                                )
+                                            try:
+                                                with st.spinner("Actualizando el expediente en Google Sheets..."):
+                                                    guardar_edicion_pendiente(folio, numero, cambios)
+                                                st.session_state.pend_guardado = True
+                                                st.rerun()
+                                            except Exception as error:
+                                                st.error(f"No fue posible completar el guardado: {error}")
+                            # Borradores: solo usuarios con acceso al oficio.
+                            if autorizado:
+                                with st.container(border=True):
+                                    mostrar_borradores_pendiente(folio, numero, responsable)
+
 
         # Actividad real desde la bitácora; la ausencia de eventos no bloquea la bandeja.
         if puede_gestionar_borradores() or puede_realizar_revision_final():
@@ -7119,7 +8126,278 @@ def aplicar_fondo_setf_por_pagina():
 
 if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
     aplicar_fondo_setf_por_pagina()
-    mostrar_cabecera_documental()
+    if _area_activa_validada() != "setf":
+        mostrar_cabecera_documental()
+
+
+# =========================================================
+# SETF: NAVEGACIÓN SUPERIOR Y CENTRO DE NOTIFICACIONES
+# No se ejecuta para Diseño Geométrico.
+# =========================================================
+_SETf_NAV = [
+    ("home", "⌂ Inicio"), ("oficios", "▤ Oficios"),
+    ("pendientes", "☷ Pendientes"), ("urgentes", "⚠ Urgentes"),
+    ("firmados", "✓ Firmados"), ("minutas", "▣ Minutas"),
+    ("reuniones", "▦ Reuniones"),
+]
+
+
+def _setf_notificaciones_actuales():
+    """Avisos derivados de registros existentes. No escribe en hojas operativas."""
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        return []
+    eventos = []
+    usuario = identificador_sesion()
+    responsable = str(st.session_state.get("responsable_oficios") or "").strip()
+    # No usar marcas de tiempo inventadas. IDs estables por registro y tipo.
+    try:
+        from datetime import timedelta
+        hoy = _reuniones_ahora().date()
+        libro, ws = _reuniones_hoja()
+        for r in _reuniones_leer(libro, ws):
+            if r["estado"] in ("Cancelada", "Realizada") or not (hoy <= r["fecha"] <= hoy + timedelta(days=7)):
+                continue
+            clave = str(r.get("id") or r["huella"])
+            eventos.append({"id": "reunion:" + clave, "tipo": "general",
+                "titulo": "Reunión próxima", "detalle": f'{r["asunto"]} · {r["fecha"].strftime("%d/%m/%Y")} · {r["hora"]}',
+                "destino": "reuniones", "fecha": r["fecha"].isoformat()})
+    except Exception:
+        pass  # Otros eventos siguen disponibles si hay problemas en la agenda.
+    try:
+        df = obtener_oficios_por_area("setf")
+        if not df.empty and "Responsable" in df.columns:
+            for _, r in df.iterrows():
+                nombre = str(r.get("Responsable", "")).strip()
+                if not responsable or normalizar_texto(nombre) != normalizar_texto(responsable):
+                    continue
+                estatus = str(r.get("Estatus", r.get("Estado", ""))).strip()
+                if normalizar_texto(estatus) in ("firmado", "firmados", "cancelado"):
+                    continue
+                ident = str(r.get("Folio") or r.get("No. de oficio") or "").strip()
+                if not ident:
+                    continue
+                eventos.append({"id": "asignacion:" + ident + ":" + usuario,
+                    "tipo": "personal", "titulo": "Oficio asignado",
+                    "detalle": str(r.get("No. de oficio") or ident),
+                    "destino": "oficios", "fecha": ""})
+    except Exception:
+        pass
+    try:
+        # Solo se notifica un envío cuando su oficio de origen continúa vigente.
+        originales = obtener_oficios_por_area("setf")
+        validos = set()
+        if not originales.empty:
+            validos = {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
+                       for _, r in originales.iterrows()}
+        for r in _leer_envios_firma():
+            ident = (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio origen", "")).strip())
+            if ident not in validos:
+                continue
+            nuevo = str(r.get("No. de oficio nuevo") or "").strip()
+            marca = str(r.get("Fecha envío") or "").strip()
+            if not nuevo:
+                continue
+            eventos.append({"id": "firma:" + hashlib.sha256(repr((ident, nuevo, marca)).encode()).hexdigest()[:20],
+                "tipo": "general", "titulo": "Oficio enviado a firma", "detalle": nuevo,
+                "destino": "firmados", "fecha": marca})
+    except Exception:
+        pass
+    # Quitar duplicados sin cambiar el orden.
+    return list({e["id"]: e for e in eventos}.values())[:80]
+
+
+def _setf_hoja_lecturas():
+    libro = conectar_google_sheets_por_area("setf").spreadsheet
+    try:
+        hoja = libro.worksheet("NOTIFICACIONES_LECTURAS")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="NOTIFICACIONES_LECTURAS", rows=2000, cols=3)
+        hoja.append_row(["Usuario", "ID", "Fecha lectura"], value_input_option="RAW")
+    if hoja.row_values(1)[:3] != ["Usuario", "ID", "Fecha lectura"]:
+        raise ValueError("NOTIFICACIONES_LECTURAS tiene encabezados distintos; no se modificaron registros.")
+    return hoja
+
+
+def _setf_leidas(usuario):
+    hoja = _setf_hoja_lecturas()
+    return {str(r.get("ID", "")) for r in hoja.get_all_records() if str(r.get("Usuario", "")) == usuario}
+
+
+def _setf_marcar_leida(evento_id):
+    usuario = identificador_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Solo SETF puede usar estas notificaciones.")
+    hoja = _setf_hoja_lecturas()
+    if evento_id not in _setf_leidas(usuario):
+        from zoneinfo import ZoneInfo
+        ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+        hoja.append_row([usuario, evento_id, ahora], value_input_option="RAW")
+
+
+def _setf_campana():
+    if "setf_avisos_abiertos" not in st.session_state:
+        st.session_state.setf_avisos_abiertos = False
+    eventos = _setf_notificaciones_actuales()
+    usuario = identificador_sesion()
+    try:
+        leidas = _setf_leidas(usuario)
+    except Exception as error:
+        st.caption("Avisos: almacenamiento de lecturas no disponible.")
+        leidas = set()
+    pendientes = [e for e in eventos if e["id"] not in leidas]
+    titulo = f"🔔 {len(pendientes)}" if pendientes else "🔔"
+    if st.button(titulo, key="setf_campana_toggle", help="Centro de notificaciones", use_container_width=True):
+        st.session_state.setf_avisos_abiertos = not st.session_state.setf_avisos_abiertos
+    if st.session_state.setf_avisos_abiertos:
+        with st.popover("Ver avisos", use_container_width=True):
+            st.markdown("**Centro de notificaciones SETF**")
+            tipo = st.radio("Mostrar", ["No leídas", "Todas"], horizontal=True, key="setf_aviso_filtro")
+            vistos = pendientes if tipo == "No leídas" else eventos
+            if not vistos:
+                st.caption("No hay avisos en esta categoría.")
+            for e in vistos[:20]:
+                st.markdown(f'**{html.escape(e["titulo"])}**')
+                st.caption(e["detalle"])
+                a, b = st.columns(2)
+                with a:
+                    if st.button("Ver módulo", key="setf_aviso_ir_" + e["id"]):
+                        navegar_a(e["destino"])
+                with b:
+                    if e["id"] not in leidas and st.button("Marcar leído", key="setf_aviso_leer_" + e["id"]):
+                        _setf_marcar_leida(e["id"])
+                        st.rerun()
+                st.divider()
+
+
+def _setf_barra_superior():
+    """Cabecera panorámica exclusiva de las subáreas SETF."""
+    if _area_activa_validada() != "setf":
+        return
+    banner = ASSETS_DIR / "banner_header_setf.png"
+    banner_css = "linear-gradient(110deg,#112b39,#203c44)"
+    if banner.is_file():
+        encoded = base64.b64encode(banner.read_bytes()).decode("ascii")
+        banner_css = (
+            'linear-gradient(90deg,rgba(9,28,40,.70),rgba(10,30,42,.45) 45%,rgba(9,28,40,.76)),'
+            f'url("data:image/png;base64,{encoded}")'
+        )
+    else:
+        st.warning("No se encontró assets/banner_header_setf.png; se muestra un fondo alternativo.")
+    st.markdown("""<style>
+    /* Navegación SETF: solo subáreas, sin modificar Diseño Geométrico o portada. */
+    [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+    [data-testid="stSidebarNav"] {display:none!important;}
+    [data-testid="stAppViewContainer"] .block-container {
+       max-width:1640px!important;padding-left:1.65rem!important;
+       padding-right:1.65rem!important;padding-top:0!important;}
+    /* No desplazar la cabecera fuera del viewport: -6rem recortaba el
+       escudo y el tren en la parte superior. El bloque ya tiene padding-top:0. */
+    .st-key-setf_header_superior {
+       margin-top:0!important;
+       scroll-margin-top:12px!important;
+    }
+    @media(max-width:700px){
+       .st-key-setf_header_superior{margin-top:0!important;}
+    }
+    [data-testid="stHeader"] {background:transparent!important;height:0!important;min-height:0!important;}
+    [data-testid="stDecoration"] {display:none!important;}
+    [data-testid="stAppViewContainer"] > section.main {padding-top:0!important;}
+    .st-key-setf_header_superior {
+       background-image:__BANNER__!important;
+       background-color:#15303d!important;background-size:cover!important;
+       background-position:center 48%!important;
+       border:1px solid rgba(196,161,104,.47)!important;
+       border-radius:14px 14px 0 0!important;
+       padding:14px 24px!important;margin-bottom:0!important;
+       min-height:132px!important;
+       box-shadow:0 7px 20px rgba(20,28,28,.15)!important;}
+    .st-key-setf_header_superior [data-testid="stHorizontalBlock"] {align-items:center!important;}
+    .setf-header-title {font-size:clamp(20px,2.1vw,29px);font-weight:850;color:white;
+       letter-spacing:1.15px;text-shadow:0 1px 5px rgba(0,0,0,.3);}
+    .setf-header-sub {font-size:10px;font-weight:750;letter-spacing:1.8px;color:#dfc79e;}
+    .st-key-setf_header_superior button {background:rgba(12,30,39,.40)!important;
+       border:1px solid rgba(219,191,146,.45)!important;color:white!important;
+       border-radius:9px!important;min-height:44px!important;font-weight:650!important;}
+    .st-key-setf_header_superior button:hover {background:rgba(56,77,79,.91)!important;border-color:#d3af70!important;}
+    .st-key-setf_perfil_popover button {text-align:left!important;}
+    .st-key-setf_navbar {background:linear-gradient(110deg,#303333,#3f4140)!important;
+       border:1px solid #A58D62!important;border-top:0!important;border-radius:0 0 14px 14px!important;
+       padding:7px 9px!important;margin-top:-.7rem!important;
+       box-shadow:0 7px 18px rgba(20,28,28,.16)!important;
+       position:sticky!important;top:0!important;z-index:1100!important;}
+    .st-key-setf_navbar [data-testid="stHorizontalBlock"] {gap:5px!important;align-items:center!important;}
+    .st-key-setf_navbar button {background:transparent!important;color:#fff!important;
+       border:1px solid transparent!important;border-radius:7px!important;
+       font-weight:650!important;min-height:42px!important;padding:6px 5px!important;
+       white-space:nowrap!important;font-size:13px!important;}
+    .st-key-setf_navbar button:hover {background:#57544b!important;border-color:#b99a65!important;}
+    /* Contenido de CSS no pasa por el traductor automático de Chrome.
+       Se conserva el texto original accesible en el botón de Streamlit. */
+    .st-key-setf_navbar [class*="st-key-setf_nav_reuniones"] button,
+    .st-key-setf_navbar [class*="st-key-setf_nav_ACTIVA_reuniones"] button {position:relative!important;}
+    .st-key-setf_navbar [class*="st-key-setf_nav_reuniones"] button p,
+    .st-key-setf_navbar [class*="st-key-setf_nav_ACTIVA_reuniones"] button p {visibility:hidden!important;}
+    .st-key-setf_navbar [class*="st-key-setf_nav_reuniones"] button::after,
+    .st-key-setf_navbar [class*="st-key-setf_nav_ACTIVA_reuniones"] button::after {
+       content:"▦ Reuniones"!important;position:absolute!important;
+       inset:0!important;display:flex!important;align-items:center!important;
+       justify-content:center!important;color:inherit!important;
+       pointer-events:none!important;font-weight:650!important;font-size:13px!important;
+       font-family:inherit!important;letter-spacing:normal!important;line-height:1.2!important;
+    }
+    /* Igualar el tamaño y peso de todas las etiquetas del menú. */
+    .st-key-setf_navbar button p,
+    .st-key-setf_navbar button::after {
+       font-family:inherit!important;font-size:13px!important;font-weight:650!important;
+       line-height:1.2!important;letter-spacing:0!important;
+    }
+    .st-key-setf_navbar [class*="st-key-setf_nav_ACTIVA"] button {
+       background:linear-gradient(110deg,#b38e58,#84683d)!important;
+       color:white!important;border-color:#c5ab7a!important;}
+    @media(max-width:880px){
+      .st-key-setf_navbar{margin-top:0!important;}
+      .st-key-setf_navbar{position:relative!important;}
+      .st-key-setf_navbar [data-testid="stHorizontalBlock"]{flex-wrap:wrap!important;}
+      .st-key-setf_navbar [data-testid="column"]{min-width:100px!important;}
+      .setf-header-sub{font-size:8px!important;}
+    }
+    </style>""".replace("__BANNER__", banner_css), unsafe_allow_html=True)
+    with st.container(key="setf_header_superior"):
+        logo_col, titulo_col, avisos_col, usuario_col = st.columns(
+            [1.05, 4.75, 0.7, 1.9], gap="small", vertical_alignment="center")
+        with logo_col:
+            logo = ASSETS_DIR / "logo_setf.png"
+            if logo.is_file():
+                st.image(str(logo), width=112)
+        with titulo_col:
+            st.markdown('<div class="setf-header-title">CONTROL DOCUMENTAL</div>'
+                '<div class="setf-header-sub">MESA DE SISTEMAS ELÉCTRICOS · SETF</div>',
+                unsafe_allow_html=True)
+        with avisos_col:
+            _setf_campana()
+        with usuario_col:
+            nombre = str(st.session_state.get("usuario_actual") or "Usuario")
+            with st.popover(f"◉  {nombre}  ▾", use_container_width=True):
+                st.markdown("**Cuenta institucional**")
+                st.caption(nombre)
+                if len(areas_autorizadas()) == 2:
+                    if st.button("⇄ Cambiar de área", key="setf_perfil_cambiar", use_container_width=True):
+                        st.session_state.area_actual = None
+                        st.session_state.menu_activo = "home"
+                        st.session_state.pop("pend_bandeja", None)
+                        st.rerun()
+                if st.button("↪ Cerrar sesión", key="setf_perfil_cerrar", use_container_width=True):
+                    _cerrar_sesion_desde_cabecera()
+    with st.container(key="setf_navbar"):
+        cols = st.columns([1] * 7, gap="small", vertical_alignment="center")
+        for (destino, etiqueta), columna in zip(_SETf_NAV, cols):
+            with columna:
+                clave = ("setf_nav_ACTIVA_" if st.session_state.menu_activo == destino
+                         else "setf_nav_") + destino
+                if st.button(etiqueta, key=clave, use_container_width=True):
+                    if st.session_state.menu_activo != destino:
+                        navegar_a(destino)
 
 
 # =========================================================
@@ -7127,7 +8405,7 @@ if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmad
 # =========================================================
 # Mantener la misma estructura de widgets y las mismas claves entre
 # pantallas evita desmontajes innecesarios durante la navegación.
-if st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
+if _area_activa_validada() != "setf" and st.session_state.menu_activo in ("oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"):
     # Imagen de la barra lateral: independiente del fondo del área principal.
     # Se incluye dentro del CSS para que funcione en Streamlit Cloud y localhost.
     if _area_activa_validada() == "setf":
@@ -7779,6 +9057,147 @@ def _modulo_lateral_documentos(tipo):
         </div>
         """.replace("__FONDO__", fondo_css)), unsafe_allow_html=True)
 
+        # Presentación SETF: un archivo compacto sobre superficie blanca. CSS aislado
+        # para que Diseño Geométrico no cambie su distribución.
+        if _area_activa_validada() == "setf":
+            st.markdown("""
+            <style>
+            /* Encabezado secundario más proporcionado; sin márgenes negativos. */
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero {
+                min-height:0!important;
+                padding:17px 25px!important;
+                margin:14px 0 13px!important;
+                border-radius:16px!important;
+                background:linear-gradient(112deg,#F8F4EC 0%,#F0F1EA 100%)!important;
+                border:1px solid #DFD2C0!important;
+                border-left:4px solid #AD8756!important;
+                box-shadow:0 6px 18px rgba(40,57,44,.07)!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero h1 {
+                font-size:28px!important;line-height:1.16!important;
+                margin:5px 0 5px!important;color:#214336!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero .eyebrow {
+                font-size:10px!important;letter-spacing:1.6px!important;
+                color:#946E44!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero p {
+                font-size:12px!important;line-height:1.5!important;
+                color:#69766F!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero .firm-signature {
+                color:#9D825E!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-hero .firm-ornament {
+                opacity:.40!important;
+            }
+            /* El archivo se encapsula en una superficie blanca continua. */
+            [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_panel"] {
+                background:#FFFFFF!important;
+                border:1px solid #DDE5DC!important;
+                border-radius:18px!important;
+                box-shadow:0 8px 27px rgba(34,60,45,.085)!important;
+                padding:21px 22px 17px!important;
+                margin:12px 0 16px!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) .firm-archive-head {
+                display:flex;align-items:center;justify-content:space-between;
+                gap:14px;padding-bottom:13px;margin-bottom:7px;
+                border-bottom:1px solid #E5ECE4;
+            }
+            .firm-archive-title {
+                color:#214436!important;font-size:17px!important;
+                font-weight:800!important;letter-spacing:-.15px;
+            }
+            .firm-archive-subtitle {
+                color:#738176!important;font-size:12px!important;margin-top:3px;
+            }
+            .firm-archive-count {
+                background:#E6F0E8;border:1px solid #C4D7C8;
+                color:#35614C;border-radius:100px;padding:5px 10px;
+                font-size:12px;font-weight:750;white-space:nowrap;
+            }
+            /* Cada oficio es una fila corta, sin el fondo técnico entre registros. */
+            [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_row_"] {
+                background:#FBFCFA!important;
+                border:1px solid #E0E9DF!important;
+                border-left:3px solid #8FAE98!important;
+                border-radius:11px!important;
+                padding:12px 13px!important;
+                margin:6px 0!important;
+                box-shadow:none!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_row_"]:nth-of-type(even) {
+                background:#FFFFFF!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_row_"] [data-testid="stHorizontalBlock"] {
+                align-items:center!important;column-gap:9px!important;
+            }
+            .firm-archive-name {
+                color:#234137!important;font-size:14px!important;font-weight:750;
+                line-height:1.35;overflow-wrap:anywhere;
+            }
+            .firm-archive-meta {
+                color:#728277!important;font-size:11.5px!important;
+                line-height:1.45;margin-top:4px;overflow-wrap:anywhere;
+            }
+            .firm-signed-state {
+                background:#E4F0E7;border:1px solid #B8D2C1;
+                border-radius:100px;color:#326547;font-size:11px;
+                font-weight:750;text-align:center;padding:6px 9px;
+                white-space:nowrap;display:inline-block;
+            }
+            .firm-pending-state {
+                background:#F3EDE4;border:1px solid #D6C7B7;
+                border-radius:100px;color:#80654D;font-size:11px;
+                font-weight:750;text-align:center;padding:6px 9px;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] .stLinkButton a,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] [data-testid="stPopover"] button,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] .stButton button {
+                min-height:38px!important;width:100%!important;
+                border:1px solid #CBDACD!important;
+                border-radius:9px!important;background:#FFFEFC!important;
+                color:#42604D!important;font-size:12px!important;
+                font-weight:650!important;padding:6px 9px!important;
+                box-shadow:none!important;white-space:normal!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] [data-testid="stHorizontalBlock"]
+                > [data-testid="stColumn"]:nth-child(3) .stLinkButton a,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] [data-testid="stHorizontalBlock"]
+                > [data-testid="stColumn"]:nth-child(3) [data-testid="stPopover"] button {
+                background:#2E5947!important;color:white!important;
+                border-color:#2E5947!important;font-weight:750!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] .stLinkButton a:hover,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] [data-testid="stPopover"] button:hover {
+                border-color:#6C997A!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_row_"] .stButton button:disabled {
+                background:#F1F3EF!important;color:#91A092!important;
+                border-color:#E1E5DC!important;opacity:1!important;
+            }
+            @media(max-width:880px){
+                [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_panel"]{
+                    padding:14px 12px!important;
+                }
+                [data-testid="stAppViewContainer"]:has(.firm-hero) div[class*="st-key-firm_archive_row_"]{
+                    padding:13px 11px!important;
+                }
+                .firm-archive-head{align-items:flex-start!important;}
+                .firm-archive-name{font-size:13px!important;}
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
         try:
             registros = _leer_registros_oficios()
         except Exception as error:
@@ -8055,93 +9474,168 @@ def _modulo_lateral_documentos(tipo):
             lista.sort(key=lambda r: (_fecha_firma(r) is None,
                                       _fecha_firma(r) or datetime.max.date()))
 
-        st.markdown(
-            f'<div class="firm-label">{html.escape(nombres_vista_firmados[vista_firmados].upper())}</div>',
-            unsafe_allow_html=True)
-        st.markdown(f'<div class="firm-caption">{len(lista)} expediente(s) · '
-                    'Documentos disponibles según su estado y vínculos</div>',
-                    unsafe_allow_html=True)
-        if not lista:
-            st.markdown('<div class="firm-empty">No se encontraron expedientes '
-                        'para este indicador o los filtros aplicados.</div>', unsafe_allow_html=True)
-            return
-
-        # UNA FILA POR OFICIO: nombre a la izquierda y tres accesos a la derecha.
-        # Con un solo enlace, abre directamente el archivo en Drive.
-        # Si una categoría contiene varios, permite escoger el archivo desde
-        # un popover pequeño, sin desplegar el expediente ni desplazar la lista.
-        for indice, oficio in enumerate(lista):
-            folio = str(oficio.get("Folio", "")).strip()
-            numero = str(oficio.get("No. de oficio", "")).strip()
-            responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
-            documentos = {
-                "firmado": leer_documentos(oficio.get("Firmado", "")),
-                "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
-                "anexos": leer_documentos(oficio.get("Anexo", "")),
-            }
-            fecha = _fecha_firma(oficio)
-            firmado_realmente = normalizar_texto(oficio.get("Estatus", "")) == "firmado"
-            fecha_texto = fecha.strftime("%d/%m/%Y") if fecha else "Sin fecha registrada"
-            estado_texto = (f"Firmado: {fecha_texto}" if firmado_realmente else
-                            f"Estado: {str(oficio.get('Estatus', '')) or 'En trámite'}")
-            # Título de la fila: nombre del OFICIO FIRMADO (no del antecedente).
-            # Si falta el archivo/nombre, conservar el título del registro.
-            archivos_firmados = documentos["firmado"]
-            titulo_firmado = (str(archivos_firmados[0].get("nombre", "")).strip()
-                             if archivos_firmados else "")
-            if not titulo_firmado or re.fullmatch(r"Documento \d+", titulo_firmado, re.I):
-                titulo_firmado = numero or (f"Folio {folio}" if folio else "Sin número")
-            ficha_envio = mapa_envios.get((folio, numero), {})
-            if vista_firmados in ("hoy", "semana") and ficha_envio:
-                titulo_firmado = str(ficha_envio.get("No. de oficio nuevo", "")).strip() or titulo_firmado
-            asunto_envio = (str(ficha_envio.get("Asunto nuevo", "")).strip()
-                            if vista_firmados in ("hoy", "semana") else "")
-            token = hashlib.sha256((folio + "|" + numero + "|" + str(indice)).encode("utf-8")).hexdigest()[:16]
-
-            with st.container(key=f"firm_reg_row_{token}"):
-                col_info, col_firmado, col_antecedentes, col_anexos = st.columns(
-                    [4.8, 1.2, 1.45, 1.1], gap="small")
-                with col_info:
+        if _area_activa_validada() == "setf":
+            # Archivo SETF: una superficie continua y filas compactas, sin
+            # duplicar la información ni convertir el estado en un botón.
+            if not lista:
+                st.info("No se encontraron expedientes para el indicador o filtros aplicados.")
+            else:
+                with st.container(key="firm_archive_panel"):
                     st.markdown(
-                        f'<div class="firm-inline-file">'
-                        f'<div class="firm-inline-name">{html.escape(titulo_firmado)}</div>'
-                        + (f'<div class="firm-inline-meta">Asunto: {html.escape(asunto_envio)}</div>' if asunto_envio else '')
-                        + f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
-                        f'· {html.escape(responsable)} · {html.escape(estado_texto)}</div>' 
-                        f'</div>', unsafe_allow_html=True)
+                        '<div class="firm-archive-head">'
+                        '<div><div class="firm-archive-title">Archivo completo de oficios</div>'
+                        '<div class="firm-archive-subtitle">Documentos firmados, antecedentes y anexos disponibles</div></div>'
+                        f'<span class="firm-archive-count">{len(lista)} expedientes</span>'
+                        '</div>', unsafe_allow_html=True)
+                    for indice, oficio in enumerate(lista):
+                        folio = str(oficio.get("Folio", "")).strip()
+                        numero = str(oficio.get("No. de oficio", "")).strip()
+                        responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
+                        documentos = {
+                            "firmado": leer_documentos(oficio.get("Firmado", "")),
+                            "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
+                            "anexos": leer_documentos(oficio.get("Anexo", "")),
+                        }
+                        fecha = _fecha_firma(oficio)
+                        firmado_realmente = normalizar_texto(oficio.get("Estatus", "")) == "firmado"
+                        fecha_texto = fecha.strftime("%d/%m/%Y") if fecha else "Sin fecha registrada"
+                        titulo = (str(documentos["firmado"][0].get("nombre", "")).strip()
+                                  if documentos["firmado"] else "")
+                        if not titulo or re.fullmatch(r"Documento \d+", titulo, re.I):
+                            titulo = numero or (f"Folio {folio}" if folio else "Sin número")
+                        token = hashlib.sha256(
+                            (folio + "|" + numero + "|" + str(indice)).encode("utf-8")
+                        ).hexdigest()[:16]
+                        with st.container(key=f"firm_archive_row_{token}"):
+                            col_info, col_estado, col_firmado, col_ante, col_anex = st.columns(
+                                [4.3, 0.9, 1.45, 1.35, 1.05], gap="small", vertical_alignment="center"
+                            )
+                            with col_info:
+                                st.markdown(
+                                    f'<div class="firm-archive-name">{html.escape(titulo)}</div>'
+                                    f'<div class="firm-archive-meta">'
+                                    f'Folio {html.escape(folio or "—")} · '
+                                    f'{html.escape(responsable)} · '
+                                    f'{html.escape(fecha_texto)}'
+                                    '</div>', unsafe_allow_html=True)
+                            with col_estado:
+                                if firmado_realmente:
+                                    st.markdown('<span class="firm-signed-state">Firmado</span>', unsafe_allow_html=True)
+                                else:
+                                    st.markdown('<span class="firm-pending-state">En trámite</span>', unsafe_allow_html=True)
+                            for columna, categoria, etiqueta in (
+                                (col_firmado, "firmado", "Abrir firmado"),
+                                (col_ante, "antecedentes", "Antecedentes"),
+                                (col_anex, "anexos", "Anexos"),
+                            ):
+                                archivos = documentos[categoria]
+                                with columna:
+                                    if categoria == "firmado" and not firmado_realmente:
+                                        st.button("Firmado pendiente", key=f"firm_arch_bloq_{token}",
+                                                  disabled=True, use_container_width=True)
+                                    elif len(archivos) == 1:
+                                        st.link_button(
+                                            etiqueta, archivos[0]["url"], use_container_width=True,
+                                            help=f'Abrir en Drive: {archivos[0]["nombre"]}',
+                                        )
+                                    elif len(archivos) > 1:
+                                        with st.popover(etiqueta, use_container_width=True):
+                                            st.caption(f"{len(archivos)} archivos · {etiqueta}")
+                                            for archivo in archivos:
+                                                st.link_button(archivo["nombre"], archivo["url"],
+                                                               use_container_width=True)
+                                    else:
+                                        st.button(etiqueta, key=f"firm_arch_vacio_{categoria}_{token}",
+                                                  disabled=True, use_container_width=True,
+                                                  help="No hay documentos vinculados")
+        else:
+            st.markdown(
+                f'<div class="firm-label">{html.escape(nombres_vista_firmados[vista_firmados].upper())}</div>',
+                unsafe_allow_html=True)
+            st.markdown(f'<div class="firm-caption">{len(lista)} expediente(s) · '
+                        'Documentos disponibles según su estado y vínculos</div>',
+                        unsafe_allow_html=True)
+            if not lista:
+                st.markdown('<div class="firm-empty">No se encontraron expedientes '
+                            'para este indicador o los filtros aplicados.</div>', unsafe_allow_html=True)
+                return
 
-                acciones = (
-                    (col_firmado, "firmado", "Firmado"),
-                    (col_antecedentes, "antecedentes", "Antecedentes"),
-                    (col_anexos, "anexos", "Anexos"),
-                )
-                for columna, categoria, etiqueta in acciones:
-                    archivos = documentos[categoria]
-                    with columna:
-                        if categoria == "firmado" and not firmado_realmente:
-                            st.button("Firmado pendiente", key=f"firm_bloq_{token}",
-                                      disabled=True, use_container_width=True,
-                                      help="La descarga se habilitará cuando regrese el oficio firmado.")
-                        elif len(archivos) == 1:
-                            st.link_button(
-                                etiqueta, archivos[0]["url"],
-                                use_container_width=True,
-                                help=f'Abrir en Drive: {archivos[0]["nombre"]}',
-                            )
-                        elif len(archivos) > 1:
-                            with st.popover(etiqueta, use_container_width=True):
-                                st.caption(f"{len(archivos)} archivos · {etiqueta}")
-                                for archivo in archivos:
-                                    st.link_button(
-                                        archivo["nombre"], archivo["url"],
-                                        use_container_width=True,
-                                    )
-                        else:
-                            st.button(
-                                etiqueta, key=f"firm_vacio_{categoria}_{token}",
-                                disabled=True, use_container_width=True,
-                                help="Sin documentos vinculados en esta categoría",
-                            )
+            # UNA FILA POR OFICIO: nombre a la izquierda y tres accesos a la derecha.
+            # Con un solo enlace, abre directamente el archivo en Drive.
+            # Si una categoría contiene varios, permite escoger el archivo desde
+            # un popover pequeño, sin desplegar el expediente ni desplazar la lista.
+            for indice, oficio in enumerate(lista):
+                folio = str(oficio.get("Folio", "")).strip()
+                numero = str(oficio.get("No. de oficio", "")).strip()
+                responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
+                documentos = {
+                    "firmado": leer_documentos(oficio.get("Firmado", "")),
+                    "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
+                    "anexos": leer_documentos(oficio.get("Anexo", "")),
+                }
+                fecha = _fecha_firma(oficio)
+                firmado_realmente = normalizar_texto(oficio.get("Estatus", "")) == "firmado"
+                fecha_texto = fecha.strftime("%d/%m/%Y") if fecha else "Sin fecha registrada"
+                estado_texto = (f"Firmado: {fecha_texto}" if firmado_realmente else
+                                f"Estado: {str(oficio.get('Estatus', '')) or 'En trámite'}")
+                # Título de la fila: nombre del OFICIO FIRMADO (no del antecedente).
+                # Si falta el archivo/nombre, conservar el título del registro.
+                archivos_firmados = documentos["firmado"]
+                titulo_firmado = (str(archivos_firmados[0].get("nombre", "")).strip()
+                                 if archivos_firmados else "")
+                if not titulo_firmado or re.fullmatch(r"Documento \d+", titulo_firmado, re.I):
+                    titulo_firmado = numero or (f"Folio {folio}" if folio else "Sin número")
+                ficha_envio = mapa_envios.get((folio, numero), {})
+                if vista_firmados in ("hoy", "semana") and ficha_envio:
+                    titulo_firmado = str(ficha_envio.get("No. de oficio nuevo", "")).strip() or titulo_firmado
+                asunto_envio = (str(ficha_envio.get("Asunto nuevo", "")).strip()
+                                if vista_firmados in ("hoy", "semana") else "")
+                token = hashlib.sha256((folio + "|" + numero + "|" + str(indice)).encode("utf-8")).hexdigest()[:16]
+
+                with st.container(key=f"firm_reg_row_{token}"):
+                    col_info, col_firmado, col_antecedentes, col_anexos = st.columns(
+                        [4.8, 1.2, 1.45, 1.1], gap="small")
+                    with col_info:
+                        st.markdown(
+                            f'<div class="firm-inline-file">'
+                            f'<div class="firm-inline-name">{html.escape(titulo_firmado)}</div>'
+                            + (f'<div class="firm-inline-meta">Asunto: {html.escape(asunto_envio)}</div>' if asunto_envio else '')
+                            + f'<div class="firm-inline-meta">Folio {html.escape(folio or "—")} '
+                            f'· {html.escape(responsable)} · {html.escape(estado_texto)}</div>' 
+                            f'</div>', unsafe_allow_html=True)
+
+                    acciones = (
+                        (col_firmado, "firmado", "Firmado"),
+                        (col_antecedentes, "antecedentes", "Antecedentes"),
+                        (col_anexos, "anexos", "Anexos"),
+                    )
+                    for columna, categoria, etiqueta in acciones:
+                        archivos = documentos[categoria]
+                        with columna:
+                            if categoria == "firmado" and not firmado_realmente:
+                                st.button("Firmado pendiente", key=f"firm_bloq_{token}",
+                                          disabled=True, use_container_width=True,
+                                          help="La descarga se habilitará cuando regrese el oficio firmado.")
+                            elif len(archivos) == 1:
+                                st.link_button(
+                                    etiqueta, archivos[0]["url"],
+                                    use_container_width=True,
+                                    help=f'Abrir en Drive: {archivos[0]["nombre"]}',
+                                )
+                            elif len(archivos) > 1:
+                                with st.popover(etiqueta, use_container_width=True):
+                                    st.caption(f"{len(archivos)} archivos · {etiqueta}")
+                                    for archivo in archivos:
+                                        st.link_button(
+                                            archivo["nombre"], archivo["url"],
+                                            use_container_width=True,
+                                        )
+                            else:
+                                st.button(
+                                    etiqueta, key=f"firm_vacio_{categoria}_{token}",
+                                    disabled=True, use_container_width=True,
+                                    help="Sin documentos vinculados en esta categoría",
+                                )
 
         # La edición autorizada de la fecha conserva su funcionalidad, pero
         # queda fuera de las tres acciones principales de cada oficio.
@@ -8526,134 +10020,348 @@ def _modulo_lateral_documentos(tipo):
                   if (d := _dias_desde_recepcion(r.get("Fecha de recepción"))) is not None)
     max_antiguedad = max(antiguedades) if antiguedades else None
 
-    # No se usa imagen adicional: este trazo SVG se integra en el encabezado.
-    st.markdown(_rotulos_area(f"""
-    <div class="urg-hero">
-      <svg class="urg-trazo" viewBox="0 0 600 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-        <g fill="none" stroke="#D8C6B4" stroke-width=".7" opacity=".43">
-          <path d="M2 24H600M2 55H600M2 86H600M2 117H600M2 148H600"/>
-          <path d="M30 10L5 155M95 10L70 155M160 10L135 155M225 10L200 155M290 10L265 155M355 10L330 155M420 10L395 155M485 10L460 155M550 10L525 155"/>
-        </g>
-        <path d="M0 139C128 137 164 115 235 82S364 20 600 22" fill="none" stroke="#D7B477" stroke-width="2.3"/>
-        <path d="M0 152C128 150 164 128 235 95S364 33 600 35" fill="none" stroke="#D7B477" stroke-width="1"/>
-        <path d="M0 125C128 123 164 101 235 68S364 6 600 8" fill="none" stroke="#D7B477" stroke-dasharray="4 7" stroke-width="1"/>
-        <circle cx="235" cy="82" r="4" fill="#F0D6A7"/>
-        <circle cx="450" cy="26" r="4" fill="#F0D6A7"/>
-      </svg>
-      <div class="urg-copy">
-        <div class="eyebrow">DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
-        <h1>Atención prioritaria</h1>
-        <p>Identifica y consulta los oficios que necesitan trámite rápido.</p>
-      </div>
-      <div class="urg-count"><strong>{len(lista):02d}</strong><span>Urgentes activos</span></div>
-    </div>
-    """), unsafe_allow_html=True)
+    # SETF: vista de atención prioritaria rediseñada; el resto de áreas conserva su cabecera.
+    es_setf_urgentes = _area_activa_validada() == "setf"
+    if es_setf_urgentes:
+        # Espacio REAL entre el menú horizontal y el primer bloque del módulo.
+        # No utilizar top / transform / márgenes negativos: antes cortaban la tarjeta.
+        st.markdown('<div class="setf-urg-separation" aria-hidden="true"></div>',
+                    unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="urg-hero setf-urg-hero" lang="es" translate="no">
+          <div class="setf-urg-title-block">
+            <div class="setf-urg-eyebrow">SETF · CONTROL DOCUMENTAL</div>
+            <h1>Atención prioritaria</h1>
+            <p>Oficios que requieren seguimiento inmediato.</p>
+          </div>
+          <div class="setf-urg-schematic" aria-hidden="true">
+            <svg viewBox="0 0 360 116" xmlns="http://www.w3.org/2000/svg" focusable="false">
+              <g fill="none" stroke="#B99A73" stroke-width=".9" opacity=".45">
+                <path d="M8 23H354M8 47H354M8 71H354M8 95H354"/>
+                <path d="M32 11V106M83 11V106M134 11V106M185 11V106M236 11V106M287 11V106M338 11V106"/>
+              </g>
+              <path d="M10 92C70 90 99 80 149 55S246 25 348 25" fill="none" stroke="#B28B58" stroke-width="2.4"/>
+              <path d="M10 103C70 101 99 91 149 66S246 36 348 36" fill="none" stroke="#B28B58" stroke-width="1.1" opacity=".7"/>
+              <g fill="#B28B58"><circle cx="149" cy="55" r="4"/><circle cx="287" cy="27" r="4"/></g>
+            </svg>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(_rotulos_area(f"""
+        <div class="urg-hero">
+          <svg class="urg-trazo" viewBox="0 0 600 160" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            <g fill="none" stroke="#D8C6B4" stroke-width=".7" opacity=".43">
+              <path d="M2 24H600M2 55H600M2 86H600M2 117H600M2 148H600"/>
+              <path d="M30 10L5 155M95 10L70 155M160 10L135 155M225 10L200 155M290 10L265 155M355 10L330 155M420 10L395 155M485 10L460 155M550 10L525 155"/>
+            </g>
+            <path d="M0 139C128 137 164 115 235 82S364 20 600 22" fill="none" stroke="#D7B477" stroke-width="2.3"/>
+            <path d="M0 152C128 150 164 128 235 95S364 33 600 35" fill="none" stroke="#D7B477" stroke-width="1"/>
+            <path d="M0 125C128 123 164 101 235 68S364 6 600 8" fill="none" stroke="#D7B477" stroke-dasharray="4 7" stroke-width="1"/>
+            <circle cx="235" cy="82" r="4" fill="#F0D6A7"/>
+            <circle cx="450" cy="26" r="4" fill="#F0D6A7"/>
+          </svg>
+          <div class="urg-copy">
+            <div class="eyebrow">DISEÑO GEOMÉTRICO · CONTROL DOCUMENTAL</div>
+            <h1>Atención prioritaria</h1>
+            <p>Identifica y consulta los oficios que necesitan trámite rápido.</p>
+          </div>
+          <div class="urg-count"><strong>{len(lista):02d}</strong><span>Urgentes activos</span></div>
+        </div>
+        """), unsafe_allow_html=True)
 
-    # SETF: el banner antes café ahora sigue la identidad azul petróleo.
-    # El buscador y las tarjetas conservan íntegra la lógica de urgencias.
-    if _area_activa_validada() == "setf":
+    # Estilos exclusivos de Urgentes SETF; no afectan Diseño Geométrico.
+    if es_setf_urgentes:
         st.markdown("""<style>
-        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero {
-            background:linear-gradient(112deg,#142D40 0%,#1B3D50 62%,#315264 100%)!important;
-            border:1px solid #8A9FA9!important;border-left:5px solid #BC9863!important;
-            box-shadow:0 10px 24px rgba(22,46,61,.12)!important;
+        /* 2026-10-29: espacio antes del encabezado sin cortar el hero ni tapar la barra. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-separation {
+            display:block!important;height:24px!important;min-height:24px!important;
+            margin:0!important;padding:0!important;visibility:hidden!important;
         }
-        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero .urg-count {
-            background:rgba(219,232,240,.10)!important;
-            border:1px solid rgba(205,221,229,.42)!important;
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-hero {
+            min-height:150px!important;margin:0 0 15px!important;
+            padding:23px 30px!important;align-items:center!important;
+            background:#F7F2E9!important;background-image:none!important;
+            border:1px solid #D9C7AD!important;border-left:5px solid #B9905B!important;
+            border-radius:16px!important;
+            box-shadow:0 8px 24px rgba(45,43,38,.06)!important;
         }
-        [data-testid="stAppViewContainer"]:has(.urg-hero) .urg-hero .urg-count strong {color:#FFF9EC!important;}
-        .urg-kpi--urgent {--urg-accent:#AC5848;--urg-tint:#FBF1ED;--urg-border:#D1A292;}
-        .urg-kpi--soon   {--urg-accent:#AA8150;--urg-tint:#F8F3E9;--urg-border:#D6C19B;}
-        .urg-kpi--manual {--urg-accent:#466B82;--urg-tint:#EEF3F6;--urg-border:#9DB4C2;}
-        .urg-kpi .value, .urg-kpi .label {color:#21394A!important;}
-        .urg-kpi .small {color:#647A89!important;}
-        /* Tarjeta de búsqueda SETF, inspirada en el buscador de Firmados. */
-        [data-testid="stAppViewContainer"]:has(.urg-hero) .st-key-urgentes_busqueda_setf {
-            background:linear-gradient(110deg,rgba(253,252,248,.97),rgba(236,242,245,.96))!important;
-            border:1px solid #A7BBC5!important;
-            border-left:4px solid #B99564!important;
-            border-radius:15px!important;
-            padding:17px 21px 18px!important;
-            margin:12px 0 18px!important;
-            box-shadow:0 7px 19px rgba(32,55,69,.10)!important;
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-hero::before {
+            content:"";position:absolute;right:12%;top:0;bottom:0;width:38%;pointer-events:none;
+            background:repeating-linear-gradient(0deg,transparent 0 17px,rgba(178,154,121,.11) 18px,transparent 19px),
+                       repeating-linear-gradient(90deg,transparent 0 38px,rgba(178,154,121,.11) 39px,transparent 40px);
+            mask-image:linear-gradient(90deg,transparent,#000 38%,transparent);
+            opacity:.65;
         }
-        .st-key-urgentes_busqueda_setf .urg-search-header {
-            display:flex;align-items:flex-end;justify-content:space-between;
-            gap:13px;flex-wrap:wrap;margin:0 0 13px;padding:0 0 12px;
-            border-bottom:1px solid rgba(119,146,161,.27);
+        .setf-urg-hero .setf-urg-title-block {position:relative;z-index:2;max-width:75%;}
+        .setf-urg-hero .setf-urg-eyebrow {font-size:10px;letter-spacing:1.5px;font-weight:850;color:#987145;}
+        [data-testid="stAppViewContainer"] .setf-urg-hero h1 {
+            color:#263A42!important;-webkit-text-fill-color:#263A42!important;
+            margin:8px 0 7px!important;font-size:31px!important;font-weight:850!important;line-height:1.14!important;
         }
-        .st-key-urgentes_busqueda_setf .urg-search-eyebrow {
-            color:#A0794B!important;font-size:9px!important;font-weight:800;
-            letter-spacing:1.6px;margin-bottom:4px;
+        [data-testid="stAppViewContainer"] .setf-urg-hero p {
+            color:#647178!important;-webkit-text-fill-color:#647178!important;
+            font-size:14px!important;line-height:1.45!important;margin:0!important;
         }
-        .st-key-urgentes_busqueda_setf .urg-search-title {
-            color:#244457!important;font-size:18px!important;font-weight:800;
-            line-height:1.15;
+        .setf-urg-counter {position:relative;z-index:2;min-width:125px;display:flex;
+            flex-direction:column;align-items:center;justify-content:center;
+            border-radius:13px;border:1px solid #E2B6A7;background:#F9E6DF;
+            padding:15px 17px;text-align:center;gap:4px;}
+        .setf-urg-counter strong {font-size:32px;line-height:1;font-weight:850;color:#A24635;}
+        .setf-urg-counter span {font-size:11px;font-weight:750;color:#8B574B;}
+
+        /* KPIs: misma estructura y altura; el primero resalta sin una franja pesada. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) [data-testid="stHorizontalBlock"]:has(.setf-urg-stat) {
+            gap:13px!important;margin:0 0 10px!important;align-items:stretch!important;
         }
-        .st-key-urgentes_busqueda_setf .urg-search-hint {
-            color:#6B8595!important;font-size:10px!important;
-            letter-spacing:.15px;text-align:right;
+        .setf-urg-stat {min-height:106px;border:1px solid #DED5C9;border-top:3px solid var(--tone);
+            border-radius:13px;background:rgba(255,253,250,.96);box-shadow:0 4px 13px rgba(43,38,35,.05);
+            padding:17px 19px;display:flex;flex-direction:column;justify-content:space-between;gap:8px;}
+        .setf-urg-stat--urgent {--tone:#B75B45;background:#FBF1EC;border-color:#DCA996;border-top-color:var(--tone);}
+        .setf-urg-stat--soon {--tone:#B18C5E;}
+        .setf-urg-stat--manual {--tone:#7B9A86;}
+        .setf-urg-stat .value-row {display:flex;align-items:center;justify-content:space-between;gap:8px;}
+        .setf-urg-stat .value {font-size:30px;font-weight:850;line-height:1.05;color:#283E47;}
+        .setf-urg-stat .stat-icon {font-size:21px;color:var(--tone);line-height:1;}
+        .setf-urg-stat .label {font-size:14px;font-weight:750;color:#34444A;line-height:1.3;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) [data-testid="stExpander"]:has(summary p) {
+            border-radius:10px!important;
         }
-        .st-key-urgentes_busqueda_setf [data-testid="stHorizontalBlock"] {
-            align-items:flex-end!important;gap:12px!important;
+
+        /* Encabezado de directorio y filtros son un único bloque funcional. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-dir-title {
+            margin:19px 0 11px;display:flex;justify-content:space-between;align-items:center;gap:14px;
         }
-        .st-key-urgentes_busqueda_setf label,
-        .st-key-urgentes_busqueda_setf label p {
-            color:#3D6074!important;font-weight:750!important;font-size:11px!important;
+        .setf-urg-dir-title .kicker {font-size:10px;letter-spacing:1.3px;font-weight:800;color:#A27A4D;}
+        .setf-urg-dir-title h2 {font-size:21px!important;color:#293C43!important;margin:4px 0 0!important;}
+        .setf-urg-dir-title .urg-antiguedad {font-size:11px;color:#92765A;background:#F4EAE0;
+            border:1px solid #E0CDBC;border-radius:7px;padding:6px 10px;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf {
+            background:rgba(255,253,250,.9)!important;border:1px solid #DED3C5!important;
+            border-radius:13px!important;margin:4px 0 8px!important;padding:15px 18px 16px!important;
+            box-shadow:0 4px 12px rgba(48,37,32,.045)!important;
         }
-        .st-key-urgentes_busqueda_setf [data-testid="stTextInput"] input {
-            min-height:46px!important;background-color:#FFFEFB!important;
-            background-image:url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMCIgaGVpZ2h0PSIyMCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJub25lIiBzdHJva2U9IiM2NTg1NzMiIHN0cm9rZS13aWR0aD0iMS45IiBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiPjxjaXJjbGUgY3g9IjEwLjgiIGN5PSIxMC44IiByPSI2LjgiLz48cGF0aCBkPSJtMTYgMTYgNC41IDQuNSIvPjwvc3ZnPg==")!important;
-            background-repeat:no-repeat!important;
-            background-position:13px center!important;
-            background-size:18px 18px!important;
-            padding-left:42px!important;
-            border:1.5px solid #A6BBC7!important;border-radius:10px!important;
-            color:#203C4B!important;box-shadow:0 2px 6px rgba(32,60,75,.035)!important;
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf label p {
+            color:#50636C!important;font-size:13px!important;font-weight:650!important;
         }
-        .st-key-urgentes_busqueda_setf [data-testid="stTextInput"] input:focus {
-            border-color:#52798D!important;outline:none!important;
-            box-shadow:0 0 0 3px rgba(87,126,144,.15)!important;
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf input,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf [data-baseweb="select"]>div {
+            min-height:40px!important;background:#FFFEFC!important;border:1px solid #D9D0C8!important;
+            border-radius:9px!important;color:#2B414B!important;
         }
-        .st-key-urgentes_busqueda_setf [data-testid="stSelectbox"] [data-baseweb="select"] > div {
-            min-height:46px!important;background:#FFFEFB!important;
-            border:1.5px solid #A6BBC7!important;border-radius:10px!important;
-            color:#203C4B!important;
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button {
+            min-height:40px!important;background:#FBF7F1!important;color:#695344!important;
+            border:1px solid #CBB8A0!important;border-radius:9px!important;box-shadow:none!important;
         }
-        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button {
-            background:#244A60!important;border:1px solid #244A60!important;
-            min-height:46px!important;border-radius:10px!important;
-            color:#FFFFFF!important;font-weight:750!important;
-            box-shadow:0 3px 10px rgba(27,61,80,.15)!important;
+
+        /* Ficha de urgencia: indicador pequeño en lugar de una barra roja alta. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) div[class*="st-key-urg_ficha_"] {
+            border:1px solid #DED3C5!important;border-left:4px solid #B45E48!important;
+            border-radius:13px!important;background:#FFFDF9!important;
+            box-shadow:0 6px 17px rgba(54,42,35,.07)!important;
+            padding:18px 21px 15px!important;margin:11px 0 14px!important;overflow:hidden!important;
         }
-        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button:hover {
-            background:#35627A!important;border-color:#35627A!important;
+        .setf-urg-file {display:flex;align-items:center;gap:16px;justify-content:space-between;}
+        .setf-urg-days {min-width:65px;max-width:65px;padding:10px 8px;text-align:center;
+            background:#F6E8E0;border-radius:10px;color:#A74634;display:flex;flex-direction:column;gap:2px;}
+        .setf-urg-days strong {font-size:26px;line-height:1;font-weight:850;color:#AB4B38;}
+        .setf-urg-days small {font-size:10px;font-weight:850;color:#915846;letter-spacing:1px;}
+        .setf-urg-file-body {min-width:0;flex:1;}
+        .setf-urg-file-head {display:flex;flex-wrap:wrap;align-items:center;gap:8px;}
+        .setf-urg-file-title {font-weight:800;font-size:17px;color:#283D46;overflow-wrap:anywhere;}
+        .setf-urg-pill {font-size:10px;font-weight:800;padding:4px 8px;border-radius:999px;
+            background:#F9EEE3;border:1px solid #E2C5A3;color:#826341;}
+        .setf-urg-pill--urgent {background:#FAE7E0;border-color:#E8B9A9;color:#A24836;}
+        .setf-urg-asunto {font-size:14px;line-height:1.5;color:#46565E;margin:7px 0 9px;}
+        .setf-urg-meta {font-size:12px;line-height:1.5;color:#637680;display:flex;flex-wrap:wrap;gap:6px 15px;}
+        .setf-urg-manual-flag {font-size:11px;color:#8B6B47;margin:8px 0 2px;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] {
+            margin:11px 0 0!important;border:0!important;background:transparent!important;box-shadow:none!important;
         }
-        .st-key-urgentes_busqueda_setf [class*="st-key-urgentes_limpiar"] button * {color:#FFF!important;}
-        @media(max-width:900px){
-          .st-key-urgentes_busqueda_setf {padding:13px!important;}
-          .st-key-urgentes_busqueda_setf .urg-search-hint {text-align:left;}
-          .st-key-urgentes_busqueda_setf [data-testid="stHorizontalBlock"] {gap:8px!important;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] details {
+            background:#F8F5EF!important;border:1px solid #DACABD!important;border-radius:9px!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] details>summary,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] details>summary:hover {
+            background:#294C48!important;color:#FFFFFF!important;border:1px solid #527A72!important;
+            border-radius:8px!important;min-height:43px!important;box-shadow:none!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] details>summary p,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] details>summary svg {color:#FFFFFF!important;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+        div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary * {color:#FFFFFF!important;}
+        .setf-urg-priority-meta {margin:10px 0 11px;font-size:12px;
+            line-height:1.5;color:#65757C;font-weight:550;}
+        /* Chrome puede traducir selectivamente texto nativo de Streamlit.
+           Mostrar la etiqueta visual CSS preserva el texto real accesible y la acción. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urgencia_guardar"] button {
+            background:#294C48!important;color:#FFFFFF!important;
+            border:1px solid #49756B!important;border-radius:9px!important;
+            min-height:43px!important;font-weight:750!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urgencia_guardar"] button:hover {background:#35635C!important;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urgencia_guardar"] button p {font-size:0!important;line-height:0!important;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urgencia_guardar"] button::after {
+            content:"Marcar prioridad manual";font-size:13px;line-height:1.4;
+            font-family:inherit;font-weight:750;color:#FFFFFF;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero):has(.setf-urg-mode-remove)
+          [class*="st-key-urgencia_guardar"] button::after {content:"Quitar marca manual";}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urgencia_guardar"] button:focus-visible {
+            outline:3px solid #A8C7B9!important;outline-offset:2px!important;
+        }
+        /* Contraste del desplegable en los expedientes, sin cambiar su función. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary {
+            background:#294C48!important;border:1px solid #527A72!important;
+            min-height:43px!important;color:#FFFFFF!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary:hover {
+            background:#35635C!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary p,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary svg,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stExpander"] summary * {
+            color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;
+        }
+        /* Pulido final SETF: una única jerarquía, sin duplicar el contador del hero. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-hero {
+            min-height:132px!important;
+            padding:20px 27px!important;
+            margin-bottom:13px!important;
+            gap:18px!important;
+        }
+        .setf-urg-hero .setf-urg-title-block {max-width:66%!important;}
+        .setf-urg-schematic {
+            position:relative;z-index:2;width:31%;max-width:330px;
+            align-self:center;pointer-events:none;opacity:.7;
+        }
+        .setf-urg-schematic svg {width:100%;height:auto;display:block;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [data-testid="stHorizontalBlock"]:has(.setf-urg-stat) {
+            gap:13px!important;margin:0 0 12px!important;
+        }
+        .setf-urg-stat {min-height:108px!important;padding:16px 18px!important;}
+        .setf-urg-stat .value {font-size:33px!important;}
+        .setf-urg-stat .label {font-size:14px!important;}
+        /* Una sola zona de filtros, más legible, con controles alineados. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .setf-urg-dir-title {
+            margin:17px 0 9px!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf {
+            padding:14px 18px 15px!important;margin:3px 0 7px!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf input,
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) .st-key-urgentes_busqueda_setf [data-baseweb="select"]>div {
+            min-height:43px!important;
+        }
+        /* Expedientes compactos con información a la izquierda y acción real a la derecha. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero) div[class*="st-key-urg_ficha_"] {
+            padding:16px 19px!important;margin:9px 0 12px!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          div[class*="st-key-urg_ficha_"] [data-testid="stHorizontalBlock"] {
+            align-items:center!important;gap:18px!important;
+        }
+        .setf-urg-file {gap:15px!important;}
+        .setf-urg-days {min-width:61px!important;max-width:61px!important;padding:10px 8px!important;}
+        .setf-urg-file-title {font-size:17px!important;line-height:1.25!important;}
+        .setf-urg-asunto {font-size:14px!important;margin:5px 0 7px!important;}
+        .setf-urg-meta {font-size:12px!important;gap:5px 13px!important;}
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urg_setf_toggle_"] button {
+            background:#294C48!important;color:#FFFFFF!important;
+            border:1px solid #52766D!important;border-radius:10px!important;
+            min-height:43px!important;white-space:nowrap!important;
+            font-size:13px!important;font-weight:750!important;
+            box-shadow:0 3px 8px rgba(38,70,63,.11)!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urg_setf_toggle_"] button:hover {
+            background:#346459!important;border-color:#346459!important;
+        }
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urg_setf_toggle_"] button p {
+            color:#FFFFFF!important;-webkit-text-fill-color:#FFFFFF!important;
+            font-size:13px!important;line-height:1.35!important;
+        }
+        /* El contenido expuesto no afecta la tarjeta mientras siga cerrado. */
+        [data-testid="stAppViewContainer"]:has(.setf-urg-hero)
+          [class*="st-key-urg_setf_docs_"] {
+            background:#FBF7F1!important;border:1px solid #DED1C2!important;
+            border-radius:11px!important;padding:13px 16px!important;
+            margin-top:11px!important;
+        }
+        @media(max-width:850px){
+            .setf-urg-schematic{width:27%;}
+            .setf-urg-hero .setf-urg-title-block{max-width:70%!important;}
+        }
+        @media(max-width:650px){
+            .setf-urg-schematic{display:none!important;}
+            .setf-urg-hero .setf-urg-title-block{max-width:100%!important;}
+        }
+        @media(max-width:800px) {
+            .setf-urg-file {gap:10px;}
+            .setf-urg-hero .setf-urg-title-block {max-width:65%;}
+            .setf-urg-hero h1 {font-size:24px!important;}
+            .setf-urg-counter {min-width:94px;padding:11px;}
+        }
+        @media(max-width:520px){
+            .setf-urg-separation {height:18px!important;min-height:18px!important;}
+            .setf-urg-file {flex-wrap:wrap;}
+            .setf-urg-hero {padding:17px!important;margin-top:0!important;}
+            .setf-urg-counter strong {font-size:23px;}
         }
         </style>""", unsafe_allow_html=True)
 
     kpis = (
         (len(lista), "Urgentes activos", "En seguimiento prioritario", "urgent"),
-        (proximos, "Próximos a urgente", "Entre 4 y 5 días naturales", "soon"),
+        (proximos, "Próximos a ser urgentes" if es_setf_urgentes else "Próximos a urgente",
+         "Entre 4 y 5 días naturales", "soon"),
         (manuales, "Prioridad manual", "Casos especiales marcados", "manual"),
     )
     for columna, (numero, titulo, detalle, tipo_kpi) in zip(st.columns(3, gap="medium"), kpis):
         with columna:
-            st.markdown(
-                f'<div class="urg-kpi urg-kpi--{tipo_kpi}">'
-                f'<span class="urg-kpi-icon" aria-hidden="true">{ {"urgent":"!","soon":"◷","manual":"✓"}[tipo_kpi] }</span>'
-                f'<div class="value">{numero:02d}</div>'
-                f'<div class="label">{html.escape(titulo)}</div>'
-                f'<div class="small">{html.escape(detalle)}</div>'
-                '</div>', unsafe_allow_html=True)
+            if es_setf_urgentes:
+                icono_stat = {"urgent": "⚠", "soon": "◷", "manual": "⚑"}[tipo_kpi]
+                st.markdown(
+                    f'<div class="setf-urg-stat setf-urg-stat--{tipo_kpi}">'
+                    '<div class="value-row">'
+                    f'<span class="value">{numero:02d}</span>'
+                    f'<span class="stat-icon" aria-hidden="true">{icono_stat}</span>'
+                    '</div>'
+                    f'<div class="label">{html.escape(titulo)}</div></div>',
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div class="urg-kpi urg-kpi--{tipo_kpi}">'
+                    f'<span class="urg-kpi-icon" aria-hidden="true">{ {"urgent":"!","soon":"◷","manual":"✓"}[tipo_kpi] }</span>'
+                    f'<div class="value">{numero:02d}</div>'
+                    f'<div class="label">{html.escape(titulo)}</div>'
+                    f'<div class="small">{html.escape(detalle)}</div>'
+                    '</div>', unsafe_allow_html=True)
 
-    with st.expander("Criterios de prioridad · 6 días / 4–5 días / marca manual", expanded=False):
+    # SETF: un solo desplegable de ayuda; acciones administrativas internas mantienen permisos.
+    # Las opciones de la cuenta administrativa son exactamente las originales.
+    with st.expander(
+        "Criterios y administración de prioridad" if es_setf_urgentes
+        else "Criterios de prioridad · 6 días / 4–5 días / marca manual",
+        expanded=False):
         st.markdown(
             "Los oficios **activos** se consideran urgentes automáticamente cuando han transcurrido "
             "**más de 5 días naturales** desde su recepción. Los días 4 y 5 se muestran "
@@ -8663,9 +10371,37 @@ def _modulo_lateral_documentos(tipo):
             "Los oficios firmados, cerrados, archivados, concluidos o cancelados no aparecen. "
             "Este indicador no altera el estatus registrado en Google Sheets."
         )
+        if es_setf_urgentes and es_administrador():
+            st.markdown("**Prioridad manual · casos especiales**")
+            st.caption("La urgencia por antigüedad no puede desactivarse retirando una marca manual.")
+            opciones = {f"{r.get('Folio', '')} · {r.get('No. de oficio', '')} · {str(r.get('Asunto', ''))[:75]}": r
+                        for r in registros if not _finalizado_urgencia(r)}
+            if opciones:
+                seleccion = st.selectbox("Selecciona un oficio activo", list(opciones), key="urgencia_seleccion")
+                oficio = opciones[seleccion]
+                folio = str(oficio.get("Folio", "")).strip()
+                numero = str(oficio.get("No. de oficio", "")).strip()
+                marcado = marcas.get((folio, numero), False)
+                dias = _dias_desde_recepcion(oficio.get("Fecha de recepción"))
+                st.markdown(
+                    '<div class="setf-urg-priority-meta" lang="es" translate="no">'
+                    f'Antigüedad: {dias if dias is not None else "sin fecha"} días · '
+                    f'Prioridad manual: {"Sí" if marcado else "No"}'
+                    '</div>', unsafe_allow_html=True)
+                st.markdown(
+                    '<span class="setf-urg-mode-remove" aria-hidden="true"></span>'
+                    if marcado else '<span class="setf-urg-mode-add" aria-hidden="true"></span>',
+                    unsafe_allow_html=True)
+                if st.button("Quitar marca manual" if marcado else "Marcar prioridad manual",
+                             key="urgencia_guardar"):
+                    try:
+                        _actualizar_urgencia(folio, numero, not marcado)
+                        st.rerun()
+                    except Exception as error:
+                        st.error(str(error))
 
-    # Gestión administrativa existente, siempre separada de las fichas de consulta.
-    if es_administrador():
+    # Otras áreas: el administrador conserva su panel anterior de marcas especiales.
+    if not es_setf_urgentes and es_administrador():
         with st.expander("Prioridad manual · casos especiales", expanded=False):
             st.caption("La urgencia por antigüedad no puede desactivarse retirando una marca manual.")
             opciones = {f"{r.get('Folio', '')} · {r.get('No. de oficio', '')} · {str(r.get('Asunto', ''))[:75]}": r
@@ -8687,13 +10423,22 @@ def _modulo_lateral_documentos(tipo):
                     except Exception as error:
                         st.error(str(error))
 
-    st.markdown(
-        '<div class="urg-section-row"><div>'
-        '<div class="kicker">EXPEDIENTES PRIORITARIOS</div>'
-        '<h2>Requieren atención</h2></div>'
-        f'<div class="urg-antiguedad">Mayor antigüedad: '
-        f'{str(max_antiguedad) + " días" if max_antiguedad is not None else "—"}'
-        '</div></div>', unsafe_allow_html=True)
+    if es_setf_urgentes:
+        st.markdown(
+            '<div class="setf-urg-dir-title"><div>'
+            '<div class="kicker">EXPEDIENTES PRIORITARIOS</div>'
+            '<h2>Requieren atención</h2></div>'
+            f'<div class="urg-antiguedad">Mayor antigüedad: '
+            f'{str(max_antiguedad) + " días" if max_antiguedad is not None else "—"}'
+            '</div></div>', unsafe_allow_html=True)
+    else:
+        st.markdown(
+            '<div class="urg-section-row"><div>'
+            '<div class="kicker">EXPEDIENTES PRIORITARIOS</div>'
+            '<h2>Requieren atención</h2></div>'
+            f'<div class="urg-antiguedad">Mayor antigüedad: '
+            f'{str(max_antiguedad) + " días" if max_antiguedad is not None else "—"}'
+            '</div></div>', unsafe_allow_html=True)
 
     # Se mantienen los filtros, keys y lógica de búsqueda originales.
     # Solo SETF recibe la presentación de buscador institucional.
@@ -8707,15 +10452,11 @@ def _modulo_lateral_documentos(tipo):
         st.session_state["urgentes_estado"] = "Todos"
 
     with _panel_urg:
-        if _area_activa_validada() == "setf":
-            st.markdown('''<div class="urg-search-header">
-                <div><div class="urg-search-eyebrow">CONSULTA PRIORITARIA · EXPEDIENTES</div>
-                <div class="urg-search-title">Localizar expediente</div></div>
-                <div class="urg-search-hint">Folio · Oficio · Asunto · Responsable</div>
-                </div>''', unsafe_allow_html=True)
+        # Un solo encabezado de campo, sin repetir «Buscar expediente» y «Buscar».
         col_buscar, col_estado, col_limpiar = st.columns([5, 2, 1.6], gap="small")
         with col_buscar:
-            consulta = st.text_input("Buscar", placeholder="Folio, oficio, asunto o responsable...",
+            consulta = st.text_input("Buscar expediente" if es_setf_urgentes else "Buscar",
+                                     placeholder="Folio, oficio, asunto o responsable...",
                                      key="buscar_urgentes")
         estados = sorted({str(r.get("Estatus", "")).strip() for r in lista
                           if str(r.get("Estatus", "")).strip()})
@@ -8734,8 +10475,7 @@ def _modulo_lateral_documentos(tipo):
                 d["nombre"] for d in leer_documentos(r.get("Firmado", ""))))]
     if estado != "Todos":
         filtrados = [r for r in filtrados if str(r.get("Estatus", "")).strip() == estado]
-    st.caption(f"{len(filtrados)} expediente(s) · Ordenados del más antiguo al más reciente")
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    st.caption(f"{len(filtrados)} expediente(s) · Ordenados por antigüedad")
     if not filtrados:
         mensaje = ("No hay oficios activos con urgencia automática o manual."
                    if not lista else "No se encontraron oficios con estos filtros.")
@@ -8751,6 +10491,17 @@ def _modulo_lateral_documentos(tipo):
         prioridad = _prioridad_urgencia(oficio)
         dias = prioridad["dias"]
         fecha = str(oficio.get("Fecha de recepción", "")).strip() or "No registrada"
+        fecha_visual = fecha
+        if es_setf_urgentes and fecha != "No registrada":
+            try:
+                fecha_parseada = pd.to_datetime(
+                    fecha, yearfirst=bool(re.match(r"^\d{4}[-/]", fecha)),
+                    dayfirst=not bool(re.match(r"^\d{4}[-/]", fecha)),
+                    errors="coerce")
+                if not pd.isna(fecha_parseada):
+                    fecha_visual = fecha_parseada.strftime("%d/%m/%Y")
+            except (ValueError, TypeError, OverflowError):
+                pass
         estatus = str(oficio.get("Estatus", "")).strip() or "Sin estado"
         asunto = str(oficio.get("Asunto", "")).strip() or "Sin asunto"
         responsable = str(oficio.get("Responsable", "")).strip() or "No asignado"
@@ -8763,43 +10514,93 @@ def _modulo_lateral_documentos(tipo):
         rail_unidad = "DÍAS NATURALES" if dias is not None else "SIN FECHA"
         rail_clase = "urg-rail--manual" if es_manual else ""
         with st.container(key=f"urg_ficha_{'manual_' if es_manual else ''}{indice}"):
-            st.markdown(
-                '<div class="urg-ficha">'
-                f'<div class="urg-rail {rail_clase}">'
-                '<div class="rail-kicker">ANTIGÜEDAD</div>'
-                f'<div class="rail-number">{html.escape(rail_label)}</div>'
-                f'<div class="rail-units">{rail_unidad}</div>'
-                f'<div class="rail-type">{motivo}</div>'
-                '</div>'
-                '<div class="urg-ficha-content">'
-                '<div class="urg-ficha-head"><div>'
-                '<div class="urg-ficha-kicker">EXPEDIENTE PRIORITARIO</div>'
-                f'<div class="urg-ficha-numero">{html.escape(numero or folio or "Sin número")}</div>'
-                f'<div class="urg-ficha-folio">Folio {html.escape(folio or "—")}</div>'
-                '</div>'
-                f'<span class="urg-status">{html.escape(estatus)}</span>'
-                '</div>'
-                f'<div class="urg-ficha-asunto">{html.escape(asunto[:230])}</div>'
-                '<div class="urg-ficha-grid">'
-                f'<div class="urg-ficha-field"><div class="label">RESPONSABLE</div>'
-                f'<div class="text">{html.escape(responsable)}</div></div>'
-                f'<div class="urg-ficha-field"><div class="label">RECEPCIÓN</div>'
-                f'<div class="text">{html.escape(fecha)}</div></div>'
-                '</div></div></div>'
-                + ('<div class="urg-ficha-meta">También marcado como prioridad manual</div>' if con_marca else '')
-                , unsafe_allow_html=True)
-            with st.expander("▣ Consultar expediente y documentos", expanded=False):
-                st.markdown(f"**Asunto:** {asunto}")
-                st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
-                _documentos_seccion(oficio)
-                if es_administrador():
-                    if marcas.get((folio, numero), False) and st.button(
-                            "Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
-                        try:
-                            _actualizar_urgencia(folio, numero, False)
-                            st.rerun()
-                        except Exception as error:
-                            st.error(str(error))
+            if es_setf_urgentes:
+                col_ficha, col_accion = st.columns([3.9, 1.2], gap="small")
+                with col_ficha:
+                    # Tarjeta de consulta compacta: sin banda vertical grande.
+                    tag_edad = f"{dias}" if dias is not None else "—"
+                    st.markdown(
+                        '<div class="setf-urg-file">'
+                        '<div class="setf-urg-days">'
+                        f'<strong>{html.escape(tag_edad)}</strong><small>DÍAS</small>'
+                        '</div><div class="setf-urg-file-body">'
+                        '<div class="setf-urg-file-head">'
+                        f'<span class="setf-urg-file-title">Oficio {html.escape(numero or folio or "Sin número")}</span>'
+                        f'<span class="setf-urg-pill setf-urg-pill--urgent">{html.escape(motivo.title())}</span>'
+                        f'<span class="setf-urg-pill">{html.escape(estatus)}</span>'
+                        '</div>'
+                        f'<div class="setf-urg-asunto">{html.escape(asunto[:230])}</div>'
+                        '<div class="setf-urg-meta">'
+                        f'<span>Responsable: <b>{html.escape(responsable)}</b></span>'
+                        f'<span>Folio: {html.escape(folio or "—")}</span>'
+                        f'<span>Recibido el {html.escape(fecha_visual)}</span>'
+                        '</div></div></div>'
+                        + ('<div class="setf-urg-manual-flag">También marcado como prioridad manual</div>'
+                           if con_marca else ''),
+                        unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div class="urg-ficha">'
+                    f'<div class="urg-rail {rail_clase}">'
+                    '<div class="rail-kicker">ANTIGÜEDAD</div>'
+                    f'<div class="rail-number">{html.escape(rail_label)}</div>'
+                    f'<div class="rail-units">{rail_unidad}</div>'
+                    f'<div class="rail-type">{motivo}</div>'
+                    '</div>'
+                    '<div class="urg-ficha-content">'
+                    '<div class="urg-ficha-head"><div>'
+                    '<div class="urg-ficha-kicker">EXPEDIENTE PRIORITARIO</div>'
+                    f'<div class="urg-ficha-numero">{html.escape(numero or folio or "Sin número")}</div>'
+                    f'<div class="urg-ficha-folio">Folio {html.escape(folio or "—")}</div>'
+                    '</div>'
+                    f'<span class="urg-status">{html.escape(estatus)}</span>'
+                    '</div>'
+                    f'<div class="urg-ficha-asunto">{html.escape(asunto[:230])}</div>'
+                    '<div class="urg-ficha-grid">'
+                    f'<div class="urg-ficha-field"><div class="label">RESPONSABLE</div>'
+                    f'<div class="text">{html.escape(responsable)}</div></div>'
+                    f'<div class="urg-ficha-field"><div class="label">RECEPCIÓN</div>'
+                    f'<div class="text">{html.escape(fecha)}</div></div>'
+                    '</div></div></div>'
+                    + ('<div class="urg-ficha-meta">También marcado como prioridad manual</div>' if con_marca else '')
+                    , unsafe_allow_html=True)
+            if es_setf_urgentes:
+                # Un botón NATIVO de Streamlit, alineado a la derecha. La apertura
+                # conserva los enlaces y permisos que antes vivían en st.expander.
+                id_urg = hashlib.sha256(f"{folio}|{numero}".encode("utf-8")).hexdigest()[:14]
+                clave_abierto = f"urg_setf_abierto_{id_urg}"
+                with col_accion:
+                    abierto = bool(st.session_state.get(clave_abierto, False))
+                    if st.button("Cerrar expediente ↑" if abierto else "Ver expediente →",
+                                 key=f"urg_setf_toggle_{indice}_{id_urg}",
+                                 use_container_width=True):
+                        st.session_state[clave_abierto] = not abierto
+                if st.session_state.get(clave_abierto, False):
+                    with st.container(key=f"urg_setf_docs_{indice}_{id_urg}"):
+                        st.markdown(f"**Asunto:** {asunto}")
+                        st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
+                        _documentos_seccion(oficio)
+                        if es_administrador():
+                            if marcas.get((folio, numero), False) and st.button(
+                                    "Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
+                                try:
+                                    _actualizar_urgencia(folio, numero, False)
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(str(error))
+            else:
+                with st.expander("▣ Consultar expediente y documentos", expanded=False):
+                    st.markdown(f"**Asunto:** {asunto}")
+                    st.markdown(f"**Folio:** {folio}  |  **Responsable:** {responsable}")
+                    _documentos_seccion(oficio)
+                    if es_administrador():
+                        if marcas.get((folio, numero), False) and st.button(
+                                "Quitar marca manual", key=f"urg_retirar_{indice}_{folio}"):
+                            try:
+                                _actualizar_urgencia(folio, numero, False)
+                                st.rerun()
+                            except Exception as error:
+                                st.error(str(error))
 
 
 # =========================================================
@@ -10143,22 +11944,40 @@ def _reuniones_calendario_html(reuniones, anio, mes):
             clase += " actual" if dia == hoy else ""
             partes.append(f'<div class="setf-reun-cal-dia{clase}"><div class="numero">{dia.day}</div>')
             eventos = sorted(por_fecha.get(dia, []), key=lambda r: r["hora"] or datetime.min.time())
-            for reunion in eventos[:2]:
+            for reunion in eventos[:3]:
                 estado_css = {"Programada": "programada", "Realizada": "realizada",
                               "Cancelada": "cancelada", "Por confirmar": "pendiente"}[reunion["estado"]]
                 titulo = html.escape(str(reunion["asunto"] or "Sin asunto"), quote=True)
                 etiqueta = html.escape((reunion["hora"].strftime("%H:%M") + " · " if reunion["hora"] else "") +
                                       (reunion["asunto"] or "Sin asunto")[:48])
                 partes.append(f'<div class="setf-reun-cal-event {estado_css}" title="{titulo}">{etiqueta}</div>')
-            if len(eventos) > 2:
-                partes.append(f'<div class="setf-reun-cal-mas">+{len(eventos) - 2} más</div>')
+            if len(eventos) > 3:
+                partes.append(f'<div class="setf-reun-cal-mas">+{len(eventos) - 3} más</div>')
             partes.append('</div>')
     partes.append('</div>')
     return "".join(partes)
 
 
+def _reuniones_ficha_calendario(reunion):
+    """Ficha existente de la reunión; sirve para un evento y para la agenda del día."""
+    titulo = str(reunion.get("asunto") or "Reunión sin asunto")
+    hora = reunion["hora"].strftime("%H:%M") if reunion.get("hora") else "S/H"
+    st.markdown("#### Información de la reunión")
+    st.markdown(f"**{html.escape(titulo)}**")
+    st.caption(f"{_REUNIONES_DIAS[reunion['fecha'].weekday()].capitalize()} "
+               f"{reunion['fecha']:%d/%m/%Y} · {hora}")
+    st.markdown(f"**Estado:** {html.escape(str(reunion['estado']))}")
+    st.markdown(f"**Ubicación:** {html.escape(str(reunion.get('ubicacion') or 'Por definir'))}")
+    st.markdown(f"**Responsable:** {html.escape(str(reunion.get('responsable') or 'Sin asignar'))}")
+    antecedente = str(reunion.get("antecedente") or "Sin antecedente")
+    st.markdown(f"**Antecedente:** {html.escape(antecedente)}")
+    if antecedente.lower().startswith("https://"):
+        st.link_button("Abrir antecedente ↗", antecedente, use_container_width=True)
+    st.caption("Para modificarla, utiliza la pestaña Editar reuniones.")
+
+
 def _reuniones_calendario_interactivo(reuniones, anio, mes):
-    """Agenda con controles Streamlit auténticos y fichas de detalle desplegables."""
+    """Calendario compacto: hasta 3 juntas por día, con agenda completa sin recargar Sheets."""
     import calendar
     meses = calendar.Calendar(firstweekday=0).monthdatescalendar(anio, mes)
     por_fecha = {}
@@ -10168,7 +11987,10 @@ def _reuniones_calendario_interactivo(reuniones, anio, mes):
     encabezados = st.columns(7, gap="small")
     for columna, rotulo in zip(encabezados, ("LUN", "MAR", "MIÉ", "JUE", "VIE", "SÁB", "DOM")):
         with columna:
-            st.markdown(f'<div class="reun-cal-encabezado">{rotulo}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="reun-cal-encabezado notranslate" translate="no" lang="es-MX">{rotulo}</div>',
+                unsafe_allow_html=True,
+            )
 
     hoy = _reuniones_ahora().date()
     for semana in meses:
@@ -10177,30 +11999,40 @@ def _reuniones_calendario_interactivo(reuniones, anio, mes):
             clase = "fuera" if dia.month != mes else "actual" if dia == hoy else "normal"
             with columna:
                 with st.container(key=f"reun_dia_{dia:%Y%m%d}_{clase}"):
-                    st.markdown(f'<div class="reun-cal-numero">{dia.day}</div>', unsafe_allow_html=True)
-                    eventos = sorted(por_fecha.get(dia, []), key=lambda r: r["hora"] or datetime.min.time())
-                    for reunion in eventos:
+                    st.markdown(
+                        f'<div class="reun-cal-numero notranslate" translate="no" lang="es-MX">{dia.day}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    eventos = sorted(
+                        por_fecha.get(dia, []),
+                        key=lambda r: (r["hora"] or datetime.min.time(), r.get("fila", 0)),
+                    )
+                    # No permitir que cuatro o más juntas estiren toda la semana.
+                    for reunion in eventos[:3]:
                         estado = {"Programada": "programada", "Realizada": "realizada",
-                                  "Cancelada": "cancelada", "Por confirmar": "pendiente"}.get(reunion["estado"], "pendiente")
+                                  "Cancelada": "cancelada", "Por confirmar": "pendiente"}.get(
+                                      reunion["estado"], "pendiente")
                         hora = reunion["hora"].strftime("%H:%M") if reunion["hora"] else "S/H"
-                        titulo = reunion["asunto"] or "Reunión sin asunto"
-                        etiqueta = f"{hora} · {titulo[:34]}{'…' if len(titulo) > 34 else ''}"
+                        titulo = str(reunion["asunto"] or "Reunión sin asunto")
+                        etiqueta = f"{hora} · {titulo[:26]}{'…' if len(titulo) > 26 else ''}"
                         with st.container(key=f"reun_evento_{estado}_{reunion['fila']}"):
                             with st.popover(etiqueta, use_container_width=True):
-                                st.markdown("#### Información de la reunión")
-                                st.markdown(f"**{titulo}**")
-                                st.caption(f"{_REUNIONES_DIAS[reunion['fecha'].weekday()].capitalize()} "
-                                           f"{reunion['fecha']:%d/%m/%Y} · {hora}")
-                                st.markdown(f"**Estado:** {reunion['estado']}")
-                                st.markdown(f"**Ubicación:** {reunion['ubicacion'] or 'Por definir'}")
-                                st.markdown(f"**Responsable:** {reunion['responsable'] or 'Sin asignar'}")
-                                antecedente = reunion["antecedente"] or "Sin antecedente"
-                                st.markdown(f"**Antecedente:** {antecedente}")
-                                if antecedente.lower().startswith("https://"):
-                                    st.link_button("Abrir antecedente ↗", antecedente,
-                                                   use_container_width=True)
-                                st.caption("Para modificarla, utiliza la pestaña Editar reuniones.")
+                                _reuniones_ficha_calendario(reunion)
 
+                    if len(eventos) > 3:
+                        adicionales = len(eventos) - 3
+                        # Popover nativo: abre en el navegador sin forzar un rerun
+                        # ni una nueva lectura de Google Sheets.
+                        with st.container(key=f"reun_eventos_mas_{dia:%Y%m%d}"):
+                            with st.popover(f"+{adicionales} {'reuniones' if adicionales != 1 else 'reunión'} más",
+                                            use_container_width=True):
+                                st.markdown(f"### Agenda del día · {dia:%d/%m/%Y}")
+                                st.caption(f"{len(eventos)} reuniones ordenadas por hora")
+                                for reunion in eventos:
+                                    hora = reunion["hora"].strftime("%H:%M") if reunion["hora"] else "S/H"
+                                    titulo = str(reunion["asunto"] or "Reunión sin asunto")
+                                    with st.expander(f"{hora} · {titulo}", expanded=False):
+                                        _reuniones_ficha_calendario(reunion)
 
 def _responsables_reuniones_setf():
     """Integrantes SETF configurados en Secrets, incluidas cuentas de dos áreas."""
@@ -10580,6 +12412,99 @@ def _modulo_reuniones_setf():
         <div class="setf-reun-art-tag">01 — PLANIFICACIÓN<br>02 — SEGUIMIENTO</div>
       </div>
     </section>""", unsafe_allow_html=True)
+    # Ajustes dedicados al calendario; no tocan formularios ni otros módulos SETF.
+    st.markdown("""
+    <style>
+    .st-key-reun_cal_panel {
+        background:rgba(255,255,255,.97)!important;
+        border:1px solid #e0e5e3!important;
+        border-radius:18px!important;
+        padding:16px 18px 13px!important;
+        box-shadow:0 9px 26px rgba(25,49,61,.09)!important;
+        margin:6px 0 16px!important;
+    }
+    .st-key-reun_cal_panel .reun-cal-mes {
+        text-align:center!important;color:#19384A!important;
+        font-size:clamp(18px,1.7vw,23px)!important;
+        font-weight:800!important;margin:1px 0 7px!important;
+    }
+    .st-key-reun_cal_panel [data-testid="stHorizontalBlock"] {
+        gap:6px!important;
+    }
+    .st-key-reun_cal_panel .reun-cal-encabezado {
+        border-radius:6px!important;padding:7px 2px!important;
+        background:#1b3b50!important;font-size:10px!important;
+        letter-spacing:.5px!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_dia_"] {
+        background:#fff!important;border:1px solid #e2e8e8!important;
+        border-radius:9px!important;
+        height:129px!important;min-height:129px!important;
+        max-height:129px!important;padding:6px!important;
+        margin:0 0 6px!important;
+        box-shadow:0 2px 5px rgba(24,50,62,.025)!important;
+        overflow:visible!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_dia_"][class*="_fuera"] {
+        background:#f4f6f6!important;opacity:.7;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_dia_"][class*="_actual"] {
+        border:2px solid #c99b53!important;
+        background:#fffaf0!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_dia_"] [data-testid="stVerticalBlock"] {
+        gap:3px!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_dia_"] .reun-cal-numero {
+        font-size:11px!important;font-weight:850!important;
+        margin:0 0 1px!important;line-height:1.15!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_evento_"] button,
+    .st-key-reun_cal_panel [class*="st-key-reun_eventos_mas_"] button {
+        min-height:22px!important;max-height:24px!important;height:24px!important;
+        width:100%!important;padding:3px 5px!important;
+        line-height:1.05!important;font-size:10px!important;
+        border-radius:5px!important;white-space:nowrap!important;
+        overflow:hidden!important;text-overflow:ellipsis!important;
+        text-align:left!important;justify-content:flex-start!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_evento_"] button p,
+    .st-key-reun_cal_panel [class*="st-key-reun_eventos_mas_"] button p {
+        white-space:nowrap!important;overflow:hidden!important;
+        text-overflow:ellipsis!important;font-size:10px!important;
+    }
+    .st-key-reun_cal_panel [class*="st-key-reun_eventos_mas_"] button {
+        background:#edf1f2!important;border:1px dashed #a3b3b9!important;
+        color:#36576a!important;font-weight:750!important;
+    }
+    .st-key-reun_cal_panel .reun-cal-leyenda {
+        display:flex;flex-wrap:wrap;gap:9px 16px;
+        padding:9px 4px 0;color:#687b84;font-size:11px;font-weight:650;
+        align-items:center;
+    }
+    .st-key-reun_cal_panel .reun-cal-leyenda span {display:flex;align-items:center;gap:6px}
+    .st-key-reun_cal_panel .reun-cal-leyenda i {
+        width:9px;height:9px;display:inline-block;border-radius:3px;
+    }
+    .st-key-reun_cal_panel .reun-cal-leyenda i.programada {background:#e6c86f}
+    .st-key-reun_cal_panel .reun-cal-leyenda i.realizada {background:#90cda3}
+    .st-key-reun_cal_panel .reun-cal-leyenda i.cancelada {background:#e19b91}
+    .st-key-reun_cal_panel .reun-cal-leyenda i.pendiente {background:#a9b7c7}
+    @media(max-width:800px) {
+       .st-key-reun_cal_panel {padding:9px 7px!important}
+       .st-key-reun_cal_panel [data-testid="stHorizontalBlock"] {gap:3px!important}
+       .st-key-reun_cal_panel [class*="st-key-reun_dia_"] {
+           padding:3px!important;height:115px!important;
+           min-height:115px!important;max-height:115px!important;
+       }
+       .st-key-reun_cal_panel [class*="st-key-reun_evento_"] button,
+       .st-key-reun_cal_panel [class*="st-key-reun_eventos_mas_"] button {
+           font-size:9px!important;padding:2px!important;
+       }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     # La consulta comparte ahora el mismo fondo del módulo completo.
     try:
         libro, ws = _reuniones_hoja()
@@ -10635,28 +12560,36 @@ def _modulo_reuniones_setf():
         if "reun_cal_ano" not in st.session_state:
             st.session_state.reun_cal_ano = hoy.year
             st.session_state.reun_cal_mes = hoy.month
-        col_prev, col_mes, col_next = st.columns([1, 5, 1], vertical_alignment="center")
-        with col_prev:
-            if st.button("← Anterior", key="reun_mes_anterior", use_container_width=True):
-                st.session_state.reun_cal_mes -= 1
-                if st.session_state.reun_cal_mes == 0:
-                    st.session_state.reun_cal_mes = 12
-                    st.session_state.reun_cal_ano -= 1
-                st.rerun()
-        with col_mes:
-            st.markdown(f'<h3 style="text-align:center;color:#173549;margin:2px 0">'
-                        f'{_REUNIONES_MESES[st.session_state.reun_cal_mes - 1].capitalize()} '
-                        f'{st.session_state.reun_cal_ano}</h3>', unsafe_allow_html=True)
-        with col_next:
-            if st.button("Siguiente →", key="reun_mes_siguiente", use_container_width=True):
-                st.session_state.reun_cal_mes += 1
-                if st.session_state.reun_cal_mes == 13:
-                    st.session_state.reun_cal_mes = 1
-                    st.session_state.reun_cal_ano += 1
-                st.rerun()
-        _reuniones_calendario_interactivo(reuniones, st.session_state.reun_cal_ano,
-                                         st.session_state.reun_cal_mes)
-        st.caption("Amarillo: programada · Verde: realizada · Rojo: cancelada · Gris: por confirmar.")
+        with st.container(key="reun_cal_panel"):
+            col_prev, col_mes, col_next = st.columns([1, 5, 1], vertical_alignment="center")
+            with col_prev:
+                if st.button("← Anterior", key="reun_mes_anterior", use_container_width=True):
+                    st.session_state.reun_cal_mes -= 1
+                    if st.session_state.reun_cal_mes == 0:
+                        st.session_state.reun_cal_mes = 12
+                        st.session_state.reun_cal_ano -= 1
+                    st.rerun()
+            with col_mes:
+                st.markdown(f'<h3 class="reun-cal-mes notranslate" translate="no" lang="es-MX">'
+                            f'{_REUNIONES_MESES[st.session_state.reun_cal_mes - 1].capitalize()} '
+                            f'{st.session_state.reun_cal_ano}</h3>', unsafe_allow_html=True)
+            with col_next:
+                if st.button("Siguiente →", key="reun_mes_siguiente", use_container_width=True):
+                    st.session_state.reun_cal_mes += 1
+                    if st.session_state.reun_cal_mes == 13:
+                        st.session_state.reun_cal_mes = 1
+                        st.session_state.reun_cal_ano += 1
+                    st.rerun()
+            _reuniones_calendario_interactivo(
+                reuniones, st.session_state.reun_cal_ano, st.session_state.reun_cal_mes)
+            st.markdown(
+                '<div class="reun-cal-leyenda notranslate" translate="no" lang="es-MX">'
+                '<span><i class="programada"></i>Programada</span>'
+                '<span><i class="realizada"></i>Realizada</span>'
+                '<span><i class="cancelada"></i>Cancelada</span>'
+                '<span><i class="pendiente"></i>Por confirmar</span>'
+                '</div>', unsafe_allow_html=True)
+
         st.markdown('<div class="setf-reun-seccion">Próximas reuniones</div>', unsafe_allow_html=True)
         proximas = sorted((r for r in reuniones if r["fecha"] >= hoy and r["estado"] in
                           ("Programada", "Por confirmar")),
@@ -10852,6 +12785,16 @@ def _modulo_reuniones_setf():
         except Exception as error:
             st.error(f"No se pudo cargar la bitácora: {error}")
 
+
+# La portada SETF conserva íntegra su interfaz original.
+# Solo las subáreas utilizan el encabezado, la navegación horizontal y la campana.
+if (
+    _area_activa_validada() == "setf"
+    and st.session_state.menu_activo in (
+        "oficios", "pendientes", "urgentes", "firmados", "minutas", "reuniones"
+    )
+):
+    _setf_barra_superior()
 
 if st.session_state.menu_activo == "home":
     # Portada de Diseño Geométrico con el mismo lenguaje visual del selector de áreas.
@@ -11123,6 +13066,11 @@ elif st.session_state.menu_activo == "pendientes":
         max-width: 1240px !important;
         padding-top: 2rem !important;
         padding-bottom: 4rem !important;
+    }
+    /* En SETF la barra superior ya reserva espacio; DG no se altera. */
+    .stMainBlockContainer:has(.pend-hero):has(.setf-pend-switch-title) {
+        max-width: none !important;
+        padding-top: 0 !important;
     }
     .pend-hero {
         position:relative; overflow:hidden; border-radius:14px;
@@ -13130,6 +15078,72 @@ div[class*="st-key-revisor_expediente_"] {
     # Estas reglas solo modifican superficies, bordes y jerarquía visual.
     # No se cambia ningún callback de Streamlit ni el acceso a Drive/Sheets.
 
+    # Ajustes responsivos exclusivos de SETF; se aplican después del tema heredado.
+    if _area_activa_validada() == "setf":
+        st.markdown("""<style>
+        /* Más superficie útil para subáreas SETF, sin alterar la portada. */
+        [data-testid="stAppViewContainer"] .block-container:has(.pend-hero) {
+            max-width: none !important;
+            width: 100% !important;
+            padding-left: clamp(12px, 1.2vw, 20px) !important;
+            padding-right: clamp(12px, 1.2vw, 20px) !important;
+        }
+        /* No usar márgenes negativos sobre la tarjeta: comprimir el espaciado real. */
+        .stMainBlockContainer:has(.pend-hero) .pend-hero {
+            margin-top: 0 !important;
+            margin-bottom: 12px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) .pend-nav-head {
+            margin-top: 6px !important;
+            margin-bottom: 8px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) div[data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) {
+            gap: clamp(10px, 1vw, 16px) !important;
+            align-items: stretch !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] {
+            height:100% !important;
+            min-height: 178px !important;
+            display:flex !important;
+            flex-direction:column !important;
+            padding:15px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-head {
+            max-width:100% !important;
+            gap: 9px !important;
+            grid-template-columns:42px minmax(0,1fr) !important;
+            min-height: 50px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-body .pend-tile-name {
+            font-size:clamp(14px,1.15vw,17px) !important;
+            overflow-wrap:break-word !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) div[class*="st-key-pend_nav_"] .pend-tile-copy {
+            max-width: 94% !important;
+            min-height: 30px !important;
+            margin-bottom:8px !important;
+        }
+        .stMainBlockContainer:has(.pend-hero) .pend-tile-art {opacity:.24 !important;}
+        /* Las cuentas con diferentes permisos presentan 2, 3 o 4 tarjetas. */
+        @media (min-width:700px) and (max-width:1250px) {
+            .stMainBlockContainer:has(.pend-hero) div[data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) {
+                flex-wrap: wrap !important;
+            }
+            .stMainBlockContainer:has(.pend-hero) div[data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) > div[data-testid="stColumn"] {
+                flex: 1 1 calc(50% - 12px) !important;
+                width: calc(50% - 12px) !important;
+                min-width: 0 !important;
+            }
+        }
+        @media (max-width:699px) {
+            .stMainBlockContainer:has(.pend-hero) div[data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) {
+                flex-wrap:wrap !important;
+            }
+            .stMainBlockContainer:has(.pend-hero) div[data-testid="stHorizontalBlock"]:has([class*="st-key-pend_nav_"]) > div[data-testid="stColumn"] {
+                flex: 1 1 100% !important; width:100% !important; min-width:0 !important;
+            }
+        }
+        </style>""", unsafe_allow_html=True)
     mostrar_mis_pendientes()
 
 elif st.session_state.menu_activo == "oficios":
@@ -13597,176 +15611,336 @@ elif st.session_state.menu_activo == "oficios":
     # INDICADORES — ESTILO INSTITUCIONAL MODERNO
     # =========================================================
 
-    html_kpis = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-    <style>
-        * {
-            box-sizing: border-box;
-        }
+    if _area_activa_validada() == "setf":
+        # Solo SETF: sustituir KPI informativos de iframe por widgets nativos.
+        # Así la navegación y los accesos rápidos funcionan con la sesión real,
+        # sin URLs manuales, JavaScript en iframe ni consultas adicionales.
+        st.markdown("""
+        <style>
+          /* PANORAMA DOCUMENTAL · ACCESOS RÁPIDOS SETF */
+          div[class*="st-key-setf_of_kpi_"] {
+              position:relative !important;
+              border:1.5px solid #C6A36D !important;
+              border-left:4px solid #C6A36D !important;
+              border-radius:13px !important;
+              background:#F8F5ED !important;
+              padding:12px 13px 11px !important;
+              min-height:158px !important;
+              box-shadow:0 5px 16px rgba(16,40,59,.07) !important;
+              transition:transform .15s ease, box-shadow .15s ease !important;
+          }
+          div[class*="st-key-setf_of_kpi_"]:hover {
+              transform:translateY(-1px);
+              box-shadow:0 8px 20px rgba(16,40,59,.11) !important;
+          }
+          div[class*="st-key-setf_of_kpi_firma"] {background:#F0F6FA !important;border-color:#6887A0 !important;border-left-color:#6887A0 !important;}
+          div[class*="st-key-setf_of_kpi_concluidos"] {background:#F0F8F4 !important;border-color:#4F927B !important;border-left-color:#4F927B !important;}
+          div[class*="st-key-setf_of_kpi_pendientes"] {background:#FBF3EF !important;border-color:#B77D61 !important;border-left-color:#B77D61 !important;}
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stVerticalBlock"] {gap:.24rem !important;}
+          .setf-of-kpi-top {display:flex;align-items:center;justify-content:space-between;gap:8px;}
+          .setf-of-kpi-number {font-size:32px;line-height:1;letter-spacing:-.8px;font-weight:800;color:#152E3C;font-variant-numeric:tabular-nums;}
+          .setf-of-kpi-icon {width:31px;height:31px;border-radius:9px;background:rgba(255,255,255,.65);border:1px solid rgba(110,125,135,.16);color:#7C6135;display:grid;place-items:center;font-size:17px;}
+          .setf-of-kpi-title {margin:7px 0 2px;font-weight:800;font-size:13px;line-height:1.2;color:#1B3546;}
+          .setf-of-kpi-desc {font-size:10.5px;line-height:1.25;color:#6B7D87;min-height:13px;}
+          .st-key-setf_of_kpi_firma .setf-of-kpi-icon {color:#3F698A;}
+          .st-key-setf_of_kpi_concluidos .setf-of-kpi-icon {color:#317A60;}
+          .st-key-setf_of_kpi_pendientes .setf-of-kpi-icon {color:#A05E45;}
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stHorizontalBlock"] {gap:6px !important;align-items:center!important;}
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button,
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button {
+              min-height:30px !important;height:30px !important;
+              border-radius:8px !important;padding:2px 8px !important;
+              font-size:11px !important;font-weight:700 !important;
+              border:1px solid #C7D1D5 !important;background:rgba(255,255,255,.75) !important;
+              color:#253C49 !important;box-shadow:none!important;
+          }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button:hover,
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button:hover {
+              background:#E5EBE9 !important;border-color:#9BADB2!important;color:#1D3D42!important;
+          }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button {
+              line-height:1!important;padding:0!important;
+          }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button p {
+              font-size:0!important;line-height:0!important;
+          }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button::after {
+              content:"▾";font-size:17px;font-weight:800;color:#253C49;
+              line-height:1;display:block;
+          }
+          /* Las cuatro tarjetas tienen la misma altura y el pie a la misma cota. */
+          div[class*="st-key-setf_of_kpi_"] > div[data-testid="stVerticalBlock"] {
+              min-height:132px!important;display:flex!important;flex-direction:column!important;
+              justify-content:space-between!important;
+          }
+          @media(max-width:1100px) {
+            div[class*="st-key-setf_of_kpi_"] {min-height:162px!important;}
+            .setf-of-kpi-number {font-size:28px;}
+          }
+        </style>
+        """, unsafe_allow_html=True)
 
-        body {
-            margin: 0;
-            padding: 0;
-            background: transparent;
-            font-family: Arial, Helvetica, sans-serif;
-            overflow: hidden;
-        }
+        def _setf_ir_desde_kpi(modulo, *, vista=None, bandeja=None,
+                               estado=None, vista_firmados=None):
+            """Navegar por controles existentes, sin alterar permisos ni registros."""
+            if _area_activa_validada() != "setf":
+                return
+            if modulo == "pendientes":
+                st.session_state["setf_pend_vista"] = vista or "Mis pendientes"
+                if bandeja:
+                    st.session_state["pend_bandeja"] = bandeja
+                st.session_state["pend_expediente_abierto"] = None
+            elif modulo == "oficios" and estado is not None:
+                # El filtro real del Centro de expedientes usa esta misma clave.
+                st.session_state["filtro_tabla_estatus"] = estado
+                st.session_state["filtro_tabla_proyecto"] = "Todos"
+                st.session_state["filtro_tabla_responsable"] = "Todos"
+                st.session_state["filtro_tabla_subproyecto"] = "Todos los subproyectos"
+            elif modulo == "firmados":
+                st.session_state["firmados_kpi_filtro"] = vista_firmados or "todos"
+                st.session_state["buscar_firmados"] = ""
+            navegar_a(modulo)
 
-        .kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 13px;
-            width: 100%;
-            padding: 3px 1px 8px;
-        }
+        opciones_kpi = (
+            ("revision", int(n_revision), "En revisión", "Documentación en análisis", "◷",
+             ("oficios", {"estado": "En revisión"})),
+            ("firma", int(n_firma), "En firma", "Pendiente de formalización", "✎",
+             ("pendientes", {"vista": "Mis pendientes", "bandeja": "En proceso de firma"})),
+            ("concluidos", int(n_concluidos), "Firmados", "Documentos formalizados", "✓",
+             ("firmados", {"vista_firmados": "todos"})),
+            ("pendientes", int(n_pendientes), "Pendientes", "Requieren seguimiento", "!",
+             ("pendientes", {"vista": "Pendientes de la mesa"})),
+        )
+        for columna, (clave, numero, titulo, descripcion, icono, destino) in zip(
+                st.columns(4, gap="small"), opciones_kpi):
+            with columna:
+                with st.container(key=f"setf_of_kpi_{clave}"):
+                    st.markdown(
+                        '<div class="setf-of-kpi-content" translate="no">'
+                        '<div class="setf-of-kpi-top">'
+                        f'<span class="setf-of-kpi-number">{numero:02d}</span>'
+                        f'<span class="setf-of-kpi-icon" aria-hidden="true">{icono}</span>'
+                        '</div>'
+                        f'<div class="setf-of-kpi-title">{html.escape(titulo)}</div>'
+                        f'<div class="setf-of-kpi-desc">{html.escape(descripcion)}</div>'
+                        '</div>', unsafe_allow_html=True,
+                    )
+                    accion_col, flecha_col = st.columns([4.6, 1], gap="small",
+                                                          vertical_alignment="center")
+                    with accion_col:
+                        if st.button("Abrir listado", key=f"setf_of_abrir_{clave}",
+                                     use_container_width=True,
+                                     help=f"Consultar {titulo.lower()}"):
+                            _setf_ir_desde_kpi(destino[0], **destino[1])
+                    with flecha_col:
+                        # Popover real de Streamlit: el menú flota sobre la página
+                        # y NO aumenta el alto de ninguna de las cuatro tarjetas.
+                        with st.popover(f"Accesos {titulo}", use_container_width=True):
+                            st.markdown(f"**{titulo} · Accesos rápidos**")
+                            if clave == "revision":
+                                if st.button("Ver oficios en revisión", key="setf_kpi_rev_listado",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("oficios", estado="En revisión")
+                                if puede_gestionar_borradores() or puede_realizar_revision_final():
+                                    if st.button("Abrir bandeja Por revisar", key="setf_kpi_rev_revisor",
+                                                 use_container_width=True):
+                                        _setf_ir_desde_kpi("pendientes", vista="Mis pendientes", bandeja="Por revisar")
+                            elif clave == "firma":
+                                if st.button("Ver bandeja en firma", key="setf_kpi_firma_bandeja",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("pendientes", vista="Mis pendientes", bandeja="En proceso de firma")
+                                if st.button("Enviados a firma hoy", key="setf_kpi_firma_hoy",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("firmados", vista_firmados="hoy")
+                                if st.button("Enviados a firma esta semana", key="setf_kpi_firma_semana",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("firmados", vista_firmados="semana")
+                            elif clave == "concluidos":
+                                if st.button("Archivo de firmados", key="setf_kpi_firm_archivo",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("firmados", vista_firmados="todos")
+                                if st.button("Firmados esta semana", key="setf_kpi_firm_semana",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("firmados", vista_firmados="firmados")
+                            elif clave == "pendientes":
+                                if st.button("Mis pendientes", key="setf_kpi_pend_mios",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("pendientes", vista="Mis pendientes")
+                                if st.button("Pendientes de la mesa", key="setf_kpi_pend_todos",
+                                             use_container_width=True):
+                                    _setf_ir_desde_kpi("pendientes", vista="Pendientes de la mesa")
 
-        .kpi {
-            position: relative;
-            height: 120px;
-            padding: 16px 19px;
-            background: #F2F7FA;
-            border: 1.7px solid #C6A36D;
-            border-radius: 13px;
-            box-shadow: 0 4px 13px rgba(16, 40, 59, 0.07);
-            overflow: hidden;
-        }
-
-        .kpi::before {
-            content: "";
-            position: absolute;
-            left: 0;
-            top: 17px;
-            bottom: 17px;
-            width: 3px;
-            background: #C6A36D;
-            border-radius: 0 3px 3px 0;
-        }
-
-        .kpi-top {
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-        }
-
-        .numero {
-            color: #142B3C;
-            font-size: 34px;
-            font-weight: 750;
-            line-height: 1;
-            letter-spacing: -1px;
-        }
-
-        .icono {
-            width: 32px;
-            height: 32px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: #F0F4F6;
-            border: 1px solid #E2E8EC;
-            border-radius: 9px;
-            color: #496273;
-            font-size: 15px;
-            font-weight: 700;
-        }
-
-        .nombre {
-            margin-top: 12px;
-            color: #183348;
-            font-size: 12px;
-            font-weight: 750;
-        }
-
-        .detalle {
-            margin-top: 5px;
-            color: #7C8B96;
-            font-size: 10px;
-            line-height: 1.3;
-        }
-
-        .revision {border-color:#C6A36D;background:#F8F5ED;}
-        .revision::before { background: #C6A36D; }
-        .revision .icono {color:#8B642C;background:#FBF3E6;border-color:#EAD5B7;}
-
-        .firma {border-color:#6887A0;background:#F0F6FA;}
-        .firma::before { background: #6887A0; }
-        .firma .icono {color:#3F698A;background:#EEF4F8;border-color:#CDDFEA;}
-
-        .concluidos {border-color:#4F927B;background:#F0F8F4;}
-        .concluidos::before { background: #4F927B; }
-        .concluidos .icono {color:#317A60;background:#EDF8F1;border-color:#CDE7D7;}
-
-        .pendientes {border-color:#B77D61;background:#FBF3EF;}
-        .pendientes::before { background: #B77D61; }
-        .pendientes .icono {color:#A05E45;background:#FFF1EA;border-color:#EBCFBD;}
-
-        @media (max-width: 650px) {
-            .kpi-grid {
-                grid-template-columns: repeat(2, minmax(0, 1fr));
+    else:
+        html_kpis = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <style>
+            * {
+                box-sizing: border-box;
             }
-        }
-    </style>
-    </head>
 
-    <body>
-        <div class="kpi-grid">
+            body {
+                margin: 0;
+                padding: 0;
+                background: transparent;
+                font-family: Arial, Helvetica, sans-serif;
+                overflow: hidden;
+            }
 
-            <div class="kpi revision">
-                <div class="kpi-top">
-                    <div class="numero">__REVISION__</div>
-                    <div class="icono">◷</div>
+            .kpi-grid {
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 13px;
+                width: 100%;
+                padding: 3px 1px 8px;
+            }
+
+            .kpi {
+                position: relative;
+                height: 120px;
+                padding: 16px 19px;
+                background: #F2F7FA;
+                border: 1.7px solid #C6A36D;
+                border-radius: 13px;
+                box-shadow: 0 4px 13px rgba(16, 40, 59, 0.07);
+                overflow: hidden;
+            }
+
+            .kpi::before {
+                content: "";
+                position: absolute;
+                left: 0;
+                top: 17px;
+                bottom: 17px;
+                width: 3px;
+                background: #C6A36D;
+                border-radius: 0 3px 3px 0;
+            }
+
+            .kpi-top {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+            }
+
+            .numero {
+                color: #142B3C;
+                font-size: 34px;
+                font-weight: 750;
+                line-height: 1;
+                letter-spacing: -1px;
+            }
+
+            .icono {
+                width: 32px;
+                height: 32px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #F0F4F6;
+                border: 1px solid #E2E8EC;
+                border-radius: 9px;
+                color: #496273;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            .nombre {
+                margin-top: 12px;
+                color: #183348;
+                font-size: 12px;
+                font-weight: 750;
+            }
+
+            .detalle {
+                margin-top: 5px;
+                color: #7C8B96;
+                font-size: 10px;
+                line-height: 1.3;
+            }
+
+            .revision {border-color:#C6A36D;background:#F8F5ED;}
+            .revision::before { background: #C6A36D; }
+            .revision .icono {color:#8B642C;background:#FBF3E6;border-color:#EAD5B7;}
+
+            .firma {border-color:#6887A0;background:#F0F6FA;}
+            .firma::before { background: #6887A0; }
+            .firma .icono {color:#3F698A;background:#EEF4F8;border-color:#CDDFEA;}
+
+            .concluidos {border-color:#4F927B;background:#F0F8F4;}
+            .concluidos::before { background: #4F927B; }
+            .concluidos .icono {color:#317A60;background:#EDF8F1;border-color:#CDE7D7;}
+
+            .pendientes {border-color:#B77D61;background:#FBF3EF;}
+            .pendientes::before { background: #B77D61; }
+            .pendientes .icono {color:#A05E45;background:#FFF1EA;border-color:#EBCFBD;}
+
+            @media (max-width: 650px) {
+                .kpi-grid {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                }
+            }
+        </style>
+        </head>
+
+        <body>
+            <div class="kpi-grid">
+
+                <div class="kpi revision">
+                    <div class="kpi-top">
+                        <div class="numero">__REVISION__</div>
+                        <div class="icono">◷</div>
+                    </div>
+                    <div class="nombre">En revisión</div>
+                    <div class="detalle">Documentación en análisis</div>
                 </div>
-                <div class="nombre">En revisión</div>
-                <div class="detalle">Documentación en análisis</div>
-            </div>
 
-            <div class="kpi firma">
-                <div class="kpi-top">
-                    <div class="numero">__FIRMA__</div>
-                    <div class="icono">✎</div>
+                <div class="kpi firma">
+                    <div class="kpi-top">
+                        <div class="numero">__FIRMA__</div>
+                        <div class="icono">✎</div>
+                    </div>
+                    <div class="nombre">En firma</div>
+                    <div class="detalle">Pendiente de formalización</div>
                 </div>
-                <div class="nombre">En firma</div>
-                <div class="detalle">Pendiente de formalización</div>
-            </div>
 
-            <div class="kpi concluidos">
-                <div class="kpi-top">
-                    <div class="numero">__CONCLUIDOS__</div>
-                    <div class="icono">✓</div>
+                <div class="kpi concluidos">
+                    <div class="kpi-top">
+                        <div class="numero">__CONCLUIDOS__</div>
+                        <div class="icono">✓</div>
+                    </div>
+                    <div class="nombre">Firmados</div>
+                    <div class="detalle">Documentos formalizados</div>
                 </div>
-                <div class="nombre">Firmados</div>
-                <div class="detalle">Documentos formalizados</div>
-            </div>
 
-            <div class="kpi pendientes" translate="no">
-                <div class="kpi-top">
-                    <div class="numero">__PENDIENTES__</div>
-                    <div class="icono">!</div>
+                <div class="kpi pendientes" translate="no">
+                    <div class="kpi-top">
+                        <div class="numero">__PENDIENTES__</div>
+                        <div class="icono">!</div>
+                    </div>
+                    <div class="nombre notranslate" translate="no">Pendientes</div>
+                    <div class="detalle">Requieren seguimiento</div>
                 </div>
-                <div class="nombre notranslate" translate="no">Pendientes</div>
-                <div class="detalle">Requieren seguimiento</div>
+
             </div>
+        </body>
+        </html>
+        """
 
-        </div>
-    </body>
-    </html>
-    """
+        html_kpis = (
+            html_kpis
+            .replace("__REVISION__", f"{n_revision:02d}")
+            .replace("__FIRMA__", f"{n_firma:02d}")
+            .replace("__CONCLUIDOS__", f"{n_concluidos:02d}")
+            .replace("__PENDIENTES__", f"{n_pendientes:02d}")
+        )
 
-    html_kpis = (
-        html_kpis
-        .replace("__REVISION__", f"{n_revision:02d}")
-        .replace("__FIRMA__", f"{n_firma:02d}")
-        .replace("__CONCLUIDOS__", f"{n_concluidos:02d}")
-        .replace("__PENDIENTES__", f"{n_pendientes:02d}")
-    )
-
-    components.html(
-        html_kpis,
-        height=137,
-        scrolling=False
-    )
+        components.html(
+            html_kpis,
+            height=137,
+            scrolling=False
+        )
 
     # =========================================================
     # CONSULTA DE EXPEDIENTES
@@ -15753,3 +17927,65 @@ elif st.session_state.menu_activo == "diseno":
     st.markdown("---")
     st.markdown("## Sistemas Eléctricos · Módulo de planos" if _area_activa_validada() == "setf" else "## Ingeniería de Detalle Fase I")
     st.info("Módulo de planos en preparación. La consulta, carga, revisión y gestión de planos se implementarán en una próxima etapa." if _area_activa_validada() == "setf" else "Espacio preparado para la gestión de proyectos y control de esta mesa.")
+
+# Estilo de la ficha de pendientes: solo los elementos propios de SETF.
+if st.session_state.get("area_actual") == "setf":
+    st.markdown("""<style>
+    .setf-exp-heading {display:flex;flex-direction:column;gap:4px;margin:2px 0 12px}
+    .setf-exp-heading span {font-size:10px;letter-spacing:1.7px;color:#9B7540;font-weight:800}
+    .setf-exp-heading strong {font-size:19px;line-height:1.25;color:#173447;font-weight:750}
+    .setf-exp-state-label {font-size:10px;font-weight:750;letter-spacing:1.3px;color:#9B7540;margin:18px 0 6px}
+    .setf-exp-state {padding:11px 13px;border-radius:9px;border:1px solid #D6DAD6;background:#F7F6F1;color:#253F42;font-size:13px;font-weight:700}
+    [class*="st-key-setf_documentos_laterales_"] {background:rgba(255,253,249,.96)!important;border:1px solid #DBCDB8!important;border-radius:15px!important;padding:18px!important}
+    [class*="st-key-pend_word_acciones_"] {background:rgba(255,253,250,.95)!important;border:1px solid #D9CCB9!important;border-radius:14px!important;padding:12px!important}
+    @media(max-width:850px) {.setf-exp-heading strong {font-size:17px}}
+    </style>""", unsafe_allow_html=True)
+
+
+# Presentación compacta del expediente SETF: dos tarjetas equilibradas como en el boceto.
+# El CSS no cambia el comportamiento del componente ni el acceso a Google Drive.
+if st.session_state.get("area_actual") == "setf":
+    st.markdown("""<style>
+    [class*="st-key-setf_word_panel_"],
+    [class*="st-key-setf_documentos_laterales_"] {
+        background:rgba(255,253,249,.98)!important;
+        border:1px solid #D5CAB9!important;
+        border-radius:14px!important;
+        padding:18px 19px!important;
+        box-sizing:border-box!important;
+        box-shadow:0 4px 14px rgba(34,40,42,.045)!important;
+    }
+    @media (min-width:980px) {
+        [class*="st-key-setf_word_panel_"],
+        [class*="st-key-setf_documentos_laterales_"] {min-height:290px!important;}
+    }
+    .setf-exp-panel-title {display:flex;align-items:center;gap:9px;margin:0 0 16px;line-height:1.25;}
+    .setf-exp-panel-title strong {font-size:17px;color:#18323D;font-weight:760;}
+    .setf-exp-panel-icon {display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;
+        border-radius:8px;background:#E9EDEB;color:#385A5C;font-size:19px;flex:none;}
+    .setf-word-version {padding:12px 14px;border:1px solid #E1DFD8;border-radius:10px;
+        background:#F6F5F0;display:flex;flex-direction:column;gap:6px;margin-bottom:13px;}
+    .setf-word-version span {font-weight:760;letter-spacing:1.15px;font-size:10px;color:#9B7848;}
+    .setf-word-version strong {font-size:17px;color:#21383E;font-weight:760;line-height:1.35;}
+    .setf-word-version small {font-size:12px;color:#607176;line-height:1.4;}
+    [class*="st-key-setf_word_panel_"] [data-testid="stExpander"],
+    [class*="st-key-setf_documentos_laterales_"] [data-testid="stExpander"] {
+        background:#FDFCF9!important;border:1px solid #D7DCD9!important;border-radius:9px!important;
+        margin:4px 0 9px!important;
+    }
+    [class*="st-key-setf_documentos_laterales_"] [data-testid="stExpander"] summary {min-height:46px!important;}
+    [class*="st-key-setf_documentos_laterales_"] .setf-exp-state-label {
+        margin:20px 0 6px!important;font-size:10px!important;letter-spacing:1.1px!important;color:#957244!important;
+    }
+    [class*="st-key-setf_documentos_laterales_"] .setf-exp-state {
+        background:transparent!important;border:0!important;padding:2px 0 8px!important;
+        font-size:14px!important;color:#21383E!important;
+    }
+    [class*="st-key-setf_word_panel_"] [data-testid="stAlert"] {margin:8px 0!important;}
+    @media(max-width:980px) {
+        [class*="st-key-setf_word_panel_"], [class*="st-key-setf_documentos_laterales_"] {
+            padding:13px!important;min-height:0!important;
+        }
+        .setf-exp-panel-title strong {font-size:15px;}
+    }
+    </style>""", unsafe_allow_html=True)
