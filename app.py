@@ -6372,15 +6372,19 @@ def _vista_firma_externa(registros):
 
     inicio = (pagina - 1) * por_pagina
     pagina_registros = firmando.iloc[inicio:inicio + por_pagina]
-    tarjetas = []
-    for _, registro in pagina_registros.iterrows():
+    try:
+        words_en_firma = _setf_words_enviados_compartidos() if _area_activa_validada() == "setf" else {}
+    except Exception as error:
+        words_en_firma = {}
+        st.warning("Los Word editables no están disponibles temporalmente: " + _mensaje_error_sheets(error))
+    for indice, registro in pagina_registros.iterrows():
         def campo(columna, defecto="No registrado"):
             valor = registro.get(columna, "")
             if pd.isna(valor) or not str(valor).strip():
                 return html.escape(defecto)
             return html.escape(str(valor).strip(), quote=True)
 
-        tarjetas.append(
+        tarjeta_html = (
             '<article class="firma-seguimiento-card">'
             '<div class="firma-card-top">'
             '<div class="firma-card-left">'
@@ -6409,7 +6413,16 @@ def _vista_firma_externa(registros):
             '<span class="firma-stage-label">Finalizado</span></div>'
             '</div></div></article>'
         )
-    st.markdown("".join(tarjetas), unsafe_allow_html=True)
+        st.markdown(tarjeta_html, unsafe_allow_html=True)
+        if _area_activa_validada() == "setf":
+            folio = str(registro.get("Folio", "")).strip()
+            numero = str(registro.get("No. de oficio", "")).strip()
+            word = words_en_firma.get((folio, numero))
+            if word:
+                token = hashlib.sha256(f"firma|{folio}|{numero}".encode("utf-8")).hexdigest()[:16]
+                col_word, _ = st.columns([1.65, 5.5], gap="small")
+                with col_word:
+                    _setf_boton_descarga_word_firma(folio, numero, word, token)
 
 # =========================================================
 # SETF - CENTRO DE PENDIENTES (CONSULTA COMPARTIDA)
@@ -6490,6 +6503,136 @@ def _setf_documento_compartido(folio, numero, borradores, identificador, mostrar
                            file_name=listo["nombre"],
                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                            key=f"{clave}_descargar", use_container_width=True)
+
+
+# =========================================================
+# SETF: RESGUARDO DEL WORD APROBADO Y EFECTIVAMENTE ENVIADO A FIRMA
+# =========================================================
+def _setf_indice_words_enviados_a_firma(borradores, eventos):
+    """Identifica el DOCX enviado a firma tras el dictamen de la Tte.
+
+    Nunca toma la última carga por su fecha: una versión puede haberse
+    cargado sin autorización ni envío. Exige la secuencia de eventos
+    ETAPA_APROBADO -> ETAPA_FIRMA para la MISMA versión.
+    Se devuelve el último envío válido de cada expediente, incluso cuando
+    la etapa después cambió a Firmado y archivado.
+    """
+    documentos = {}
+    for b in borradores:
+        folio = str(b.get("Folio", "")).strip()
+        numero = str(b.get("No. de oficio", "")).strip()
+        try:
+            version = int(b.get("Version") or 0)
+        except (ValueError, TypeError):
+            continue
+        drive_id = str(b.get("Drive ID", "")).strip()
+        if not folio or not numero or version <= 0 or not re.fullmatch(r"[A-Za-z0-9_-]{10,}", drive_id):
+            continue
+        if not str(b.get("Nombre", "")).lower().endswith(".docx"):
+            continue
+        documentos[(folio, numero, version)] = b
+
+    aprobadas = set()
+    enviados = {}
+    # EVENTOS_BORRADORES es una bitácora append-only; el orden de filas
+    # refleja el orden de los dictámenes y envíos.
+    for evento in eventos:
+        folio = str(evento.get("Folio", "")).strip()
+        numero = str(evento.get("No. de oficio", "")).strip()
+        try:
+            version = int(evento.get("Version") or 0)
+        except (ValueError, TypeError):
+            continue
+        clave = (folio, numero, version)
+        accion = str(evento.get("Accion", "")).strip()
+        if accion == ETAPA_APROBADO:
+            aprobadas.add(clave)
+        elif accion == ETAPA_FIRMA and clave in aprobadas and clave in documentos:
+            enviados[(folio, numero)] = documentos[clave]
+    return enviados
+
+
+def _setf_words_enviados_compartidos():
+    """Solo lecturas brevemente cacheadas; jamás carga bytes Word al listar."""
+    return _setf_indice_words_enviados_a_firma(
+        _leer_registros_borradores_por_area("setf"),
+        _leer_registros_eventos_por_area("setf"),
+    )
+
+
+def _setf_boton_descarga_word_firma(folio, numero, word, token):
+    """Botón por expediente; descarga privada bajo demanda, sin prefetch masivo.
+
+    Streamlit necesita los bytes del archivo para ofrecer download_button.
+    Por eso el primer clic prepara un único DOCX y muestra 'Guardar .docx'.
+    """
+    if not word:
+        return
+    esperado = str(word.get("Drive ID", "")).strip()
+    nombre = Path(str(word.get("Nombre") or "oficio.docx")).name
+    if not nombre.lower().endswith(".docx"):
+        nombre += ".docx"
+    try:
+        version = int(word.get("Version") or 0)
+    except (ValueError, TypeError):
+        return
+    # Solo un Word en memoria por sesión para no acumular DOCX de 15 MB.
+    clave_preparado = "setf_word_firma_preparado"
+    clave_boton = f"setf_word_firma_preparar_{token}"
+    if st.button("⬇ Descargar Word", key=clave_boton,
+                 help=f"Preparar versión V{version:02d} enviada a firma. La descarga requiere un segundo clic.",
+                 use_container_width=True):
+        try:
+            exigir_sesion()
+            if _area_activa_validada() != "setf":
+                raise PermissionError("El resguardo de Word solo está disponible para SETF.")
+
+            # Verificación fresca solo al pulsar; no añade lecturas al renderizado
+            # de cientos de expedientes ni permite descargar uno ya eliminado.
+            registros_actuales = conectar_google_sheets_por_area("setf").get_all_records()
+            coincidencias = [r for r in registros_actuales
+                             if str(r.get("Folio", "")).strip() == str(folio).strip()
+                             and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+            if len(coincidencias) != 1 or str(coincidencias[0].get("Estatus", "")).strip() not in ("En firma", "Firmado"):
+                raise ValueError("El oficio ya no está en firma ni firmado. Actualiza la vista.")
+            if not _permiso_documental(coincidencias[0].get("Responsable", "")):
+                raise PermissionError("No tienes permiso para consultar este expediente.")
+            resguardo_actual = _setf_indice_words_enviados_a_firma(
+                _hoja_borradores_por_area("setf").get_all_records(),
+                _hoja_eventos_borradores_por_area("setf").get_all_records(),
+            ).get((str(folio).strip(), str(numero).strip()))
+            if (not resguardo_actual or
+                str(resguardo_actual.get("Drive ID", "")).strip() != esperado or
+                int(resguardo_actual.get("Version") or 0) != version):
+                raise ValueError("El Word enviado a firma cambió. Actualiza la página.")
+
+            with st.spinner("Preparando Word editable desde Google Drive..."):
+                contenido = _descargar_docx_drive(esperado)
+            if not contenido.startswith(b"PK"):
+                raise ValueError("Drive no devolvió un archivo Word .docx válido.")
+            st.session_state[clave_preparado] = {
+                "folio": str(folio).strip(), "numero": str(numero).strip(),
+                "drive_id": esperado, "version": version,
+                "nombre": nombre, "bytes": contenido,
+                "usuario": identificador_sesion(),
+            }
+        except Exception as error:
+            st.session_state.pop(clave_preparado, None)
+            st.error("No se pudo preparar el Word: " + _mensaje_error_sheets(error))
+
+    listo = st.session_state.get(clave_preparado) or {}
+    if (listo.get("folio") == str(folio).strip()
+            and listo.get("numero") == str(numero).strip()
+            and listo.get("drive_id") == esperado
+            and listo.get("version") == version
+            and listo.get("usuario") == identificador_sesion()
+            and _area_activa_validada() == "setf"):
+        st.download_button(
+            "Guardar .docx", data=listo["bytes"], file_name=listo["nombre"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            key=f"setf_word_firma_guardar_{token}", use_container_width=True,
+            help="Descargar una copia editable sin modificar el documento aprobado.",
+        )
 
 
 def _setf_vista_pendientes_generales():
@@ -9779,6 +9922,13 @@ def _modulo_lateral_documentos(tipo):
                                       _fecha_firma(r) or datetime.max.date()))
 
         if _area_activa_validada() == "setf":
+            # Solo oficios del nuevo filtro de la Tte. tendrán Word resguardado;
+            # los expedientes antiguos no necesitan migración ni carga manual.
+            try:
+                words_archivados = _setf_words_enviados_compartidos()
+            except Exception as error:
+                words_archivados = {}
+                st.warning("No fue posible consultar el resguardo Word: " + _mensaje_error_sheets(error))
             # Archivo SETF: una superficie continua y filas compactas, sin
             # duplicar la información ni convertir el estado en un botón.
             if not lista:
@@ -9810,10 +9960,20 @@ def _modulo_lateral_documentos(tipo):
                         token = hashlib.sha256(
                             (folio + "|" + numero + "|" + str(indice)).encode("utf-8")
                         ).hexdigest()[:16]
+                        word_firma = words_archivados.get((folio, numero))
+                        if not firmado_realmente:
+                            # Enviados a firma no se mezclan con el archivo firmado.
+                            # La bandeja En firma muestra su acceso independiente.
+                            word_firma = None
                         with st.container(key=f"firm_archive_row_{token}"):
-                            col_info, col_estado, col_firmado, col_ante, col_anex = st.columns(
-                                [4.3, 0.9, 1.45, 1.35, 1.05], gap="small", vertical_alignment="center"
-                            )
+                            if word_firma:
+                                col_info, col_estado, col_firmado, col_word, col_ante, col_anex = st.columns(
+                                    [3.25, 0.9, 1.3, 1.55, 1.3, 1.1], gap="small", vertical_alignment="center"
+                                )
+                            else:
+                                col_info, col_estado, col_firmado, col_ante, col_anex = st.columns(
+                                    [4.3, 0.9, 1.45, 1.35, 1.05], gap="small", vertical_alignment="center"
+                                )
                             with col_info:
                                 st.markdown(
                                     f'<div class="firm-archive-name">{html.escape(titulo)}</div>'
@@ -9827,6 +9987,9 @@ def _modulo_lateral_documentos(tipo):
                                     st.markdown('<span class="firm-signed-state">Firmado</span>', unsafe_allow_html=True)
                                 else:
                                     st.markdown('<span class="firm-pending-state">En trámite</span>', unsafe_allow_html=True)
+                            if word_firma:
+                                with col_word:
+                                    _setf_boton_descarga_word_firma(folio, numero, word_firma, token)
                             for columna, categoria, etiqueta in (
                                 (col_firmado, "firmado", "Abrir firmado"),
                                 (col_ante, "antecedentes", "Antecedentes"),
