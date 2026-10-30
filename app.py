@@ -1445,6 +1445,15 @@ def _puede_formalizar_para_firma(folio, numero):
     return bool(puede_editar_responsable(oficio.get("Responsable", "")))
 
 
+def _puede_registrar_firmado_setf(folio, numero):
+    """Acceso de escritura: responsable vigente o Gestión Documental, nunca solo consulta.
+
+    Restringe la nueva recepción a SETF; no cambia las reglas de Diseño.
+    """
+    return (_area_activa_validada() == "setf" and
+            _puede_formalizar_para_firma(folio, numero))
+
+
 def _formalizar_envio_firma_borrador(folio, numero, nuevo_numero, nuevo_asunto):
     """Solo tras aprobación. Contabiliza la salida real, nunca el dictamen."""
     if not _puede_formalizar_para_firma(folio, numero):
@@ -1488,7 +1497,11 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
         (actual == ETAPA_TTE and etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_APROBADO) and tte) or
         (actual == ETAPA_APROBADO and etapa_nueva == ETAPA_FIRMA
          and _puede_formalizar_para_firma(folio, numero)) or
-        (actual == ETAPA_FIRMA and etapa_nueva in (ETAPA_RETORNO_FIRMA, ETAPA_ARCHIVADO) and admin)
+        (actual == ETAPA_FIRMA and (
+            (etapa_nueva == ETAPA_RETORNO_FIRMA and admin) or
+            (etapa_nueva == ETAPA_ARCHIVADO and
+             (admin or _puede_registrar_firmado_setf(folio, numero)))
+        ))
     )
     if not permitido:
         raise PermissionError("La transición no está permitida para tu usuario o la etapa actual.")
@@ -1505,7 +1518,7 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
 
 
 def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False,
-                            formalizacion_responsable=False):
+                            formalizacion_responsable=False, recepcion_firmado=False):
     """Actualización restringida del flujo; no permite modificar otros campos.
 
     Reutiliza la validación de fila y el batch existente, pero habilita a la Tte.
@@ -1521,6 +1534,13 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False,
     elif formalizacion_responsable:
         if cambios != {"Estatus": "En firma"} or not _puede_formalizar_para_firma(folio, numero):
             raise PermissionError("La formalización corresponde al responsable o Gestión Documental.")
+    elif recepcion_firmado:
+        if not _puede_registrar_firmado_setf(folio, numero):
+            raise PermissionError("Solo el responsable o Gestión Documental puede registrar el firmado.")
+        if (set(cambios) != {"Estatus", "Firmado", "Fecha de entrega"}
+                or cambios.get("Estatus") != "Firmado" or not cambios.get("Firmado")
+                or not cambios.get("Fecha de entrega")):
+            raise ValueError("La recepción requiere PDF firmado y fecha de recepción.")
     else:
         # En SETF el responsable asignado puede mandar su propio Word
         # directamente a revisión de la Tte.; DG conserva sus revisores.
@@ -1553,7 +1573,9 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False,
     fila_num, actual = coincidencias[0]
     if formalizacion_responsable and campo(actual, "Estatus") not in ("Autorizado para firma", "En firma"):
         raise ValueError("El expediente no está autorizado para formalización.")
-    if not autorizacion_tte and not formalizacion_responsable:
+    if recepcion_firmado and campo(actual, "Estatus") != "En firma":
+        raise ValueError("El oficio ya no está En firma. Actualiza la bandeja.")
+    if not autorizacion_tte and not formalizacion_responsable and not recepcion_firmado:
         # SETF: el responsable asignado o administrador documental autorizado
         # puede enviar su documento a revisión; el flujo DG no se altera.
         if _area_activa_validada() == "setf" and cambios == {"Estatus": "En revisión"}:
@@ -1581,7 +1603,11 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False,
 def _registrar_resultado_firma(folio, numero, resultado, nombre="", url="", fecha=None, observaciones=""):
     """Guarda el resultado en OFICIOS antes de cerrar la etapa en BORRADORES."""
     from urllib.parse import urlparse
-    exigir_permiso_borradores()
+    if _area_activa_validada() == "setf":
+        if not _puede_registrar_firmado_setf(folio, numero):
+            raise PermissionError("Solo el responsable o Gestión Documental puede registrar el firmado.")
+    else:
+        exigir_permiso_borradores()
     _verificar_expediente_documental(folio, numero)
     versiones = _borradores_expediente(folio, numero)
     if not versiones or str(versiones[-1].get("Etapa", "")) != ETAPA_FIRMA:
@@ -1600,7 +1626,7 @@ def _registrar_resultado_firma(folio, numero, resultado, nombre="", url="", fech
         _actualizar_oficio_flujo(folio, numero, {
             "Estatus": "Firmado", "Fecha de entrega": fecha.isoformat(),
             "Firmado": documentos,
-        })
+        }, recepcion_firmado=(_area_activa_validada() == "setf"))
         detalle = f"Firmado recibido: {nombre} | Drive: {url} | Fecha: {fecha.isoformat()}"
         if str(observaciones).strip():
             detalle += " | " + str(observaciones).strip()
@@ -3801,8 +3827,10 @@ def _formalizar_envio_firma_directo(folio, numero, nuevo_numero, nuevo_asunto):
 def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo,
                                    nombre_principal=None, url_principal=None):
     """Actualización auxiliar para John/Alejandra sin modificar los permisos de la Tte."""
-    if not (estado_previo == "Autorizado para firma" and estado_nuevo == "En firma"
-            and _puede_formalizar_para_firma(folio, numero)):
+    if not ((estado_previo == "Autorizado para firma" and estado_nuevo == "En firma"
+             and _puede_formalizar_para_firma(folio, numero)) or
+            (estado_previo == "En firma" and estado_nuevo == "Firmado"
+             and _puede_registrar_firmado_setf(folio, numero))):
         exigir_permiso_borradores()
     hoja = _hoja_modalidades()
     valores = hoja.get_all_values()
@@ -3830,7 +3858,11 @@ def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo
 
 def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fecha=None, comentario=""):
     """Recepción real del oficio firmado o retorno con correcciones (sin borradores)."""
-    exigir_permiso_borradores()
+    if resultado == "Regresó firmado" and _area_activa_validada() == "setf":
+        if not _puede_registrar_firmado_setf(folio, numero):
+            raise PermissionError("No tienes permiso para registrar el firmado.")
+    else:
+        exigir_permiso_borradores()
     datos = _modalidad_expediente(folio, numero)
     if not datos or datos.get("Tipo de trámite") != "Directo" or datos.get("Estado directo") != "En firma":
         raise ValueError("No existe un trámite directo activo en firma.")
@@ -3848,10 +3880,13 @@ def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fech
         archivo = json.dumps([{"nombre": nombre.strip(), "url": url.strip()}], ensure_ascii=False)
         _actualizar_oficio_flujo(folio, numero, {
             "Estatus": "Firmado", "Firmado": archivo, "Fecha de entrega": fecha.isoformat()
-        })
+        }, recepcion_firmado=(_area_activa_validada() == "setf"))
         try:
+            detalle_recepcion = f"Trámite directo · recepción de firma: {nombre} · {fecha.isoformat()}"
+            if comentario.strip():
+                detalle_recepcion += " · Observaciones: " + comentario.strip()
             _registrar_evento_borrador(folio, numero, 0, ETAPA_ARCHIVADO,
-                                      f"Trámite directo · recepción de firma: {nombre} · {fecha.isoformat()}")
+                                      detalle_recepcion)
         finally:
             # El estado real de OFICIOS sigue siendo fuente de verdad.
             _actualizar_datos_directo_revisor(folio, numero, "En firma", "Firmado")
@@ -3864,6 +3899,73 @@ def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fech
                                       "Trámite directo · " + comentario.strip())
         finally:
             _actualizar_datos_directo_revisor(folio, numero, "En firma", "En correcciones")
+
+
+def _setf_registrar_firmado_desde_bandeja(folio, numero, enlace, fecha, comentario=""):
+    """Cierra un oficio En firma, ordinario o directo, sin perder el DOCX.
+
+    No borra/versiona Word ni cambia los envíos históricos. OFICIOS es la fuente
+    de verdad; BORRADORES/MODALIDADES registran el cierre correspondiente.
+    """
+    from urllib.parse import urlparse
+    from datetime import date
+    from zoneinfo import ZoneInfo
+    exigir_sesion()
+    if not _puede_registrar_firmado_setf(folio, numero):
+        raise PermissionError("Registrar firmado requiere ser responsable o Gestión Documental de SETF.")
+    enlace = str(enlace or "").strip()
+    parsed = urlparse(enlace)
+    if (parsed.scheme != "https" or (parsed.hostname or "").lower() not in
+            ("drive.google.com", "docs.google.com") or not parsed.path.strip("/")):
+        raise ValueError("Pega un enlace https válido al documento firmado en Google Drive.")
+    if not isinstance(fecha, date) or isinstance(fecha, datetime):
+        raise ValueError("Selecciona la fecha real de recepción del firmado.")
+    if fecha > datetime.now(ZoneInfo("America/Mexico_City")).date():
+        raise ValueError("La fecha de recepción no puede ser posterior a hoy.")
+    if len(str(comentario)) > 2500:
+        raise ValueError("El comentario no debe superar los 2500 caracteres.")
+
+    # Consulta fresca SOLO al guardar: protege contra registros simultáneos.
+    hoja = conectar_google_sheets_por_area("setf")
+    registros = hoja.get_all_records()
+    matches = [r for r in registros if
+               str(r.get("Folio", "")).strip() == str(folio).strip() and
+               str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
+    if len(matches) != 1 or str(matches[0].get("Estatus", "")).strip() != "En firma":
+        raise ValueError("El oficio ya cambió de estado. Actualiza la bandeja antes de continuar.")
+
+    # El usuario NO captura el nombre: se genera automáticamente del expediente.
+    # No agregamos nuevos campos ni columnas a OFICIOS.
+    nombre = f"Oficio {str(numero).strip()} firmado"
+    # Modalidad directa sin Word, o proceso ordinario que conserva Word versionado.
+    modalidad = _modalidad_expediente(folio, numero)
+    if modalidad and str(modalidad.get("Tipo de trámite", "")).strip() == "Directo":
+        _guardar_resultado_directo(folio, numero, "Regresó firmado", nombre,
+                                  enlace, fecha, str(comentario).strip())
+    elif _borradores_expediente(folio, numero):
+        _registrar_resultado_firma(folio, numero, "Regresó firmado", nombre,
+                                  enlace, fecha, str(comentario).strip())
+    else:
+        # Oficio legado sin BORRADORES (no hay Word que rescatar): se vincula
+        # únicamente el firmado. No se inventa ni exige un DOCX histórico.
+        documentos = json.dumps([{"nombre": nombre, "url": enlace}], ensure_ascii=False)
+        _actualizar_oficio_flujo(folio, numero, {
+            "Estatus": "Firmado", "Firmado": documentos,
+            "Fecha de entrega": fecha.isoformat(),
+        }, recepcion_firmado=True)
+        detalle = f"Recepción firmada sin Word previo · {nombre} · {fecha.isoformat()}"
+        if str(comentario).strip():
+            detalle += " · " + str(comentario).strip()
+        try:
+            _registrar_evento_borrador(folio, numero, 0, ETAPA_ARCHIVADO, detalle)
+        except Exception as error:
+            # El expediente ya quedó correctamente Firmado en OFICIOS;
+            # no simular que también se guardó el evento si la bitácora falló.
+            st.warning("El oficio se firmó correctamente, pero falló el registro de bitácora: "
+                       + _mensaje_error_sheets(error))
+    # Se actualizan las listas compartidas y los indicadores solo después de guardar.
+    _invalidar_cache_documental(oficios=True, borradores=True, eventos=True)
+    _leer_modalidades_por_area.clear()
 
 
 def _reenviar_tramite_directo(folio, numero, nombre, url):
@@ -6175,10 +6277,10 @@ def _bandeja_borradores_compartida():
 
 
 def _vista_firma_externa(registros):
-    """Bandeja de consulta de los oficios en firma externa (sin acciones de edición).
+    """Bandeja de seguimiento y recepción de los oficios en firma externa.
 
-    Pensada para ~20 registros: búsqueda local y paginación de cinco tarjetas.
-    Usa únicamente los datos ya existentes en la tabla de oficios.
+    Lectura y descarga para autorizados. Recepción solo para responsables/gestores
+    SETF; Diseño Geométrico mantiene su comportamiento de consulta original.
     """
     import html
 
@@ -6293,6 +6395,41 @@ def _vista_firma_externa(registros):
     .firma-stage.active .firma-stage-label {color:#9E753F;}
     .firma-stage-link {height:1px;width:22px;background:#CDBCA6;}
     .firma-stage-link.done {background:#7F9F83;}
+    /* Tarjeta completa: contenido y controles de Streamlit dentro de un panel. */
+    div[class*="st-key-firma_expediente_"] {
+        background:linear-gradient(115deg,#FFFCF8,#F8F4EE)!important;
+        border:1px solid #CDBAA5!important;
+        border-left:4px solid #719077!important;
+        border-radius:14px!important;
+        padding:16px 18px 14px!important;
+        margin:0 0 17px!important;
+        box-shadow:0 6px 17px rgba(57,49,44,.075)!important;
+    }
+    div[class*="st-key-firma_expediente_"] .firma-seguimiento-card {
+        border:0!important;border-left:0!important;box-shadow:none!important;
+        background:transparent!important;padding:0!important;margin:0!important;
+        border-radius:0!important;
+    }
+    .firma-action-intro {margin-top:15px;padding-top:13px;border-top:1px solid #E4D9CD;}
+    .firma-action-title {font-size:12.5px;font-weight:800;color:#405848;margin-bottom:3px;}
+    .firma-action-subtitle {font-size:11px;color:#847469;line-height:1.5;margin-bottom:9px;}
+    div[class*="st-key-firma_expediente_"] .stButton > button {
+        min-height:41px;border-radius:9px!important;font-size:12px!important;
+        font-weight:750!important;letter-spacing:.05px!important;
+    }
+    div[class*="st-key-firma_expediente_"] button[kind="primary"] {
+        background:#345C44!important;color:white!important;
+        border:1px solid #345C44!important;
+    }
+    div[class*="st-key-firma_expediente_"] button[kind="primary"]:hover {
+        background:#467352!important;border-color:#467352!important;
+    }
+    div[class*="st-key-firma_form_"] {
+        background:#F5F0E9!important;border:1px solid #D9C8B4!important;
+        border-radius:12px!important;padding:16px!important;margin-top:10px!important;
+    }
+    .firma-form-title {font-size:14px;font-weight:800;color:#395B47;}
+    .firma-form-subtitle {font-size:11px;color:#776D64;margin-top:3px;}
     @media(max-width:720px) {
         .firma-bandeja-head {padding:13px 14px;}
         .firma-bandeja-title {font-size:19px;}
@@ -6360,7 +6497,7 @@ def _vista_firma_externa(registros):
     if paginas > 1:
         etiqueta, control = st.columns([4, 1], vertical_alignment="center")
         with etiqueta:
-            st.caption(f"{encontrados} oficio(s) · Mostrando 5 por página · Solo consulta")
+            st.caption(f"{encontrados} oficio(s) · Mostrando 5 por página")
         with control:
             pagina = st.selectbox(
                 "Página", numeros_paginas, key=pag_key,
@@ -6368,7 +6505,7 @@ def _vista_firma_externa(registros):
             )
     else:
         pagina = 1
-        st.caption(f"{encontrados} oficio(s) · Solo consulta")
+        st.caption(f"{encontrados} oficio(s) · Seguimiento de firma")
 
     inicio = (pagina - 1) * por_pagina
     pagina_registros = firmando.iloc[inicio:inicio + por_pagina]
@@ -6384,46 +6521,114 @@ def _vista_firma_externa(registros):
                 return html.escape(defecto)
             return html.escape(str(valor).strip(), quote=True)
 
-        tarjeta_html = (
-            '<article class="firma-seguimiento-card">'
-            '<div class="firma-card-top">'
-            '<div class="firma-card-left">'
-            '<div class="firma-card-kicker">EXPEDIENTE EN SEGUIMIENTO</div>'
-            f'<div class="firma-card-oficio">{campo("No. de oficio")}</div>'
-            f'<div class="firma-card-folio">Folio {campo("Folio")}</div>'
-            '</div>'
-            '<span class="firma-card-status">En firma externa</span>'
-            '</div>'
-            '<div class="firma-card-body">'
-            '<div><div class="firma-data-label">RESPONSABLE</div>'
-            f'<div class="firma-data-value">{campo("Responsable", "No asignado")}</div></div>'
-            '<div><div class="firma-data-label">ASUNTO</div>'
-            f'<div class="firma-data-value">{campo("Asunto", "Sin asunto registrado")}</div></div>'
-            '</div>'
-            '<div class="firma-card-timeline">'
-            '<div class="firma-timeline-title">SEGUIMIENTO DEL TRÁMITE</div>'
-            '<div class="firma-stages">'
-            '<div class="firma-stage done"><span class="firma-stage-circle">✓</span>'
-            '<span class="firma-stage-label">Revisión</span></div>'
-            '<div class="firma-stage-link done"></div>'
-            '<div class="firma-stage active"><span class="firma-stage-circle">◷</span>'
-            '<span class="firma-stage-label">Firma externa</span></div>'
-            '<div class="firma-stage-link"></div>'
-            '<div class="firma-stage future"><span class="firma-stage-circle">○</span>'
-            '<span class="firma-stage-label">Finalizado</span></div>'
-            '</div></div></article>'
-        )
-        st.markdown(tarjeta_html, unsafe_allow_html=True)
-        if _area_activa_validada() == "setf":
-            folio = str(registro.get("Folio", "")).strip()
-            numero = str(registro.get("No. de oficio", "")).strip()
-            word = words_en_firma.get((folio, numero))
-            if word:
-                token = hashlib.sha256(f"firma|{folio}|{numero}".encode("utf-8")).hexdigest()[:16]
-                col_word, _ = st.columns([1.65, 5.5], gap="small")
-                with col_word:
-                    _setf_boton_descarga_word_firma(folio, numero, word, token)
+        folio = str(registro.get("Folio", "")).strip()
+        numero = str(registro.get("No. de oficio", "")).strip()
+        token = hashlib.sha256(f"firma|{folio}|{numero}".encode("utf-8")).hexdigest()[:16]
+        word = words_en_firma.get((folio, numero)) if _area_activa_validada() == "setf" else None
+        puede_registrar = (_puede_registrar_firmado_setf(folio, numero)
+                          if _area_activa_validada() == "setf" else False)
+        clave_form = f"setf_recibir_firmado_{token}"
 
+        with st.container(key=f"firma_expediente_{token}"):
+            tarjeta_html = (
+                '<article class="firma-seguimiento-card">'
+                '<div class="firma-card-top">'
+                '<div class="firma-card-left">'
+                '<div class="firma-card-kicker">EXPEDIENTE EN SEGUIMIENTO</div>'
+                f'<div class="firma-card-oficio">{campo("No. de oficio")}</div>'
+                f'<div class="firma-card-folio">Folio {campo("Folio")}</div>'
+                '</div>'
+                '<span class="firma-card-status">En firma externa</span>'
+                '</div>'
+                '<div class="firma-card-body">'
+                '<div><div class="firma-data-label">RESPONSABLE</div>'
+                f'<div class="firma-data-value">{campo("Responsable", "No asignado")}</div></div>'
+                '<div><div class="firma-data-label">ASUNTO</div>'
+                f'<div class="firma-data-value">{campo("Asunto", "Sin asunto registrado")}</div></div>'
+                '</div>'
+                '<div class="firma-card-timeline">'
+                '<div class="firma-timeline-title">SEGUIMIENTO DEL TRÁMITE</div>'
+                '<div class="firma-stages">'
+                '<div class="firma-stage done"><span class="firma-stage-circle">✓</span>'
+                '<span class="firma-stage-label">Revisión</span></div>'
+                '<div class="firma-stage-link done"></div>'
+                '<div class="firma-stage active"><span class="firma-stage-circle">◷</span>'
+                '<span class="firma-stage-label">Firma externa</span></div>'
+                '<div class="firma-stage-link"></div>'
+                '<div class="firma-stage future"><span class="firma-stage-circle">○</span>'
+                '<span class="firma-stage-label">Finalizado</span></div>'
+                '</div></div></article>'
+            )
+            st.markdown(tarjeta_html, unsafe_allow_html=True)
+            if _area_activa_validada() == "setf":
+                st.markdown(
+                    '<div class="firma-action-intro">'
+                    '<div class="firma-action-title">Documento en proceso de firma</div>'
+                    '<div class="firma-action-subtitle">'
+                    'Conserva el editable aprobado y registra el documento oficial cuando sea recibido.'
+                    '</div></div>', unsafe_allow_html=True,
+                )
+                col_word, col_registro = st.columns([1, 1], gap="small")
+                with col_word:
+                    if word:
+                        _setf_boton_descarga_word_firma(folio, numero, word, token)
+                    else:
+                        st.caption("Word editable no disponible para este expediente.")
+                with col_registro:
+                    if puede_registrar:
+                        abierto = bool(st.session_state.get(clave_form, False))
+                        if st.button("✕ Cerrar registro" if abierto else "✓ Registrar firmado",
+                                     key=f"setf_abrir_registro_{token}",
+                                     type="secondary" if abierto else "primary",
+                                     use_container_width=True):
+                            st.session_state[clave_form] = not abierto
+                            st.rerun()
+                    else:
+                        st.caption("El registro del firmado corresponde al responsable o Gestión Documental.")
+
+                if puede_registrar and st.session_state.get(clave_form, False):
+                    with st.container(key=f"firma_form_{token}"):
+                        st.markdown(
+                            '<div class="firma-form-title">Recepción del documento firmado</div>'
+                            '<div class="firma-form-subtitle">'
+                            'Vincula el PDF oficial y registra la fecha en que se recibió firmado.'
+                            '</div>', unsafe_allow_html=True,
+                        )
+                        with st.form(key=f"setf_firmado_form_{token}", clear_on_submit=False):
+                            enlace = st.text_input(
+                                "Enlace de Google Drive del documento firmado *",
+                                placeholder="https://drive.google.com/file/d/...",
+                                key=f"setf_firmado_enlace_{token}",
+                            )
+                            from zoneinfo import ZoneInfo
+                            hoy_mx = datetime.now(ZoneInfo("America/Mexico_City")).date()
+                            fecha = st.date_input(
+                                "Fecha de recepción del oficio firmado *",
+                                value=hoy_mx, max_value=hoy_mx, format="DD/MM/YYYY",
+                                key=f"setf_firmado_fecha_{token}",
+                            )
+                            comentario = st.text_area(
+                                "Observaciones (opcional)",
+                                placeholder="Agrega una aclaración solo si es necesario...",
+                                height=82, max_chars=2500,
+                                key=f"setf_firmado_comentario_{token}",
+                            )
+                            st.caption("Al confirmar, el expediente pasará a Firmados y conservará su Word editable, si existe.")
+                            confirmar = st.form_submit_button(
+                                "✓ Confirmar recepción del firmado",
+                                type="primary", use_container_width=True,
+                            )
+                        if confirmar:
+                            try:
+                                with st.spinner("Guardando el documento firmado..."):
+                                    _setf_registrar_firmado_desde_bandeja(
+                                        folio, numero, enlace, fecha, comentario)
+                                st.session_state.pop(clave_form, None)
+                                st.toast("Oficio recibido y registrado como Firmado.", icon="✅")
+                                st.rerun()
+                            except Exception as error:
+                                st.error("No se pudo registrar el firmado: " + _mensaje_error_sheets(error))
+                                st.info("Si el estado cambió en otra cuenta, actualiza la bandeja antes de reintentar.")
 # =========================================================
 # SETF - CENTRO DE PENDIENTES (CONSULTA COMPARTIDA)
 # =========================================================
@@ -9938,7 +10143,7 @@ def _modulo_lateral_documentos(tipo):
                     st.markdown(
                         '<div class="firm-archive-head">'
                         '<div><div class="firm-archive-title">Archivo completo de oficios</div>'
-                        '<div class="firm-archive-subtitle">Documentos firmados, antecedentes y anexos disponibles</div></div>'
+                        '<div class="firm-archive-subtitle">PDF firmado, Word editable resguardado, antecedentes y anexos disponibles</div></div>'
                         f'<span class="firm-archive-count">{len(lista)} expedientes</span>'
                         '</div>', unsafe_allow_html=True)
                     for indice, oficio in enumerate(lista):
