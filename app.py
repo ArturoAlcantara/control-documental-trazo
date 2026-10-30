@@ -6765,11 +6765,33 @@ def _setf_words_enviados_compartidos():
     )
 
 
-def _setf_boton_descarga_word_firma(folio, numero, word, token):
-    """Botón por expediente; descarga privada bajo demanda, sin prefetch masivo.
+def _setf_contenido_descarga_word(listo, token):
+    """Muestra el DOCX preparado solo dentro del diálogo (no en la fila)."""
+    st.caption("El Word editable se conservó de la versión enviada a firma.")
+    st.markdown(f"**Archivo:** `{html.escape(str(listo['nombre']))}`")
+    st.download_button(
+        "⬇ Guardar archivo .docx", data=listo["bytes"],
+        file_name=listo["nombre"],
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        key=f"setf_word_firma_dialogo_guardar_{token}",
+        use_container_width=True,
+        help="Descarga una copia sin modificar el documento oficial ni el Word resguardado.",
+    )
 
-    Streamlit necesita los bytes del archivo para ofrecer download_button.
-    Por eso el primer clic prepara un único DOCX y muestra 'Guardar .docx'.
+
+# st.dialog está disponible en las versiones modernas de Streamlit.
+# Si una instalación antigua carece de él, se conserva el método de descarga previo.
+_setf_dialogo_descarga_word = (
+    st.dialog("Descargar Word editable")(_setf_contenido_descarga_word)
+    if callable(getattr(st, "dialog", None)) else None
+)
+
+
+def _setf_boton_descarga_word_firma(folio, numero, word, token, *, en_dialogo=False):
+    """Descarga privada bajo demanda, sin prefetch masivo.
+
+    En Firmados el segundo paso se presenta en un diálogo para que no
+    aparezca un botón extra bajo la fila. En Firma conserva el flujo anterior.
     """
     if not word:
         return
@@ -6784,9 +6806,12 @@ def _setf_boton_descarga_word_firma(folio, numero, word, token):
     # Solo un Word en memoria por sesión para no acumular DOCX de 15 MB.
     clave_preparado = "setf_word_firma_preparado"
     clave_boton = f"setf_word_firma_preparar_{token}"
-    if st.button("⬇ Descargar Word", key=clave_boton,
-                 help=f"Preparar versión V{version:02d} enviada a firma. La descarga requiere un segundo clic.",
-                 use_container_width=True):
+    boton_pulsado = st.button(
+        "⬇ Descargar Word", key=clave_boton,
+        help=f"Descargar versión V{version:02d} enviada a firma: {nombre}",
+        use_container_width=True,
+    )
+    if boton_pulsado:
         try:
             exigir_sesion()
             if _area_activa_validada() != "setf":
@@ -6832,12 +6857,19 @@ def _setf_boton_descarga_word_firma(folio, numero, word, token):
             and listo.get("version") == version
             and listo.get("usuario") == identificador_sesion()
             and _area_activa_validada() == "setf"):
-        st.download_button(
-            "Guardar .docx", data=listo["bytes"], file_name=listo["nombre"],
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            key=f"setf_word_firma_guardar_{token}", use_container_width=True,
-            help="Descargar una copia editable sin modificar el documento aprobado.",
-        )
+        if en_dialogo and _setf_dialogo_descarga_word is not None:
+            # El diálogo solo se abre en el rerun que corresponde al clic.
+            # No se vuelve a descargar el archivo ni se añade otro botón a la ficha.
+            if boton_pulsado:
+                _setf_dialogo_descarga_word(listo, token)
+        else:
+            # Compatibilidad con En firma y versiones anteriores de Streamlit.
+            st.download_button(
+                "Guardar .docx", data=listo["bytes"], file_name=listo["nombre"],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                key=f"setf_word_firma_guardar_{token}", use_container_width=True,
+                help="Descargar una copia editable sin modificar el documento aprobado.",
+            )
 
 
 def _setf_vista_pendientes_generales():
@@ -9817,14 +9849,37 @@ def _modulo_lateral_documentos(tipo):
                 font-weight:650!important;padding:6px 9px!important;
                 box-shadow:none!important;white-space:normal!important;
             }
+            /* Acciones agrupadas, PDF prioritario y Word como secundario. */
             [data-testid="stAppViewContainer"]:has(.firm-hero)
-                div[class*="st-key-firm_archive_row_"] [data-testid="stHorizontalBlock"]
-                > [data-testid="stColumn"]:nth-child(3) .stLinkButton a,
+                div[class*="st-key-firm_archive_pdf_"] .stLinkButton a,
             [data-testid="stAppViewContainer"]:has(.firm-hero)
-                div[class*="st-key-firm_archive_row_"] [data-testid="stHorizontalBlock"]
-                > [data-testid="stColumn"]:nth-child(3) [data-testid="stPopover"] button {
-                background:#2E5947!important;color:white!important;
+                div[class*="st-key-firm_archive_pdf_"] [data-testid="stPopover"] > button {
+                background:#2E5947!important;color:#FFFFFF!important;
                 border-color:#2E5947!important;font-weight:750!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_pdf_"] .stLinkButton a:hover {
+                background:#3C7159!important;color:#FFFFFF!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_support_"] .stLinkButton a,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_support_"] [data-testid="stPopover"] > button,
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_support_"] .stButton button {
+                background:#F5F7F3!important;color:#58705E!important;
+                border-color:#E0E8DF!important;min-height:34px!important;
+                font-size:11px!important;font-weight:600!important;
+            }
+            [data-testid="stAppViewContainer"]:has(.firm-hero)
+                div[class*="st-key-firm_archive_support_"] {
+                margin-top:7px!important;
+            }
+            .firm-word-filename {
+                color:#829088!important;font-size:10px!important;
+                line-height:1.25!important;margin:3px 0 0!important;
+                white-space:nowrap!important;overflow:hidden!important;
+                text-overflow:ellipsis!important;max-width:100%!important;
             }
             [data-testid="stAppViewContainer"]:has(.firm-hero)
                 div[class*="st-key-firm_archive_row_"] .stLinkButton a:hover,
@@ -10143,7 +10198,7 @@ def _modulo_lateral_documentos(tipo):
                     st.markdown(
                         '<div class="firm-archive-head">'
                         '<div><div class="firm-archive-title">Archivo completo de oficios</div>'
-                        '<div class="firm-archive-subtitle">PDF firmado, Word editable resguardado, antecedentes y anexos disponibles</div></div>'
+                        '<div class="firm-archive-subtitle">PDF firmado, Word resguardado cuando exista, antecedentes y anexos</div></div>'
                         f'<span class="firm-archive-count">{len(lista)} expedientes</span>'
                         '</div>', unsafe_allow_html=True)
                     for indice, oficio in enumerate(lista):
@@ -10171,14 +10226,11 @@ def _modulo_lateral_documentos(tipo):
                             # La bandeja En firma muestra su acceso independiente.
                             word_firma = None
                         with st.container(key=f"firm_archive_row_{token}"):
-                            if word_firma:
-                                col_info, col_estado, col_firmado, col_word, col_ante, col_anex = st.columns(
-                                    [3.25, 0.9, 1.3, 1.55, 1.3, 1.1], gap="small", vertical_alignment="center"
-                                )
-                            else:
-                                col_info, col_estado, col_firmado, col_ante, col_anex = st.columns(
-                                    [4.3, 0.9, 1.45, 1.35, 1.05], gap="small", vertical_alignment="center"
-                                )
+                            # Un bloque de expediente y dos niveles de acciones.
+                            # Las filas conservan su alineación aunque no tengan Word.
+                            col_info, col_estado, col_acciones = st.columns(
+                                [4.2, 0.9, 4.5], gap="medium", vertical_alignment="center"
+                            )
                             with col_info:
                                 st.markdown(
                                     f'<div class="firm-archive-name">{html.escape(titulo)}</div>'
@@ -10192,34 +10244,80 @@ def _modulo_lateral_documentos(tipo):
                                     st.markdown('<span class="firm-signed-state">Firmado</span>', unsafe_allow_html=True)
                                 else:
                                     st.markdown('<span class="firm-pending-state">En trámite</span>', unsafe_allow_html=True)
-                            if word_firma:
-                                with col_word:
-                                    _setf_boton_descarga_word_firma(folio, numero, word_firma, token)
-                            for columna, categoria, etiqueta in (
-                                (col_firmado, "firmado", "Abrir firmado"),
-                                (col_ante, "antecedentes", "Antecedentes"),
-                                (col_anex, "anexos", "Anexos"),
-                            ):
-                                archivos = documentos[categoria]
-                                with columna:
-                                    if categoria == "firmado" and not firmado_realmente:
-                                        st.button("Firmado pendiente", key=f"firm_arch_bloq_{token}",
-                                                  disabled=True, use_container_width=True)
-                                    elif len(archivos) == 1:
-                                        st.link_button(
-                                            etiqueta, archivos[0]["url"], use_container_width=True,
-                                            help=f'Abrir en Drive: {archivos[0]["nombre"]}',
-                                        )
-                                    elif len(archivos) > 1:
-                                        with st.popover(etiqueta, use_container_width=True):
-                                            st.caption(f"{len(archivos)} archivos · {etiqueta}")
-                                            for archivo in archivos:
-                                                st.link_button(archivo["nombre"], archivo["url"],
-                                                               use_container_width=True)
-                                    else:
-                                        st.button(etiqueta, key=f"firm_arch_vacio_{categoria}_{token}",
-                                                  disabled=True, use_container_width=True,
-                                                  help="No hay documentos vinculados")
+                            with col_acciones:
+                                # Acciones principales: PDF oficial y editable.
+                                with st.container(key=f"firm_archive_main_{token}"):
+                                    col_firmado, col_word = st.columns(
+                                        2, gap="small", vertical_alignment="top"
+                                    )
+                                    with col_firmado:
+                                        with st.container(key=f"firm_archive_pdf_{token}"):
+                                            archivos = documentos["firmado"]
+                                            if not firmado_realmente:
+                                                st.button("Firmado pendiente", key=f"firm_arch_bloq_{token}",
+                                                          disabled=True, use_container_width=True)
+                                            elif len(archivos) == 1:
+                                                st.link_button(
+                                                    "Abrir firmado", archivos[0]["url"],
+                                                    use_container_width=True,
+                                                    help=f'Abrir en Drive: {archivos[0]["nombre"]}',
+                                                )
+                                            elif len(archivos) > 1:
+                                                with st.popover("Abrir firmado", use_container_width=True):
+                                                    st.caption(f"{len(archivos)} archivos firmados")
+                                                    for archivo in archivos:
+                                                        st.link_button(archivo["nombre"], archivo["url"],
+                                                                       use_container_width=True)
+                                            else:
+                                                st.button("Sin PDF vinculado", key=f"firm_arch_vacio_firmado_{token}",
+                                                          disabled=True, use_container_width=True,
+                                                          help="No se ha vinculado un documento firmado")
+                                    with col_word:
+                                        if word_firma:
+                                            _setf_boton_descarga_word_firma(
+                                                folio, numero, word_firma, token, en_dialogo=True
+                                            )
+                                            nombre_word = Path(str(word_firma.get("Nombre") or "oficio.docx")).name
+                                            st.markdown(
+                                                '<div class="firm-word-filename" title="'
+                                                + html.escape(nombre_word, quote=True)
+                                                + '">Archivo: ' + html.escape(nombre_word) + '</div>',
+                                                unsafe_allow_html=True,
+                                            )
+                                        else:
+                                            st.button("Sin Word editable", key=f"firm_arch_sin_word_{token}",
+                                                      disabled=True, use_container_width=True,
+                                                      help="Este expediente no cuenta con Word resguardado")
+                                            st.markdown('<div class="firm-word-filename">No disponible</div>',
+                                                        unsafe_allow_html=True)
+
+                                # Documentación complementaria, en una fila secundaria.
+                                with st.container(key=f"firm_archive_support_{token}"):
+                                    col_ante, col_anex = st.columns(
+                                        2, gap="small", vertical_alignment="center"
+                                    )
+                                    for columna, categoria, etiqueta in (
+                                        (col_ante, "antecedentes", "Antecedentes"),
+                                        (col_anex, "anexos", "Anexos"),
+                                    ):
+                                        archivos = documentos[categoria]
+                                        with columna:
+                                            if len(archivos) == 1:
+                                                st.link_button(
+                                                    etiqueta, archivos[0]["url"], use_container_width=True,
+                                                    help=f'Abrir en Drive: {archivos[0]["nombre"]}',
+                                                )
+                                            elif len(archivos) > 1:
+                                                with st.popover(etiqueta, use_container_width=True):
+                                                    st.caption(f"{len(archivos)} archivos · {etiqueta}")
+                                                    for archivo in archivos:
+                                                        st.link_button(archivo["nombre"], archivo["url"],
+                                                                       use_container_width=True)
+                                            else:
+                                                st.button(etiqueta, key=f"firm_arch_vacio_{categoria}_{token}",
+                                                          disabled=True, use_container_width=True,
+                                                          help="No hay documentos vinculados")
+
         else:
             st.markdown(
                 f'<div class="firm-label">{html.escape(nombres_vista_firmados[vista_firmados].upper())}</div>',
