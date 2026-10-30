@@ -1180,6 +1180,13 @@ def _invalidar_cache_documental(borradores=False, eventos=False, oficios=False):
     if oficios:
         _leer_registros_oficios_por_area.clear()
         obtener_oficios_por_area.clear()
+        # Los envíos se filtran por oficios vivos; no conservar registros borrados.
+        envios = globals().get("_leer_envios_firma_por_area")
+        if envios is not None:
+            envios.clear()
+        avisos_envios = globals().get("_envios_avisos_cacheados")
+        if avisos_envios is not None:
+            avisos_envios.clear()
         # Existe solo cuando terminó la carga de las funciones del módulo SETF.
         avisos = globals().get("_setf_notificaciones_por_usuario")
         if avisos is not None:
@@ -1380,8 +1387,18 @@ def _hoja_envios_firma_por_area(area):
 
 
 def _leer_envios_firma():
-    # Lectura fresca: los movimientos deben verse entre cuentas sin reiniciar sesión.
-    return _hoja_envios_firma_por_area(_area_activa_validada()).get_all_records()
+    # La validación de área se realiza ANTES de acceder a la caché.
+    return _leer_envios_firma_por_area(_area_activa_validada())
+
+
+@st.cache_data(ttl=20, max_entries=4, show_spinner=False)
+def _leer_envios_firma_por_area(area):
+    """Una lectura por área y ventana corta, compartida por las sesiones.
+
+    Las validaciones de unicidad al enviar a firma siguen leyendo la hoja
+    de forma directa, sin pasar por este snapshot.
+    """
+    return _hoja_envios_firma_por_area(area).get_all_records()
 
 
 def _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto):
@@ -1410,6 +1427,7 @@ def _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto):
     hoja.append_row([str(folio), str(numero), nuevo_numero, nuevo_asunto,
                      fecha, identificador_sesion()], value_input_option="RAW")
     # Las lecturas que alimentan la campana no deben ocultar un envío confirmado.
+    _leer_envios_firma_por_area.clear()
     _envios_avisos_cacheados.clear()
     _setf_notificaciones_por_usuario.clear()
 
@@ -8166,8 +8184,8 @@ def _reuniones_avisos_cacheadas(libro_id):
 
 @st.cache_data(ttl=20, max_entries=4, show_spinner=False)
 def _envios_avisos_cacheados(area):
-    """Avoid repeated signature-sheet reads while opening the notification bell."""
-    return _hoja_envios_firma_por_area(area).get_all_records()
+    """La campana reutiliza las lecturas de los listados de envíos."""
+    return _leer_envios_firma_por_area(area)
 
 
 @st.cache_data(ttl=20, max_entries=64, show_spinner=False)
@@ -8614,9 +8632,14 @@ def _hoja_urgencias_por_area(area):
 
 
 def _marcas_urgentes():
+    return _marcas_urgentes_cacheadas(_area_activa_validada())
+
+
+@st.cache_data(ttl=25, max_entries=4, show_spinner=False)
+def _marcas_urgentes_cacheadas(area):
     return {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()):
             str(r.get("Urgente", "")).strip().lower() == "si"
-            for r in _hoja_urgencias().get_all_records()}
+            for r in _hoja_urgencias_por_area(area).get_all_records()}
 
 
 def _actualizar_urgencia(folio, numero, activar):
@@ -8635,6 +8658,7 @@ def _actualizar_urgencia(folio, numero, activar):
         hoja.update(f"A{coincidencias[0]}:E{coincidencias[0]}", [datos], value_input_option="RAW")
     else:
         hoja.append_row(datos, value_input_option="RAW")
+    _marcas_urgentes_cacheadas.clear()
 
 
 def _dias_desde_recepcion(valor):
@@ -10707,14 +10731,17 @@ def _cliente_gspread_minutas_setf():
 
 
 def _hoja_minutas_setf():
-    """Obtiene MINUTAS en su propio libro, sin acceder al libro de DG."""
+    """Comprueba autorización en cada acceso; recurso reutilizado por libro."""
     if _area_activa_validada() != "setf":
         raise PermissionError("La gestión de minutas de SETF no está disponible en DG.")
-    identificador = _id_libro_minutas_setf()
-    # La conexión de Oficios devuelve una Worksheet, no un Client.
-    # No usar `worksheet.spreadsheet.client`: con gspread 6 es HTTPClient.
+    return _hoja_minutas_setf_por_libro(_id_libro_minutas_setf())
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_minutas_setf_por_libro(libro_id):
+    # No se cachean escrituras, solo el cliente y los metadatos de la pestaña.
     cliente = _cliente_gspread_minutas_setf()
-    libro = cliente.open_by_key(identificador)
+    libro = cliente.open_by_key(libro_id)
     try:
         hoja = libro.worksheet("MINUTAS")
     except gspread.WorksheetNotFound as exc:
@@ -10800,6 +10827,20 @@ def _url_minuta_segura(url):
     return valor
 
 
+@st.cache_data(ttl=25, max_entries=4, show_spinner=False)
+def _minutas_vista_compartida(libro_id):
+    """Snapshot de consulta; NUNCA se usa para comprobar escrituras.
+
+    Incluye MINUTAS y auxiliares para evitar tres/cuatro lecturas por clic.
+    """
+    libro, hoja = _hoja_minutas_setf_por_libro(libro_id)
+    return (
+        _filas_minutas_setf(hoja),
+        _filas_minutas_externas_setf(libro),
+        _vinculos_minutas_setf(libro),
+    )
+
+
 def _guardar_minuta_propia_setf(asunto, fecha, proyecto, enlace):
     exigir_sesion()
     if _area_activa_validada() != "setf":
@@ -10867,6 +10908,7 @@ def _guardar_minuta_propia_setf(asunto, fecha, proyecto, enlace):
             raise RuntimeError(
                 "No se pudo confirmar la escritura. Revisa la pestaña MINUTAS antes de intentarlo otra vez."
             )
+    _minutas_vista_compartida.clear()
     return codigo
 
 
@@ -10925,6 +10967,7 @@ def _guardar_minuta_externa_setf(clave, asunto, fecha, proyecto, enlace):
             fecha.strftime("%d/%m/%Y"), _texto_sheets_seguro(proyecto), enlace,
             identificador_sesion(), datetime.now().astimezone().isoformat(timespec="seconds"),
         ], value_input_option="RAW")
+    _minutas_vista_compartida.clear()
     return clave or "Minuta externa registrada"
 
 
@@ -10980,6 +11023,7 @@ def _guardar_vinculo_minuta_setf(registro, url):
                       values=[valores], value_input_option="RAW")
         else:
             ws.append_row(valores, value_input_option="RAW")
+    _minutas_vista_compartida.clear()
     return url
 
 
@@ -11009,6 +11053,7 @@ def _eliminar_vinculo_minuta_setf(registro):
                       values=[valores], value_input_option="RAW")
         else:
             ws.append_row(valores, value_input_option="RAW")
+    _minutas_vista_compartida.clear()
     return True
 
 
@@ -11320,10 +11365,9 @@ def _modulo_minutas_setf():
     try:
         id_libro = _id_libro_minutas_setf()
         libro, hoja = _hoja_minutas_setf()
-        actuales = _filas_minutas_setf(hoja)
-        externas_app = _filas_minutas_externas_setf(libro)
+        # Una instantánea por ventana de caché (no por cada botón o filtro).
+        actuales, externas_app, vinculos_manuales = _minutas_vista_compartida(id_libro)
         total = actuales + externas_app
-        vinculos_manuales = _vinculos_minutas_setf(libro)
         for registro in total:
             enlace_manual = vinculos_manuales.get(_clave_vinculo_minuta_setf(registro))
             if _clave_vinculo_minuta_setf(registro) in vinculos_manuales:
@@ -11846,6 +11890,7 @@ def _reuniones_registrar_historial(libro, id_registro, fila, accion, antes, desp
         json.dumps(antes, ensure_ascii=False),
         json.dumps(despues, ensure_ascii=False),
     ], value_input_option="RAW")
+    _reuniones_historial_compartido.clear()
 
 
 def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antecedente, estado,
@@ -12069,11 +12114,23 @@ def _reuniones_cerrar_programadas_vencidas(libro, hoja, reuniones):
             r["meta"]["estado"] = "Realizada"
 
     _reuniones_avisos_cacheadas.clear()
+    _reuniones_historial_compartido.clear()
     _setf_notificaciones_por_usuario.clear()
     return len(verificadas)
 
 
 def _reuniones_historial(libro, limite=40):
+    _exigir_reuniones_setf()
+    return _reuniones_historial_compartido(_id_libro_minutas_setf(), limite)
+
+
+@st.cache_data(ttl=35, max_entries=8, show_spinner=False)
+def _reuniones_historial_compartido(libro_id, limite=40):
+    libro, _ = _reuniones_hoja_por_libro(libro_id)
+    return _reuniones_historial_sin_cache(libro, limite)
+
+
+def _reuniones_historial_sin_cache(libro, limite=40):
     ws = _reuniones_hoja_auxiliar(libro, _REUNIONES_HIST_TITULO, _REUNIONES_HIST_CABECERAS)
     if ws is None:
         return []
@@ -12688,7 +12745,10 @@ def _modulo_reuniones_setf():
     # La consulta comparte ahora el mismo fondo del módulo completo.
     try:
         libro, ws = _reuniones_hoja()
-        reuniones = _reuniones_leer(libro, ws)
+        # Misma instantánea compartida que utiliza la campana de notificaciones.
+        # _reuniones_leer lee la hoja principal + metadatos, por eso es costosa.
+        # Guardar y editar comprueban SIEMPRE las filas reales bajo bloqueo.
+        reuniones = _reuniones_avisos_cacheadas(_id_libro_minutas_setf())
     except Exception as error:
         st.error(f"No se pudo consultar la agenda SETF: {error}")
         st.info("Comprueba que [setf].minutas_spreadsheet_id apunte a Control Interno SETF, "
