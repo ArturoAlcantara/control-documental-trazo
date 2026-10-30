@@ -3978,8 +3978,15 @@ def _panel_tramites_directos_tte():
             st.caption(f"Responsable: {r.get('Responsable', '')} · "
                        f"{r.get('Asunto', '')}")
             url = str(m.get("URL principal", "")).strip()
-            if url.startswith("https://"):
-                st.link_button("Ver oficio principal en Drive", url, use_container_width=True)
+            directo_doc, directo_relacionados = st.columns([1.85, 1], gap="medium")
+            with directo_doc:
+                st.markdown("**Documento principal · Word / PDF**")
+                if url.startswith("https://"):
+                    st.link_button("Ver oficio principal en Drive", url, use_container_width=True)
+                else:
+                    st.caption("No hay enlace al documento principal registrado.")
+            with directo_relacionados:
+                _documentos_relacionados_revision_tte(r if r else None)
             nuevo_numero_directo = st.text_input("Número del nuevo oficio enviado a firma *", key=f"directo_num_nuevo_{clave}")
             nuevo_asunto_directo = st.text_area("Asunto del nuevo oficio *", key=f"directo_asunto_nuevo_{clave}")
             obs = st.text_area("Observaciones (opcional)", key=f"directo_obs_{clave}", height=68)
@@ -5045,7 +5052,41 @@ def mostrar_documentos(oficio, titulo=True):
                 )
 
 
-def _panel_revision_tte(registro):
+def _documentos_relacionados_revision_tte(oficio):
+    """Consulta de antecedentes y anexos de solo lectura para la Tte.
+
+    Los datos proceden de la lectura de OFICIOS compartida por la bandeja;
+    expandir un panel no dispara nuevas solicitudes a Google Sheets.
+    """
+    st.markdown(
+        '<div class="tte-related-title notranslate" translate="no" lang="es-MX">'
+        '<span class="tte-module-overline">DOCUMENTACIÓN VINCULADA</span>'
+        '<strong>Antecedentes y anexos</strong>'
+        '<small>Archivos de apoyo para la revisión institucional</small>'
+        '</div>', unsafe_allow_html=True,
+    )
+    if oficio is None:
+        st.info("No se pudo consultar la documentación relacionada de este oficio.")
+        return
+
+    for titulo, campo, icono, singular in (
+        ("Antecedentes", "Antecedente", "▤", "antecedente"),
+        ("Anexos", "Anexo", "◇", "anexo"),
+    ):
+        documentos = leer_documentos(oficio.get(campo, ""))
+        with st.expander(f"{icono} {titulo} ({len(documentos)})", expanded=False):
+            if not documentos:
+                st.caption(f"Sin {titulo.lower()} vinculados al oficio.")
+            for documento in documentos:
+                url = documento.get("url", "")
+                if url:
+                    st.link_button(
+                        documento.get("nombre") or f"Abrir {singular}",
+                        url, use_container_width=True,
+                    )
+
+
+def _panel_revision_tte(registro, oficio_relacionado=None):
     """Vista ligera exclusiva para la Tte.; conserva el flujo de Sheets/Drive."""
     import html
 
@@ -5122,6 +5163,36 @@ def _panel_revision_tte(registro):
         background:#FAFBF6!important;
         border-color:#B4C1A8!important;
         border-radius:9px!important;
+    }
+    /* Consulta en dos paneles: Word/PDF (65%) y documentación asociada (35%). */
+    .stMainBlockContainer div[class*="st-key-tte_doc_principal_"] {
+        background:#FCFDFB!important;
+        border:1px solid #BAC9B6!important;
+        border-radius:11px!important;
+        padding:14px 15px!important;
+        box-shadow:0 3px 9px rgba(47,74,47,.045)!important;
+    }
+    .stMainBlockContainer div[class*="st-key-tte_doc_relacionados_"] {
+        background:#FFFEFB!important;
+        border:1px solid #D4C8B4!important;
+        border-radius:11px!important;
+        padding:14px 14px!important;
+        box-shadow:0 3px 9px rgba(71,61,45,.045)!important;
+    }
+    div[class*="st-key-tte_doc_relacionados_"] [data-testid="stExpander"] {
+        border:1px solid #D7DCD2!important;
+        border-radius:9px!important;
+        background:#FAFBF8!important;
+    }
+    .tte-related-title {
+        display:flex;flex-direction:column;gap:3px;
+        border-bottom:1px solid #DFE4DA;padding-bottom:11px;margin-bottom:8px;
+    }
+    .tte-related-title strong {
+        font-size:15px!important;color:#314939!important;line-height:1.35!important;
+    }
+    .tte-related-title small {
+        font-size:11px!important;color:#6D7A6D!important;line-height:1.45!important;
     }
     /* Secciones Word/PDF: que se lean como parte de consulta documental. */
     .stMainBlockContainer div[class*="st-key-tte_consulta_panel_"] [class*="st-key-tte_doc_"] {
@@ -5249,29 +5320,33 @@ def _panel_revision_tte(registro):
                 unsafe_allow_html=True,
             )
             # Nombre íntegro en el tooltip; en pantalla no domina toda la ficha.
-            nombre_breve = nombre if len(nombre) <= 86 else nombre[:82] + "…"
-            st.markdown(
-                '<div class="tte-document-line notranslate" translate="no" lang="es-MX">'
-                '<span aria-hidden="true">📄</span><div>'
-                '<strong>Versión vigente</strong>'
-                f'<small title="{html.escape(nombre, quote=True)}">{html.escape(nombre_breve)}</small>'
-                '</div></div>', unsafe_allow_html=True,
-            )
-
-            # Descargar/visualizar el mismo original privado; lógica sin cambios.
-            _botones_word_y_pdf(drive_id, nombre, f"tte_{folio}_{numero}_{version}")
-
-            with st.expander("Historial PDF · versiones anteriores", expanded=False):
-                try:
-                    versiones = _borradores_expediente(folio, numero)
-                    anteriores = [v for v in versiones if int(v.get("Version") or 0) < version]
-                    eventos = _eventos_expediente(folio, numero)
-                    _mostrar_historial_pdf_por_version(
-                        folio, numero, anteriores, eventos,
-                        actual=next((v for v in versiones if int(v.get("Version") or 0) == version), None),
+            col_documento, col_relacionados = st.columns([1.85, 1], gap="medium")
+            with col_documento:
+                with st.container(key=f"tte_doc_principal_{clave}", border=True):
+                    # Se conserva el mismo visor privado y su historial.
+                    nombre_breve = nombre if len(nombre) <= 86 else nombre[:82] + "…"
+                    st.markdown(
+                        '<div class="tte-document-line notranslate" translate="no" lang="es-MX">'
+                        '<span aria-hidden="true">📄</span><div>'
+                        '<strong>Versión vigente · Word / PDF</strong>'
+                        f'<small title="{html.escape(nombre, quote=True)}">{html.escape(nombre_breve)}</small>'
+                        '</div></div>', unsafe_allow_html=True,
                     )
-                except Exception as error:
-                    st.warning(f"Historial temporalmente no disponible: {_mensaje_error_sheets(error)}")
+                    _botones_word_y_pdf(drive_id, nombre, f"tte_{folio}_{numero}_{version}")
+                    with st.expander("Historial PDF · versiones anteriores", expanded=False):
+                        try:
+                            versiones = _borradores_expediente(folio, numero)
+                            anteriores = [v for v in versiones if int(v.get("Version") or 0) < version]
+                            eventos = _eventos_expediente(folio, numero)
+                            _mostrar_historial_pdf_por_version(
+                                folio, numero, anteriores, eventos,
+                                actual=next((v for v in versiones if int(v.get("Version") or 0) == version), None),
+                            )
+                        except Exception as error:
+                            st.warning(f"Historial temporalmente no disponible: {_mensaje_error_sheets(error)}")
+            with col_relacionados:
+                with st.container(key=f"tte_doc_relacionados_{clave}", border=True):
+                    _documentos_relacionados_revision_tte(oficio_relacionado)
 
         st.markdown(
             '<div class="tte-stage-separator" aria-hidden="true">'
@@ -5758,6 +5833,7 @@ def _bandeja_borradores_compartida():
         )
         # Tres indicadores para la Tte. basados en registros y bitácora reales.
         por_revisar, recibidos_semana, pendientes_totales = _resumen_revision_tte(ultimos, recibidos)
+        oficios_actuales = {}  # Reutilizada por las tarjetas y por la cuenta de la Tte.
         try:
             oficios_actuales = {(str(x.get("Folio", "")).strip(),
                                  str(x.get("No. de oficio", "")).strip()): x
@@ -5869,7 +5945,9 @@ def _bandeja_borradores_compartida():
         else:
             st.caption(f"{len(recibidos)} documento(s) en la bandeja · Seleccione la decisión dentro de cada expediente.")
             for r in recibidos:
-                _panel_revision_tte(r)
+                clave_oficio = (str(r.get("Folio", "")).strip(),
+                               str(r.get("No. de oficio", "")).strip())
+                _panel_revision_tte(r, oficios_actuales.get(clave_oficio))
         # Una entrada directa no tiene filas en BORRADORES: se consulta aquí
         # independientemente del proceso ordinario.
         _panel_tramites_directos_tte()
