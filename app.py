@@ -1294,6 +1294,7 @@ def _eventos_expediente(folio, numero):
 
 ETAPA_CORRECCIONES = "Correcciones solicitadas por la Tte."
 ETAPA_FIRMA = "En proceso de firma"
+ETAPA_APROBADO = "Autorizado por la Tte. · pendiente de formalización"
 ETAPA_ARCHIVADO = "Firmado y archivado"
 ETAPA_RETORNO_FIRMA = "Devuelto de firma para correcciones"
 
@@ -1432,6 +1433,36 @@ def _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto):
     _setf_notificaciones_por_usuario.clear()
 
 
+def _puede_formalizar_para_firma(folio, numero):
+    """Solo Gestión Documental o el responsable vigente; nunca la cuenta revisora."""
+    if puede_realizar_revision_final() and not puede_gestionar_borradores():
+        return False
+    if puede_gestionar_borradores():
+        return True
+    if _area_activa_validada() != "setf":
+        return False
+    oficio = _verificar_expediente_documental(folio, numero)
+    return bool(puede_editar_responsable(oficio.get("Responsable", "")))
+
+
+def _formalizar_envio_firma_borrador(folio, numero, nuevo_numero, nuevo_asunto):
+    """Solo tras aprobación. Contabiliza la salida real, nunca el dictamen."""
+    if not _puede_formalizar_para_firma(folio, numero):
+        raise PermissionError("Solo el responsable o Gestión Documental puede formalizar este oficio.")
+    # Consulta fresca para validar el estado real, sin confiar en Session State.
+    hoja = _hoja_borradores()
+    filas = hoja.get_all_values()[1:]
+    matches = [r for r in filas if len(r) >= 8
+               and r[0].strip() == str(folio).strip()
+               and r[1].strip() == str(numero).strip()]
+    if not matches or max(matches, key=lambda r: int(r[3] or 0))[7] != ETAPA_APROBADO:
+        raise ValueError("El dictamen ya no está pendiente de formalización. Actualiza la vista.")
+    _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto)
+    _actualizar_oficio_flujo(folio, numero, {"Estatus": "En firma"}, formalizacion_responsable=True)
+    _cambiar_etapa_borrador(folio, numero, ETAPA_FIRMA,
+                           f"Número del oficio enviado: {nuevo_numero.strip()} | Asunto: {nuevo_asunto.strip()}")
+
+
 def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
     oficio = _verificar_expediente_documental(folio, numero)
     hoja = _hoja_borradores()
@@ -1454,7 +1485,9 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
         (actual in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA)
          and etapa_nueva == ETAPA_TTE
          and (admin or (_area_activa_validada() == "setf" and auxiliar))) or
-        (actual == ETAPA_TTE and etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_FIRMA) and tte) or
+        (actual == ETAPA_TTE and etapa_nueva in (ETAPA_CORRECCIONES, ETAPA_APROBADO) and tte) or
+        (actual == ETAPA_APROBADO and etapa_nueva == ETAPA_FIRMA
+         and _puede_formalizar_para_firma(folio, numero)) or
         (actual == ETAPA_FIRMA and etapa_nueva in (ETAPA_RETORNO_FIRMA, ETAPA_ARCHIVADO) and admin)
     )
     if not permitido:
@@ -1471,7 +1504,8 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
         st.warning(f"Se actualizó la etapa, pero no se pudo escribir en la bitácora: {error}")
 
 
-def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
+def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False,
+                            formalizacion_responsable=False):
     """Actualización restringida del flujo; no permite modificar otros campos.
 
     Reutiliza la validación de fila y el batch existente, pero habilita a la Tte.
@@ -1482,8 +1516,11 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
         raise ValueError("Se intentó modificar un campo ajeno al proceso de firma.")
     if autorizacion_tte:
         exigir_permiso_revision_final()
-        if set(cambios) != {"Estatus"} or cambios["Estatus"] not in ("En firma", "En correcciones"):
-            raise PermissionError("La Tte. solo puede autorizar la firma o solicitar correcciones.")
+        if set(cambios) != {"Estatus"} or cambios["Estatus"] not in ("Autorizado para firma", "En correcciones"):
+            raise PermissionError("La Tte. solo puede emitir un dictamen o solicitar correcciones.")
+    elif formalizacion_responsable:
+        if cambios != {"Estatus": "En firma"} or not _puede_formalizar_para_firma(folio, numero):
+            raise PermissionError("La formalización corresponde al responsable o Gestión Documental.")
     else:
         # En SETF el responsable asignado puede mandar su propio Word
         # directamente a revisión de la Tte.; DG conserva sus revisores.
@@ -1514,7 +1551,9 @@ def _actualizar_oficio_flujo(folio, numero, cambios, *, autorizacion_tte=False):
     if len(coincidencias) != 1:
         raise ValueError("El oficio no se encontró de forma única en OFICIOS.")
     fila_num, actual = coincidencias[0]
-    if not autorizacion_tte:
+    if formalizacion_responsable and campo(actual, "Estatus") not in ("Autorizado para firma", "En firma"):
+        raise ValueError("El expediente no está autorizado para formalización.")
+    if not autorizacion_tte and not formalizacion_responsable:
         # SETF: el responsable asignado o administrador documental autorizado
         # puede enviar su documento a revisión; el flujo DG no se altera.
         if _area_activa_validada() == "setf" and cambios == {"Estatus": "En revisión"}:
@@ -2106,7 +2145,8 @@ def _mostrar_movimientos_version(movimientos, numero_version, resumen_actual=Fal
     acciones_decision = {
         ETAPA_CORRECCIONES: ("↩ Correcciones solicitadas por la Tte.", False),
         ETAPA_RETORNO_FIRMA: ("↩ Correcciones posteriores a firma", False),
-        ETAPA_FIRMA: ("✓ Autorizado para firma por la Tte.", True),
+        ETAPA_FIRMA: ("↗ Enviado a firma por Gestión Documental", True),
+        ETAPA_APROBADO: ("✓ Autorizado para formalización por la Tte.", True),
     }
     decisiones = [e for e in movimientos if str(e.get("Accion") or "").strip() in acciones_decision]
     secundarios = [e for e in movimientos if str(e.get("Accion") or "").strip() not in acciones_decision]
@@ -2160,7 +2200,7 @@ def _mostrar_historial_pdf_por_version(folio, numero, versiones_anteriores, movi
     from hashlib import sha256
     _historial_version_estilos()
     por_version, sin_version = _eventos_agrupados_por_version(movimientos)
-    acciones_decision = {ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA, ETAPA_FIRMA}
+    acciones_decision = {ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA, ETAPA_APROBADO, ETAPA_FIRMA}
     if not versiones_anteriores:
         st.caption("Todavía no hay versiones anteriores.")
     for v in sorted(versiones_anteriores, key=lambda x: int(x.get("Version") or 0), reverse=True):
@@ -2703,6 +2743,7 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
             ETAPA_BORRADOR: "Borrador listo",
             ETAPA_ENVIADO: "Revisión inicial",
             ETAPA_TTE: "En revisión",
+            ETAPA_APROBADO: "Pendiente de formalización",
             ETAPA_CORRECCIONES: "Requiere ajustes",
             ETAPA_FIRMA: "En firma",
             ETAPA_RETORNO_FIRMA: "Ajustes de firma",
@@ -2891,11 +2932,7 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
         with st.form(key=f"doc_revision_tte_{folio}_{numero}"):
             decision = st.radio("Resultado de la revisión", ["Autorizar para firma", "Solicitar correcciones"],
                                 horizontal=True)
-            if decision == "Autorizar para firma":
-                nuevo_numero_firma = st.text_input("Número del nuevo oficio enviado a firma *", key=f"firma_num_doc_{folio}_{numero}")
-                nuevo_asunto_firma = st.text_area("Asunto del nuevo oficio *", key=f"firma_asunto_doc_{folio}_{numero}")
-            else:
-                nuevo_numero_firma, nuevo_asunto_firma = "", ""
+            st.caption("El número y asunto del nuevo oficio los registrará el responsable o Gestión Documental.")
             comentario = st.text_area("Observaciones de revisión (opcional)",
                                       placeholder="Puedes dejar indicaciones o continuar sin comentarios")
             archivo_tte = (st.file_uploader("Word o PDF con modificaciones de la Tte. (opcional)",
@@ -2905,21 +2942,34 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
             enviar = st.form_submit_button("Registrar decisión", type="primary", use_container_width=True)
         if enviar:
             try:
-                nueva = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
+                nueva = ETAPA_APROBADO if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
                 # Registrar primero el adjunto para evitar que quede inaccesible
                 # si el expediente cambia de etapa durante la operación.
                 if nueva == ETAPA_CORRECCIONES and archivo_tte is not None:
                     with st.spinner("Guardando documento corregido en Drive..."):
                         _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
-                if nueva == ETAPA_FIRMA:
-                    _registrar_envio_firma(folio, numero, nuevo_numero_firma, nuevo_asunto_firma)
                 _actualizar_oficio_flujo(folio, numero, {
-                    "Estatus": "En firma" if nueva == ETAPA_FIRMA else "En correcciones"
+                    "Estatus": "Autorizado para firma" if nueva == ETAPA_APROBADO else "En correcciones"
                 }, autorizacion_tte=True)
                 _cambiar_etapa_borrador(folio, numero, nueva, comentario)
                 st.rerun()
             except Exception as error:
                 st.error(str(error))
+    elif etapa == ETAPA_APROBADO and _puede_formalizar_para_firma(folio, numero):
+        st.success("La Tte. autorizó este documento. Falta formalizar el envío a firma.")
+        st.caption("El número y el asunto del nuevo oficio corresponden al responsable o a Gestión Documental.")
+        with st.form(key=f"formalizar_borrador_{folio}_{numero}"):
+            nuevo_numero = st.text_input("Número del nuevo oficio enviado a firma *")
+            nuevo_asunto = st.text_area("Asunto del nuevo oficio *", height=85)
+            registrar = st.form_submit_button("Registrar envío a firma →", type="primary", use_container_width=True)
+        if registrar:
+            try:
+                with st.spinner("Registrando el envío real a firma..."):
+                    _formalizar_envio_firma_borrador(folio, numero, nuevo_numero, nuevo_asunto)
+                st.success("Envío formalizado y registrado en la bitácora.")
+                st.rerun()
+            except Exception as error:
+                st.error(_mensaje_error_sheets(error))
     elif etapa == ETAPA_FIRMA and admin:
         st.caption("Registra el resultado de la firma externa; se actualizará OFICIOS y el historial.")
         # El selector fuera del formulario permite mostrar los campos necesarios inmediatamente.
@@ -3246,7 +3296,7 @@ def actualizar_campo_oficio(folio_original, numero_original, columna, nuevo_valo
 def actualizar_estatus_y_entrega(folio_original, numero_original, nuevo_estatus, fecha_entrega):
     """Guarda juntos el estatus y la fecha; conserva documentos ya archivados."""
     if nuevo_estatus not in ESTATUS_OFICIOS:
-        raise ValueError("Selecciona uno de los seis estatus permitidos.")
+        raise ValueError("Selecciona uno de los estatus permitidos.")
     if nuevo_estatus == "Firmado" and not fecha_entrega:
         raise ValueError("Debes seleccionar una fecha de entrega para un oficio firmado.")
 
@@ -3337,6 +3387,7 @@ ESTATUS_OFICIOS = [
     "En elaboración",
     "En correcciones",
     "En revisión",
+    "Autorizado para firma",
     "En firma",
     "Firmado",
     "Recaído",
@@ -3710,14 +3761,12 @@ def _autorizar_tramite_directo(folio, numero, autorizar, observaciones="", nuevo
                      and str(r.get("No. de oficio", "")).strip() == str(numero).strip()]
     if len(coincidencias) != 1 or str(coincidencias[0].get("Estatus", "")).strip() != "En revisión":
         raise ValueError("El oficio ya no espera revisión, o no es único en OFICIOS.")
-    nuevo = "En firma" if autorizar else "En correcciones"
-    if autorizar:
-        _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto)
+    nuevo = "Autorizado para firma" if autorizar else "En correcciones"
     # El origen/versión 0 distingue al trámite directo de los borradores.
     _actualizar_oficio_flujo(folio, numero, {"Estatus": nuevo}, autorizacion_tte=True)
     try:
         _registrar_evento_borrador(
-            folio, numero, 0, ETAPA_FIRMA if autorizar else ETAPA_CORRECCIONES,
+            folio, numero, 0, ETAPA_APROBADO if autorizar else ETAPA_CORRECCIONES,
             "Trámite directo: " + (observaciones.strip() or "Sin observaciones")
         )
     except Exception as error:
@@ -3732,10 +3781,29 @@ def _autorizar_tramite_directo(folio, numero, autorizar, observaciones="", nuevo
                    "actualizar la ficha auxiliar: " + str(error))
 
 
+def _formalizar_envio_firma_directo(folio, numero, nuevo_numero, nuevo_asunto):
+    if not _puede_formalizar_para_firma(folio, numero):
+        raise PermissionError("La formalización corresponde al responsable o Gestión Documental.")
+    # Leer estado auxiliar directamente para evitar aprobar dos veces el mismo envío.
+    hoja = _hoja_modalidades()
+    filas = hoja.get_all_values()[1:]
+    coincidentes = [r for r in filas if len(r) >= 7 and r[0].strip() == str(folio).strip()
+                    and r[1].strip() == str(numero).strip()]
+    if len(coincidentes) != 1 or coincidentes[0][2] != "Directo" or coincidentes[0][6] != "Autorizado para firma":
+        raise ValueError("El trámite directo ya no espera formalización.")
+    _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto)
+    _actualizar_oficio_flujo(folio, numero, {"Estatus": "En firma"}, formalizacion_responsable=True)
+    _actualizar_datos_directo_revisor(folio, numero, "Autorizado para firma", "En firma")
+    _registrar_evento_borrador(folio, numero, 0, ETAPA_FIRMA,
+                               f"Envío formalizado: {nuevo_numero.strip()} | {nuevo_asunto.strip()}")
+
+
 def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo,
                                    nombre_principal=None, url_principal=None):
     """Actualización auxiliar para John/Alejandra sin modificar los permisos de la Tte."""
-    exigir_permiso_borradores()
+    if not (estado_previo == "Autorizado para firma" and estado_nuevo == "En firma"
+            and _puede_formalizar_para_firma(folio, numero)):
+        exigir_permiso_borradores()
     hoja = _hoja_modalidades()
     valores = hoja.get_all_values()
     filas = [(i, r) for i, r in enumerate(valores[1:], start=2)
@@ -3747,6 +3815,9 @@ def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo
     if anterior[2] != "Directo" or anterior[6] != estado_previo:
         raise ValueError("El trámite directo cambió de etapa. Actualiza la bandeja.")
     cambios = {7: estado_nuevo}
+    if estado_nuevo == "En firma":
+        from zoneinfo import ZoneInfo
+        cambios[10] = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
     if nombre_principal is not None:
         cambios[5] = nombre_principal
     if url_principal is not None:
@@ -3817,17 +3888,23 @@ def _reenviar_tramite_directo(folio, numero, nombre, url):
 
 def _panel_directos_para_revisores():
     """Recibir firmas y reentregar directos, sin modificar el flujo Word ordinario."""
-    if not puede_gestionar_borradores():
+    administrador_directo = puede_gestionar_borradores()
+    if not administrador_directo and _area_activa_validada() != "setf":
         return
     try:
         todos = _leer_modalidades()
         directos = [m for m in todos if m.get("Tipo de trámite") == "Directo"
-                    and m.get("Estado directo") in ("En firma", "En correcciones")]
+                    and m.get("Estado directo") in ("Autorizado para firma", "En firma", "En correcciones")]
         estados = {(str(x.get("Folio", "")).strip(), str(x.get("No. de oficio", "")).strip()): x
                    for x in _leer_registros_oficios()}
         directos = [m for m in directos
                     if str(estados.get((str(m.get("Folio", "")).strip(),
-                                        str(m.get("No. de oficio", "")).strip()), {}).get("Estatus", "")).strip() == m.get("Estado directo")]
+                                        str(m.get("No. de oficio", "")).strip()), {}).get("Estatus", "")).strip() == m.get("Estado directo")
+                    and (administrador_directo or
+                         (m.get("Estado directo") == "Autorizado para firma"
+                          and not puede_realizar_revision_final()
+                          and puede_editar_responsable(estados.get((str(m.get("Folio", "")).strip(),
+                                          str(m.get("No. de oficio", "")).strip()), {}).get("Responsable", ""))))]
     except Exception as error:
         st.warning("Trámites directos: no se pudo leer la información auxiliar: " + str(error))
         return
@@ -3844,7 +3921,21 @@ def _panel_directos_para_revisores():
             enlace = str(m.get("URL principal", "")).strip()
             if enlace.startswith("https://"):
                 st.link_button("Oficio principal (Drive)", enlace, use_container_width=True)
-            if estado == "En correcciones":
+            if estado == "Autorizado para firma":
+                st.success("Dictamen favorable de la Tte. · Pendiente de número y asunto del oficio.")
+                with st.form(key=f"directo_formalizar_{clave}"):
+                    nuevo_numero = st.text_input("Número del nuevo oficio enviado a firma *")
+                    nuevo_asunto = st.text_area("Asunto del nuevo oficio *", height=85)
+                    guardar = st.form_submit_button("Formalizar envío a firma →", type="primary",
+                                                   use_container_width=True)
+                if guardar:
+                    try:
+                        _formalizar_envio_firma_directo(folio, numero, nuevo_numero, nuevo_asunto)
+                        st.success("Envío a firma registrado correctamente.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(_mensaje_error_sheets(error))
+            elif estado == "En correcciones":
                 try:
                     eventos_directos = _eventos_expediente(folio, numero)
                     for evento_directo in eventos_directos:
@@ -3987,33 +4078,66 @@ def _panel_tramites_directos_tte():
                     st.caption("No hay enlace al documento principal registrado.")
             with directo_relacionados:
                 _documentos_relacionados_revision_tte(r if r else None)
-            nuevo_numero_directo = st.text_input("Número del nuevo oficio enviado a firma *", key=f"directo_num_nuevo_{clave}")
-            nuevo_asunto_directo = st.text_area("Asunto del nuevo oficio *", key=f"directo_asunto_nuevo_{clave}")
-            obs = st.text_area("Observaciones (opcional)", key=f"directo_obs_{clave}", height=68)
-            adjunto_directo = st.file_uploader(
-                "Word o PDF con correcciones (opcional)", type=["docx", "pdf"],
-                key=f"directo_adj_tte_{clave}",
-            )
-            confirm = st.checkbox("Confirmo que revisé el oficio", key=f"directo_confirm_{clave}")
-            a, b = st.columns(2)
-            with a:
-                aprobar = st.button("Autorizar envío a firma", key=f"directo_ok_{clave}",
-                                    use_container_width=True, type="primary")
-            with b:
-                devolver = st.button("Solicitar correcciones", key=f"directo_regresar_{clave}",
-                                     use_container_width=True)
-            if aprobar or devolver:
-                if not confirm:
-                    st.warning("Confirma la revisión antes de emitir la decisión.")
-                else:
+            st.caption("El número y asunto del nuevo oficio serán registrados por el responsable o Gestión Documental.")
+            decision_key = f"directo_decision_tte_{clave}"
+            if st.session_state.get(decision_key) not in ("Autorizar para firma", "Solicitar correcciones"):
+                st.session_state[decision_key] = "Autorizar para firma"
+            op1, op2 = st.columns(2, gap="medium")
+            with op1:
+                with st.container(key=f"tte_dict_choice_accept_{'selected' if st.session_state[decision_key]=='Autorizar para firma' else 'idle'}_directo_{clave}"):
+                    if st.button("Autorizar para firma", key=f"directo_tte_aceptar_{clave}",
+                                 use_container_width=True):
+                        st.session_state[decision_key] = "Autorizar para firma"
+                        st.session_state.pop(f"directo_dict_pendiente_{clave}", None)
+                        st.rerun()
+            with op2:
+                with st.container(key=f"tte_dict_choice_return_{'selected' if st.session_state[decision_key]=='Solicitar correcciones' else 'idle'}_directo_{clave}"):
+                    if st.button("Solicitar correcciones", key=f"directo_tte_corregir_{clave}",
+                                 use_container_width=True):
+                        st.session_state[decision_key] = "Solicitar correcciones"
+                        st.session_state.pop(f"directo_dict_pendiente_{clave}", None)
+                        st.rerun()
+            decision = st.session_state[decision_key]
+            with st.form(key=f"directo_dict_form_{clave}"):
+                obs = st.text_area("Comentarios de revisión (opcional)",
+                                   placeholder="Agrega indicaciones si hace falta...",
+                                   key=f"directo_obs_{clave}", height=80)
+                adjunto_directo = None
+                if decision == "Solicitar correcciones":
+                    with st.expander("Adjuntar Word o PDF con correcciones (opcional)", expanded=False):
+                        adjunto_directo = st.file_uploader("Archivo .docx o .pdf", type=["docx", "pdf"],
+                                                           key=f"directo_adj_tte_{clave}")
+                continuar = st.form_submit_button("Continuar con dictamen →", type="primary",
+                                                   use_container_width=True)
+            confirm_key = f"directo_dict_pendiente_{clave}"
+            if continuar:
+                st.session_state[confirm_key] = {"decision": decision, "obs": obs.strip()}
+            pendiente = st.session_state.get(confirm_key)
+            if pendiente and pendiente.get("decision") == decision:
+                st.info("Confirma la autorización; quedará pendiente de formalización." if decision == "Autorizar para firma"
+                        else "Confirma la devolución para correcciones.")
+                ok, cancelar = st.columns([2, 1])
+                with ok:
+                    confirmar = st.button("Confirmar dictamen", key=f"directo_tte_confirmar_{clave}",
+                                          type="primary", use_container_width=True)
+                with cancelar:
+                    descartar = st.button("Cancelar", key=f"directo_tte_cancelar_{clave}",
+                                          use_container_width=True)
+                if descartar:
+                    st.session_state.pop(confirm_key, None)
+                    st.rerun()
+                if confirmar:
                     try:
-                        if devolver and adjunto_directo is not None:
+                        if decision == "Solicitar correcciones" and adjunto_directo is not None:
                             _adjuntar_correccion_directo_tte(folio, numero, adjunto_directo)
-                        _autorizar_tramite_directo(folio, numero, aprobar, obs, nuevo_numero_directo, nuevo_asunto_directo)
-                        st.success("Decisión registrada y expediente actualizado.")
+                        _autorizar_tramite_directo(folio, numero,
+                                                   decision == "Autorizar para firma", pendiente["obs"])
+                        st.session_state.pop(confirm_key, None)
+                        st.success("Dictamen registrado correctamente.")
                         st.rerun()
                     except Exception as error:
-                        st.error(str(error))
+                        st.error(_mensaje_error_sheets(error))
+
 
 
 # =========================================================
@@ -5668,6 +5792,7 @@ def _panel_revision_tte(registro, oficio_relacionado=None):
                         help="Documento validado para continuar con el proceso de firma.",
                     ):
                         st.session_state[decision_key] = "Autorizar para firma"
+                        st.session_state.pop(f"tte_dict_confirmacion_{clave}", None)
                         st.rerun()
             with col_correcciones:
                 with st.container(key=f"tte_dict_choice_return_{'selected' if st.session_state[decision_key] == 'Solicitar correcciones' else 'idle'}_{clave}"):
@@ -5678,63 +5803,74 @@ def _panel_revision_tte(registro, oficio_relacionado=None):
                         help="Devolver el documento con las observaciones necesarias.",
                     ):
                         st.session_state[decision_key] = "Solicitar correcciones"
+                        st.session_state.pop(f"tte_dict_confirmacion_{clave}", None)
                         st.rerun()
             decision = st.session_state[decision_key]
+            st.markdown(
+                '<div class="dictamen-descripcion" style="margin:10px 0 6px">'
+                'La Tte. únicamente emite el dictamen. El número y asunto del oficio '
+                'los registrará posteriormente el responsable o Gestión Documental.'
+                '</div>', unsafe_allow_html=True)
             with st.form(key=f"tte_form_{clave}"):
-                if decision == "Autorizar para firma":
-                    nuevo_numero_firma = st.text_input("Número del nuevo oficio enviado a firma *", key=f"tte_num_nuevo_{clave}")
-                    nuevo_asunto_firma = st.text_area("Asunto del nuevo oficio *", key=f"tte_asunto_nuevo_{clave}")
-                else:
-                    nuevo_numero_firma, nuevo_asunto_firma = "", ""
-                if decision == "Solicitar correcciones":
-                    archivo_tte = st.file_uploader(
-                        "Word o PDF con modificaciones de la Tte. (opcional)",
-                        type=["docx", "pdf"], key=f"tte_word_devolucion_{clave}",
-                        help=("Adjunto opcional. El personal autorizado de SETF podrá consultarlo en Drive como Word o PDF."
-                              if _area_activa_validada() == "setf" else
-                              "Adjunto opcional. John y Alejandra podrán consultarlo en Drive como Word o PDF."),
-                    )
-                    comentario = st.text_area(
-                        "Comentarios u observaciones (opcional)",
-                        placeholder="Indica las correcciones necesarias para esta versión...",
-                        key=f"tte_observaciones_{clave}", height=76,
-                    )
-                else:
-                    comentario = st.text_area(
-                        "Observaciones adicionales (opcional)",
-                        placeholder="Agrega una indicación para el trámite de firma, si hace falta...",
-                        key=f"tte_observaciones_{clave}", height=76,
-                    )
-                confirmado = st.checkbox(
-                    "Confirmo que revisé el documento y deseo registrar esta decisión.",
-                    key=f"tte_confirmar_{clave}",
+                comentario = st.text_area(
+                    "Comentarios de revisión (opcional)",
+                    placeholder=("Puedes agregar una indicación para el trámite de firma..."
+                                 if decision == "Autorizar para firma"
+                                 else "Puedes describir los ajustes solicitados..."),
+                    key=f"tte_observaciones_{clave}", height=85,
                 )
-                enviar = st.form_submit_button(
-                    "✓ Autorizar y enviar a firma →" if decision == "Autorizar para firma"
-                    else "↶ Devolver para correcciones →",
+                archivo_tte = None
+                if decision == "Solicitar correcciones":
+                    with st.expander("Adjuntar Word o PDF con correcciones (opcional)", expanded=False):
+                        archivo_tte = st.file_uploader(
+                            "Documento de apoyo (.docx o .pdf)", type=["docx", "pdf"],
+                            key=f"tte_word_devolucion_{clave}",
+                        )
+                continuar = st.form_submit_button(
+                    "Continuar con la autorización →" if decision == "Autorizar para firma"
+                    else "Continuar con la devolución →",
                     type="primary", use_container_width=True,
                 )
-        if enviar:
-            if not confirmado:
-                st.warning("Marque la confirmación antes de registrar su decisión.")
-            else:
-                try:
-                    nueva_etapa = ETAPA_FIRMA if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
-                    with st.spinner("Registrando decisión..."):
-                        # Guardar primero el adjunto opcional para que quede asociado
-                        # a la devolución vigente en EVENTOS_BORRADORES.
-                        if nueva_etapa == ETAPA_CORRECCIONES and archivo_tte is not None:
-                            _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
-                        if nueva_etapa == ETAPA_FIRMA:
-                            _registrar_envio_firma(folio, numero, nuevo_numero_firma, nuevo_asunto_firma)
-                        _actualizar_oficio_flujo(folio, numero, {
-                            "Estatus": "En firma" if nueva_etapa == ETAPA_FIRMA else "En correcciones"
-                        }, autorizacion_tte=True)
-                        _cambiar_etapa_borrador(folio, numero, nueva_etapa, comentario.strip())
-                    st.success("Decisión registrada correctamente.")
+            confirm_key = f"tte_dict_confirmacion_{clave}"
+            if continuar:
+                st.session_state[confirm_key] = {"decision": decision, "comentario": comentario.strip()}
+            pendiente = st.session_state.get(confirm_key)
+            if pendiente and pendiente.get("decision") == decision:
+                titulo_confirmar = ("Autorizar documento" if decision == "Autorizar para firma"
+                                   else "Devolver para correcciones")
+                st.info(
+                    f"Confirma la decisión: **{titulo_confirmar}**. "
+                    + ("El oficio quedará pendiente de formalización por su responsable."
+                       if decision == "Autorizar para firma"
+                       else "El expediente regresará al responsable para ajustes.")
+                )
+                c_si, c_no = st.columns([2, 1])
+                with c_si:
+                    confirmar = st.button("Confirmar dictamen", type="primary",
+                                          key=f"tte_confirmar_dict_{clave}", use_container_width=True)
+                with c_no:
+                    cancelar = st.button("Cancelar", key=f"tte_cancelar_dict_{clave}",
+                                         use_container_width=True)
+                if cancelar:
+                    st.session_state.pop(confirm_key, None)
                     st.rerun()
-                except Exception as error:
-                    st.error(_mensaje_error_sheets(error))
+                if confirmar:
+                    try:
+                        nueva_etapa = ETAPA_APROBADO if decision == "Autorizar para firma" else ETAPA_CORRECCIONES
+                        with st.spinner("Registrando dictamen y comprobando el expediente..."):
+                            if nueva_etapa == ETAPA_CORRECCIONES and archivo_tte is not None:
+                                _adjuntar_documento_corregido_tte(folio, numero, archivo_tte)
+                            _actualizar_oficio_flujo(folio, numero, {
+                                "Estatus": ("Autorizado para firma" if nueva_etapa == ETAPA_APROBADO
+                                            else "En correcciones")
+                            }, autorizacion_tte=True)
+                            _cambiar_etapa_borrador(folio, numero, nueva_etapa,
+                                                   pendiente["comentario"])
+                        st.session_state.pop(confirm_key, None)
+                        st.success("Dictamen registrado. El responsable podrá continuar la formalización desde su expediente.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(_mensaje_error_sheets(error))
 
         # Cierre visual: identifica el límite del expediente cuando hay varios.
         st.markdown(
@@ -5759,7 +5895,7 @@ def _resumen_revision_tte(ultimos, recibidos):
     from datetime import timedelta
 
     total_pendientes = sum(
-        str(registro.get("Etapa", "")).strip() in {ETAPA_TTE, ETAPA_FIRMA}
+        str(registro.get("Etapa", "")).strip() in {ETAPA_TTE, ETAPA_APROBADO, ETAPA_FIRMA}
         for registro in ultimos.values()
     )
     try:
@@ -5804,7 +5940,8 @@ def _bandeja_borradores_compartida():
     if puede_realizar_revision_final():
         etapas = {ETAPA_TTE}
     elif puede_gestionar_borradores():
-        etapas = {ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES, ETAPA_RETORNO_FIRMA, ETAPA_FIRMA}
+        etapas = {ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES,
+                  ETAPA_RETORNO_FIRMA, ETAPA_APROBADO, ETAPA_FIRMA}
     else:
         st.info("Bandeja disponible para revisores autorizados.")
         return
@@ -5973,7 +6110,7 @@ def _bandeja_borradores_compartida():
         recibidos = [r for r in recibidos if termino in normalizar_texto(
             f"{r.get('Folio', '')} {r.get('No. de oficio', '')} {r.get('Nombre', '')}")]
     prioridad = {ETAPA_BORRADOR: 0, ETAPA_CORRECCIONES: 1, ETAPA_RETORNO_FIRMA: 2,
-                 ETAPA_ENVIADO: 2, ETAPA_FIRMA: 3}
+                 ETAPA_ENVIADO: 2, ETAPA_APROBADO: 3, ETAPA_FIRMA: 4}
     recibidos.sort(key=lambda r: (prioridad.get(str(r.get("Etapa", "")), 9),
                                   str(r.get("No. de oficio", ""))))
     if not recibidos:
@@ -5990,6 +6127,9 @@ def _bandeja_borradores_compartida():
         elif correcciones:
             etiqueta, clase = "REQUIERE CORRECCIONES", "ajustes"
             accion = "Revisar observaciones y cargar nueva versión"
+        elif etapa == ETAPA_APROBADO:
+            etiqueta, clase = "AUTORIZADO · POR FORMALIZAR", "firma"
+            accion = "Capturar número y asunto para enviar a firma"
         elif etapa == ETAPA_FIRMA:
             etiqueta, clase = "EN TRÁMITE DE FIRMA", "firma"
             accion = "Registrar resultado de firma"
@@ -6450,7 +6590,7 @@ def _setf_vista_pendientes_generales():
     )
 
     df = obtener_oficios_por_area("setf").copy()
-    activos = {"En elaboración", "En correcciones", "En revisión", "En firma", "Recaído"}
+    activos = {"En elaboración", "En correcciones", "En revisión", "Autorizado para firma", "En firma", "Recaído"}
     requeridas = {"Folio", "No. de oficio", "Estatus", "Responsable"}
     if not requeridas.issubset(df.columns):
         st.error("No fue posible consultar las columnas necesarias del libro SETF.")
@@ -6907,7 +7047,7 @@ def mostrar_mis_pendientes():
             == normalizar_texto(asignado)
         ].copy()
 
-    activos = {"En elaboración", "En correcciones", "En revisión", "En firma", "Recaído"}
+    activos = {"En elaboración", "En correcciones", "En revisión", "Autorizado para firma", "En firma", "Recaído"}
     pendientes = registros.loc[
         registros["Estatus"].fillna("").astype(str).str.strip().isin(activos)
     ].copy()
@@ -7337,7 +7477,7 @@ def mostrar_mis_pendientes():
             # Primero los documentos en correcciones; después el resto de los activos.
             prioridad = {
                 "En correcciones": 0, "Recaído": 1, "En elaboración": 2,
-                "En revisión": 3, "En firma": 4,
+                "En revisión": 3, "Autorizado para firma": 4, "En firma": 5,
             }
             pendientes["_prioridad"] = pendientes["Estatus"].map(prioridad).fillna(9)
             pendientes = pendientes.sort_values("_prioridad", kind="stable")
@@ -7356,7 +7496,8 @@ def mostrar_mis_pendientes():
                 estatus = campo("Estatus")
                 estilo = {
                     "En correcciones": "correcciones", "En revisión": "revision",
-                    "En elaboración": "elaboracion", "En firma": "firma",
+                    "En elaboración": "elaboracion", "Autorizado para firma": "firma",
+                    "En firma": "firma",
                     "Recaído": "recaido",
                 }.get(estatus, "normal")
 
@@ -7694,6 +7835,10 @@ def mostrar_mis_pendientes():
                          use_container_width=True):
                 navegar_a("oficios")
 
+    if (bandeja_actual == "Mis oficios" and _area_activa_validada() == "setf"
+            and not puede_gestionar_borradores() and not puede_realizar_revision_final()):
+        # El responsable también puede formalizar trámites DIRECTOS aprobados.
+        _panel_directos_para_revisores()
     if bandeja_actual == "Por revisar" and "Por revisar" in etiquetas:
         _bandeja_borradores_compartida()
         # Regresos de firma de los oficios que no tuvieron borradores Word.
