@@ -4162,8 +4162,9 @@ def formulario_nuevo_oficio():
     if registro_solo_numero_salida:
         st.info(
             "**Registro sin folio ni antecedentes.** Indica el proyecto y el número "
-            "con el que saldrá el oficio firmado. No necesitas un enlace de Drive "
-            "en este momento; podrás vincular el documento al recibirlo firmado."
+            "que identificará al oficio. Si el documento ya está formalizado, "
+            "selecciona **Firmado** e indica la fecha de entrega. El enlace de Drive "
+            "puede agregarse ahora o posteriormente."
         )
     elif not tiene_folio or not tiene_antecedentes:
         st.caption("Los campos que no correspondan se guardarán vacíos. "
@@ -4376,14 +4377,11 @@ def formulario_nuevo_oficio():
             st.text_input("Estatus", value="En revisión · trámite directo",
                           disabled=True, key=f"estado_directo_{version}")
         else:
-            # Un oficio sin folio ni antecedentes se registra antes de que
-            # exista la versión firmada. Su estado se actualizará después.
-            estados_registro = (
-                [e for e in ESTATUS_OFICIOS if e != "Firmado"]
-                if registro_solo_numero_salida else ESTATUS_OFICIOS
-            )
+            # Los expedientes sin folio ni antecedentes también pueden darse
+            # de alta ya firmados. Conservan las mismas validaciones que los
+            # demás oficios (incluida la fecha de entrega al elegir Firmado).
             estatus = st.selectbox(
-                "Estatus", estados_registro, key=f"estatus_{version}"
+                "Estatus", ESTATUS_OFICIOS, key=f"estatus_{version}"
             )
 
     es_firmado = estatus == "Firmado"
@@ -4441,26 +4439,48 @@ def formulario_nuevo_oficio():
         nombre_firmado, liga_firmado, firmado = "", "", ""
         st.caption("La fecha y hora de envío se registrarán automáticamente al guardar el oficio.")
     elif registro_solo_numero_salida:
-        st.markdown("**▣ Identificación del oficio por firmar**")
+        st.markdown(
+            "**▣ Identificación del oficio firmado**" if es_firmado
+            else "**▣ Identificación del oficio por firmar**"
+        )
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             numero_salida = st.text_input(
-                "Nombre o número del oficio que saldrá firmado",
+                "Nombre o número del oficio firmado *" if es_firmado
+                else "Nombre o número del oficio que saldrá firmado *",
                 placeholder="Ej. LFSLPSTL-IB-26-2119",
                 key=f"nuevo_numero_salida_{version}",
-                help="Este será el número de oficio con el que se identificará el expediente.",
-            )
-        with col_firmado_link:
-            st.text_input(
-                "Enlace de Drive · disponible después de firmar",
-                value="", disabled=True,
-                placeholder="Se habilita al registrar el documento firmado",
-                key=f"nuevo_liga_firmado_sin_folio_{version}",
+                help="Este número identificará al expediente sin folio en OFICIOS.",
             )
         numero = numero_salida.strip()
-        nombre_firmado, liga_firmado, firmado = "", "", ""
-        st.caption("El número de salida se guardará como número de oficio. "
-                   "El enlace podrá añadirse cuando el documento regrese firmado.")
+        nombre_firmado = numero if es_firmado else ""
+        with col_firmado_link:
+            liga_firmado = st.text_input(
+                "Enlace de Drive · documento firmado" if es_firmado
+                else "Enlace de Drive · disponible después de firmar",
+                value="",
+                disabled=not es_firmado,
+                placeholder=("https://drive.google.com/..." if es_firmado
+                             else "Se habilita al registrar el documento firmado"),
+                key=f"nuevo_liga_firmado_sin_folio_{version}",
+            )
+        # Se puede guardar el estado Firmado aunque el PDF aún no esté
+        # vinculado. No crear un documento vacío, para evitar enlaces rotos.
+        firmado = (
+            json.dumps([{"nombre": nombre_firmado, "url": liga_firmado.strip()}],
+                       ensure_ascii=False)
+            if es_firmado and liga_firmado.strip() else ""
+        )
+        if es_firmado:
+            st.caption(
+                "Se guardará como **Firmado**. La fecha de entrega es obligatoria. "
+                "Si todavía no tienes el enlace, podrás incorporarlo después."
+            )
+        else:
+            st.caption(
+                "El número capturado identificará el oficio. "
+                "Podrás vincular el documento cuando regrese firmado."
+            )
     else:
         st.markdown("**▣ Oficio firmado**")
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
