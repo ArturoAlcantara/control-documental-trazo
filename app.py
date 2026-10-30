@@ -82,6 +82,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False, max_entries=48)
+def _asset_base64_cacheado(ruta_absoluta, revision_ns):
+    """Convert static images once per file version, not on each Streamlit rerun."""
+    return base64.b64encode(Path(ruta_absoluta).read_bytes()).decode("ascii")
+
+
+def _asset_base64(ruta):
+    """Preserves the exact existing data URI content; reloads updated files."""
+    ruta = Path(ruta)
+    if not ruta.is_file():
+        return ""
+    return _asset_base64_cacheado(str(ruta.resolve()), ruta.stat().st_mtime_ns)
+
+
 def aplicar_fondo():
     ruta = Path(__file__).parent / "assets" / "fondo_ferroviario.png"
 
@@ -89,9 +103,7 @@ def aplicar_fondo():
         st.warning("No se encontró el fondo ferroviario.")
         return
 
-    imagen_base64 = base64.b64encode(
-        ruta.read_bytes()
-    ).decode("utf-8")
+    imagen_base64 = _asset_base64(ruta)
 
     st.markdown(
         f"""
@@ -491,7 +503,7 @@ def _imagen_selector(nombre):
     if not ruta.is_file():
         return ""
     mime = "image/png" if ruta.suffix.lower() == ".png" else "image/jpeg"
-    return f"data:{mime};base64,{base64.b64encode(ruta.read_bytes()).decode('ascii')}"
+    return f"data:{mime};base64,{_asset_base64(ruta)}"
 
 
 def mostrar_selector_areas():
@@ -1168,6 +1180,10 @@ def _invalidar_cache_documental(borradores=False, eventos=False, oficios=False):
     if oficios:
         _leer_registros_oficios_por_area.clear()
         obtener_oficios_por_area.clear()
+        # Existe solo cuando terminó la carga de las funciones del módulo SETF.
+        avisos = globals().get("_setf_notificaciones_por_usuario")
+        if avisos is not None:
+            avisos.clear()
 
 
 def _borradores_expediente(folio, numero):
@@ -1393,6 +1409,9 @@ def _registrar_envio_firma(folio, numero, nuevo_numero, nuevo_asunto):
     fecha = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
     hoja.append_row([str(folio), str(numero), nuevo_numero, nuevo_asunto,
                      fecha, identificador_sesion()], value_input_option="RAW")
+    # Las lecturas que alimentan la campana no deben ocultar un envío confirmado.
+    _envios_avisos_cacheados.clear()
+    _setf_notificaciones_por_usuario.clear()
 
 
 def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
@@ -7586,17 +7605,13 @@ def obtener_imagen_base64(nombre_archivo):
     else:
         mime = "application/octet-stream"
 
-    with open(ruta, "rb") as archivo:
-        contenido = base64.b64encode(archivo.read()).decode()
-
-    return f"data:{mime};base64,{contenido}"
+    return f"data:{mime};base64,{_asset_base64(ruta)}"
 
 def cargar_imagen_base64(ruta):
     ruta_completa = BASE_DIR / ruta if not Path(ruta).is_absolute() else Path(ruta)
     if not ruta_completa.exists():
         return ""
-    with open(ruta_completa, "rb") as archivo:
-        return base64.b64encode(archivo.read()).decode()
+    return _asset_base64(ruta_completa)
 
 
 fondo_planos = obtener_imagen_base64("fondo_planos.jpg")
@@ -8074,7 +8089,7 @@ def _imagen_setf_pagina_cacheada(ruta_absoluta, fecha_modificacion_ns):
     ruta = Path(ruta_absoluta)
     if not ruta.is_file():
         return ""
-    return base64.b64encode(ruta.read_bytes()).decode("ascii")
+    return _asset_base64(ruta)
 
 
 def aplicar_fondo_setf_por_pagina():
@@ -8142,20 +8157,28 @@ _SETf_NAV = [
 ]
 
 
-def _setf_notificaciones_actuales():
-    """Avisos derivados de registros existentes. No escribe en hojas operativas."""
-    exigir_sesion()
-    if _area_activa_validada() != "setf":
-        return []
+@st.cache_data(ttl=20, max_entries=6, show_spinner=False)
+def _reuniones_avisos_cacheadas(libro_id):
+    """Meeting read snapshot shared only after the caller validated SETF access."""
+    libro, ws = _reuniones_hoja()
+    return _reuniones_leer(libro, ws)
+
+
+@st.cache_data(ttl=20, max_entries=4, show_spinner=False)
+def _envios_avisos_cacheados(area):
+    """Avoid repeated signature-sheet reads while opening the notification bell."""
+    return _hoja_envios_firma_por_area(area).get_all_records()
+
+
+@st.cache_data(ttl=20, max_entries=64, show_spinner=False)
+def _setf_notificaciones_por_usuario(usuario, responsable):
+    """Short-lived notice summary partitioned by authenticated account."""
     eventos = []
-    usuario = identificador_sesion()
-    responsable = str(st.session_state.get("responsable_oficios") or "").strip()
     # No usar marcas de tiempo inventadas. IDs estables por registro y tipo.
     try:
         from datetime import timedelta
         hoy = _reuniones_ahora().date()
-        libro, ws = _reuniones_hoja()
-        for r in _reuniones_leer(libro, ws):
+        for r in _reuniones_avisos_cacheadas(_id_libro_minutas_setf()):
             if r["estado"] in ("Cancelada", "Realizada") or not (hoy <= r["fecha"] <= hoy + timedelta(days=7)):
                 continue
             clave = str(r.get("id") or r["huella"])
@@ -8190,7 +8213,7 @@ def _setf_notificaciones_actuales():
         if not originales.empty:
             validos = {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
                        for _, r in originales.iterrows()}
-        for r in _leer_envios_firma():
+        for r in _envios_avisos_cacheados("setf"):
             ident = (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio origen", "")).strip())
             if ident not in validos:
                 continue
@@ -8207,6 +8230,17 @@ def _setf_notificaciones_actuales():
     return list({e["id"]: e for e in eventos}.values())[:80]
 
 
+def _setf_notificaciones_actuales():
+    """Revalidar sesión en cada interacción; la caché nunca autoriza acceso."""
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        return []
+    return _setf_notificaciones_por_usuario(
+        identificador_sesion(), str(st.session_state.get("responsable_oficios") or "").strip()
+    )
+
+
+@st.cache_resource(show_spinner=False)
 def _setf_hoja_lecturas():
     libro = conectar_google_sheets_por_area("setf").spreadsheet
     try:
@@ -8219,6 +8253,7 @@ def _setf_hoja_lecturas():
     return hoja
 
 
+@st.cache_data(ttl=20, max_entries=64, show_spinner=False)
 def _setf_leidas(usuario):
     hoja = _setf_hoja_lecturas()
     return {str(r.get("ID", "")) for r in hoja.get_all_records() if str(r.get("Usuario", "")) == usuario}
@@ -8233,6 +8268,8 @@ def _setf_marcar_leida(evento_id):
         from zoneinfo import ZoneInfo
         ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
         hoja.append_row([usuario, evento_id, ahora], value_input_option="RAW")
+        # Refrescar inmediatamente el badge después de la escritura confirmada.
+        _setf_leidas.clear()
 
 
 def _setf_campana():
@@ -8277,7 +8314,7 @@ def _setf_barra_superior():
     banner = ASSETS_DIR / "banner_header_setf.png"
     banner_css = "linear-gradient(110deg,#112b39,#203c44)"
     if banner.is_file():
-        encoded = base64.b64encode(banner.read_bytes()).decode("ascii")
+        encoded = _asset_base64(banner)
         banner_css = (
             'linear-gradient(90deg,rgba(9,28,40,.70),rgba(10,30,42,.45) 45%,rgba(9,28,40,.76)),'
             f'url("data:image/png;base64,{encoded}")'
@@ -8424,7 +8461,7 @@ if _area_activa_validada() != "setf" and st.session_state.menu_activo in ("ofici
     if ruta_fondo_sidebar is not None:
         extension = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png",
                      ".webp": "webp"}[ruta_fondo_sidebar.suffix.lower()]
-        imagen_sidebar = base64.b64encode(ruta_fondo_sidebar.read_bytes()).decode("ascii")
+        imagen_sidebar = _asset_base64(ruta_fondo_sidebar)
         # La imagen personalizada ya es clara: evitar que una capa opaca la oculte.
         es_personalizado = ruta_fondo_sidebar.stem.lower() in ("fondo_sidebar", "fondo_sidebar_setf")
         opacidad = ".20" if es_personalizado else ".87"
@@ -8650,7 +8687,7 @@ def _modulo_lateral_documentos(tipo):
         if fondo:
             mime = {".png": "image/png", ".jpg": "image/jpeg",
                     ".jpeg": "image/jpeg", ".webp": "image/webp"}[fondo.suffix.lower()]
-            imagen = base64.b64encode(fondo.read_bytes()).decode("ascii")
+            imagen = _asset_base64(fondo)
             fondo_css = (
                 'background-image:linear-gradient(rgba(240,244,241,.17),rgba(240,244,241,.25)),'
                 f'url("data:{mime};base64,{imagen}") !important;'
@@ -9679,7 +9716,7 @@ def _modulo_lateral_documentos(tipo):
         tipos = {".png": "image/png", ".jpg": "image/jpeg",
                  ".jpeg": "image/jpeg", ".webp": "image/webp"}
         mime = tipos[fondo_urgentes.suffix.lower()]
-        img = base64.b64encode(fondo_urgentes.read_bytes()).decode("ascii")
+        img = _asset_base64(fondo_urgentes)
         css_fondo = (
             'background-image:linear-gradient(rgba(248,246,241,.24),rgba(248,246,241,.32)),'
             f'url("data:{mime};base64,{img}") !important;'
@@ -9968,7 +10005,7 @@ def _modulo_lateral_documentos(tipo):
     _imagen_hero_urg = ASSETS_DIR / "banner_urgentes.png"
     _imagen_ficha_urg = ASSETS_DIR / "tarjeta_urgentes.png"
     if _imagen_hero_urg.is_file():
-        _url_hero_urg = "data:image/png;base64," + base64.b64encode(_imagen_hero_urg.read_bytes()).decode("ascii")
+        _url_hero_urg = "data:image/png;base64," + _asset_base64(_imagen_hero_urg)
         st.markdown(
             '<style>.urg-hero{background-image:'
             'linear-gradient(90deg,rgba(61,56,56,.98) 0%,rgba(64,55,53,.92) 42%,rgba(64,55,53,.58) 58%,rgba(64,55,53,.22) 100%),'
@@ -9979,7 +10016,7 @@ def _modulo_lateral_documentos(tipo):
             '.urg-hero .urg-trazo{display:none!important;}'
             '</style>', unsafe_allow_html=True)
     if _imagen_ficha_urg.is_file():
-        _url_ficha_urg = "data:image/png;base64," + base64.b64encode(_imagen_ficha_urg.read_bytes()).decode("ascii")
+        _url_ficha_urg = "data:image/png;base64," + _asset_base64(_imagen_ficha_urg)
         st.markdown(
             '<style>div[class*="st-key-urg_ficha_"]::before{'
             f'background-image:url("{_url_ficha_urg}")!important;'
@@ -11508,7 +11545,7 @@ _REUNIONES_ESTADOS = ("Programada", "Realizada", "Cancelada", "Por confirmar")
 _REUNIONES_META_TITULO = "REUNIONES_APP_ESTADOS"
 _REUNIONES_META_CABECERAS = [
     "Fila origen", "Huella", "Estado", "ID", "Creado por", "Creado el",
-    "Modificado por", "Modificado el",
+    "Modificado por", "Modificado el", "Cierre automático",
 ]
 _REUNIONES_HIST_TITULO = "REUNIONES_APP_HISTORIAL"
 _REUNIONES_HIST_CABECERAS = [
@@ -11570,9 +11607,15 @@ def _reuniones_hora(valor):
 
 
 def _reuniones_hoja():
-    """Agenda NUEVA. No lee ni modifica la pestaña histórica Reuniones."""
+    """Validar siempre el área antes de acceder al recurso reutilizable."""
     _exigir_reuniones_setf()
-    libro = _cliente_gspread_minutas_setf().open_by_key(_id_libro_minutas_setf())
+    return _reuniones_hoja_por_libro(_id_libro_minutas_setf())
+
+
+@st.cache_resource(show_spinner=False)
+def _reuniones_hoja_por_libro(libro_id):
+    """Cache the sheet handle and header verification, not the meeting writes."""
+    libro = _cliente_gspread_minutas_setf().open_by_key(libro_id)
     titulo = "REUNIONES_APP"
     cabeceras = ["Día", "Fecha", "Hora", "Asunto", "Ubicación", "Asignación", "Antecedente"]
     try:
@@ -11603,7 +11646,15 @@ def _reuniones_hoja_auxiliar(libro, titulo, cabeceras, crear=False):
             return None
         ws = libro.add_worksheet(title=titulo, rows=1000, cols=max(len(cabeceras), 8))
         ws.append_row(cabeceras, value_input_option="RAW")
-    if ws.row_values(1)[:len(cabeceras)] != cabeceras:
+    encabezados = ws.row_values(1)
+    if titulo == _REUNIONES_META_TITULO and encabezados[:8] == cabeceras[:8] and len(encabezados) < 9:
+        # Migración compatible: añadir una sola columna sin alterar A:H ni los estados previos.
+        # Reuniones existentes: cierre automático DESACTIVADO hasta que lo autoricen al editarlas.
+        if ws.col_count < 9:
+            ws.add_cols(9 - ws.col_count)
+        ws.update(range_name="I1", values=[["Cierre automático"]], value_input_option="RAW")
+        encabezados = list(encabezados[:8]) + ["Cierre automático"]
+    if encabezados[:len(cabeceras)] != cabeceras:
         raise ValueError(f"La pestaña {titulo} tiene encabezados incompatibles; no se realizó el registro.")
     return ws
 
@@ -11660,7 +11711,7 @@ def _reuniones_leer(libro, ws):
     metadatos = {}
     if auxiliares is not None:
         for idx, fila in enumerate(auxiliares.get_all_values()[1:], start=2):
-            valores = (list(fila) + [""] * 8)[:8]
+            valores = (list(fila) + [""] * 9)[:9]
             try:
                 num_fila = int(valores[0])
             except ValueError:
@@ -11669,7 +11720,8 @@ def _reuniones_leer(libro, ws):
                 raise ValueError("Hay filas duplicadas en REUNIONES_APP_ESTADOS. Corrígelas antes de editar.")
             metadatos[num_fila] = {"meta_fila": idx, "huella": valores[1],
                                     "estado": valores[2], "id": valores[3],
-                                    "creado_por": valores[4], "creado_el": valores[5]}
+                                    "creado_por": valores[4], "creado_el": valores[5],
+                                    "cierre_automatico": valores[8].strip().upper() == "SI"}
     colores = {}  # La pestaña nueva no depende del coloreado de la histórica.
     hoy = _reuniones_ahora().date()
     salida = []
@@ -11692,6 +11744,7 @@ def _reuniones_leer(libro, ws):
             "ubicacion": valores[4], "responsable": valores[5],
             "antecedente": valores[6], "estado": estado,
             "id": meta["id"] if meta else "", "meta": meta,
+            "cierre_automatico": bool(meta and meta["cierre_automatico"]),
         })
     return salida
 
@@ -11761,7 +11814,8 @@ def _reuniones_color_fila(libro, ws, fila, estado):
     }}]})
 
 
-def _reuniones_guardar_metadata(libro, fila, huella, estado, id_registro, anterior):
+def _reuniones_guardar_metadata(libro, fila, huella, estado, id_registro, anterior,
+                                cierre_automatico=False):
     ws = _reuniones_hoja_auxiliar(
         libro, _REUNIONES_META_TITULO, _REUNIONES_META_CABECERAS, crear=True,
     )
@@ -11770,10 +11824,10 @@ def _reuniones_guardar_metadata(libro, fila, huella, estado, id_registro, anteri
     datos = [str(fila), huella, estado, id_registro,
              anterior.get("creado_por", usuario) if anterior else usuario,
              anterior.get("creado_el", momento) if anterior else momento,
-             usuario, momento]
+             usuario, momento, "SI" if cierre_automatico and estado == "Programada" else "NO"]
     if anterior and anterior.get("meta_fila"):
         indice = anterior["meta_fila"]
-        ws.update(range_name=f"A{indice}:H{indice}", values=[datos], value_input_option="RAW")
+        ws.update(range_name=f"A{indice}:I{indice}", values=[datos], value_input_option="RAW")
     else:
         # Detectar metadatos agregados desde la lectura, antes de anexar.
         ocupadas = {str(f[0]).strip() for f in ws.get_all_values()[1:] if f and str(f[0]).strip()}
@@ -11794,7 +11848,8 @@ def _reuniones_registrar_historial(libro, id_registro, fila, accion, antes, desp
     ], value_input_option="RAW")
 
 
-def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antecedente, estado):
+def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antecedente, estado,
+                             cierre_automatico=False):
     _exigir_reuniones_setf()
     datos = _reuniones_revisar_datos(fecha, hora, asunto, ubicacion, responsable, antecedente, estado)
     with _candado_minutas_instancia():
@@ -11812,14 +11867,16 @@ def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antece
         valores_guardados = (list(fila_guardada[0]) + [""] * 7)[:7] if fila_guardada else datos
         id_registro = secrets.token_hex(12)
         try:
-            _reuniones_guardar_metadata(libro, fila, _reuniones_huella(valores_guardados), estado, id_registro, None)
+            _reuniones_guardar_metadata(libro, fila, _reuniones_huella(valores_guardados), estado,
+                                        id_registro, None, cierre_automatico=cierre_automatico)
         except Exception as exc:
             raise RuntimeError(f"La reunión SÍ se guardó en la fila {fila} de REUNIONES_APP, pero "
                                "falló el estado auxiliar. No vuelvas a dar de alta el mismo evento. "
                                f"Detalle: {exc}") from exc
         try:
             _reuniones_registrar_historial(libro, id_registro, fila, "Creación", {},
-                                           {"datos": valores_guardados, "estado": estado})
+                                           {"datos": valores_guardados, "estado": estado,
+                                            "cierre_automatico": bool(cierre_automatico and estado == "Programada")})
         except Exception as exc:
             raise RuntimeError(f"La reunión SÍ se guardó en la fila {fila}; no repitas el alta. "
                                f"Falló únicamente la bitácora: {exc}") from exc
@@ -11827,10 +11884,13 @@ def _reuniones_guardar_nueva(fecha, hora, asunto, ubicacion, responsable, antece
             _reuniones_color_fila(libro, ws, fila, estado)
         except Exception:
             pass  # El color es decorativo: no invalida el registro ni su historial.
+    _reuniones_avisos_cacheadas.clear()
+    _setf_notificaciones_por_usuario.clear()
     return fila
 
 
-def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, responsable, antecedente, estado):
+def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, responsable,
+                              antecedente, estado, cierre_automatico=False):
     _exigir_reuniones_setf()
     datos = _reuniones_revisar_datos(fecha, hora, asunto, ubicacion, responsable, antecedente, estado)
     with _candado_minutas_instancia():
@@ -11841,6 +11901,22 @@ def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, respons
         if valores_actuales != original["datos"]:
             raise ValueError("Otra persona cambió esta reunión desde que la abriste. "
                              "Actualiza la página antes de editar para evitar sobrescribir cambios.")
+        # El estado y el cierre automático se guardan en otra hoja: también se
+        # verifican para no reactivar/contradecir un cierre aplicado por otra sesión.
+        meta_anterior = original.get("meta")
+        if meta_anterior and meta_anterior.get("meta_fila"):
+            hoja_meta = _reuniones_hoja_auxiliar(
+                libro, _REUNIONES_META_TITULO, _REUNIONES_META_CABECERAS,
+            )
+            meta_actual = (hoja_meta.get(f"A{int(meta_anterior['meta_fila'])}:I{int(meta_anterior['meta_fila'])}")
+                           or [[]])[0]
+            meta_actual = (list(meta_actual) + [""] * 9)[:9]
+            if (meta_actual[0] != str(fila) or meta_actual[1] != original["huella"]
+                    or meta_actual[2] != original["estado"]
+                    or meta_actual[3] != original.get("id", "")
+                    or (meta_actual[8].strip().upper() == "SI") != bool(original.get("cierre_automatico"))):
+                raise ValueError("Otra persona o el cierre automático actualizó el estado de esta reunión. "
+                                 "Actualiza la página antes de guardar cambios.")
         # No volver a escribir la columna G si mantiene su texto: una celda con
         # hipervínculo enriquecido perdería la URL al reemplazarla por su etiqueta.
         actualizaciones = []
@@ -11857,7 +11933,9 @@ def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, respons
             if cambiado:
                 columna = "ABCDEFG"[indice]
                 actualizaciones.append({"range": f"{columna}{fila}", "values": [[despues]]})
-        if not actualizaciones and original["estado"] == estado:
+        cierre_automatico = bool(cierre_automatico and estado == "Programada")
+        if (not actualizaciones and original["estado"] == estado
+                and bool(original.get("cierre_automatico")) == cierre_automatico):
             return False
         if actualizaciones:
             originales_formula = ws.get(f"A{fila}:G{fila}", value_render_option="FORMULA")
@@ -11875,14 +11953,17 @@ def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, respons
         id_registro = original.get("id") or secrets.token_hex(12)
         try:
             _reuniones_guardar_metadata(libro, fila, _reuniones_huella(valores_guardados),
-                                        estado, id_registro, original.get("meta"))
+                                        estado, id_registro, original.get("meta"),
+                                        cierre_automatico=cierre_automatico)
         except Exception as exc:
             raise RuntimeError("El contenido de la reunión pudo quedar actualizado, pero "
                                f"no se guardó su estado auxiliar. Revisa la fila {fila} antes de reintentar: {exc}") from exc
         try:
             _reuniones_registrar_historial(libro, id_registro, fila, "Edición",
-                {"datos": original["datos"], "estado": original["estado"]},
-                {"datos": valores_guardados, "estado": estado})
+                {"datos": original["datos"], "estado": original["estado"],
+                 "cierre_automatico": bool(original.get("cierre_automatico"))},
+                {"datos": valores_guardados, "estado": estado,
+                 "cierre_automatico": cierre_automatico})
         except Exception as exc:
             raise RuntimeError("La reunión SÍ se actualizó; no repitas el cambio sin revisar. "
                                f"Falló únicamente el historial: {exc}") from exc
@@ -11890,7 +11971,106 @@ def _reuniones_guardar_edicion(original, fecha, hora, asunto, ubicacion, respons
             _reuniones_color_fila(libro, ws, fila, estado)
         except Exception:
             pass
+    _reuniones_avisos_cacheadas.clear()
+    _setf_notificaciones_por_usuario.clear()
     return True
+
+
+def _reuniones_cerrar_programadas_vencidas(libro, hoja, reuniones):
+    """Cierra solo reuniones opt-in después de su fecha, sin consultas extra si no hay pendientes.
+
+    Se ejecuta al abrir Reuniones (no hay tarea de fondo). Una única operación
+    batchUpdate aplica estado, auditoría y color en Google Sheets. Los datos se
+    validan de nuevo dentro del candado para no sobrescribir modificaciones.
+    """
+    _exigir_reuniones_setf()
+    hoy = _reuniones_ahora().date()
+    vencidas = [r for r in reuniones if r["estado"] == "Programada"
+                and r.get("cierre_automatico") and r["fecha"] < hoy
+                and r.get("id") and r.get("meta", {}).get("meta_fila")]
+    if not vencidas:
+        return 0
+
+    with _candado_minutas_instancia():
+        hoja_meta = _reuniones_hoja_auxiliar(
+            libro, _REUNIONES_META_TITULO, _REUNIONES_META_CABECERAS,
+        )
+        if hoja_meta is None:
+            return 0
+        filas_meta = hoja_meta.get_all_values()
+        # Una sola lectura en lote para verificar que el contenido no cambió.
+        valores_actuales = hoja.batch_get(
+            [f"A{r['fila']}:G{r['fila']}" for r in vencidas],
+            value_render_option="FORMATTED_VALUE",
+        )
+        verificadas = []
+        for r, bloque in zip(vencidas, valores_actuales):
+            m = r["meta"]
+            indice = int(m["meta_fila"])
+            actual_meta = (list(filas_meta[indice - 1]) + [""] * 9)[:9] if indice <= len(filas_meta) else []
+            actuales = (list(bloque[0]) + [""] * 7)[:7] if bloque else []
+            if (not actual_meta or len(actuales) != 7
+                    or actual_meta[0] != str(r["fila"])
+                    or actual_meta[1] != r["huella"]
+                    or actual_meta[2] != "Programada"
+                    or actual_meta[3] != r["id"]
+                    or actual_meta[8].strip().upper() != "SI"
+                    or _reuniones_huella(actuales) != r["huella"]
+                    or _reuniones_fecha(actuales[1]) != r["fecha"]
+                    or r["fecha"] >= hoy):
+                continue
+            verificadas.append((r, indice, actual_meta, actuales))
+        if not verificadas:
+            return 0
+
+        hoja_historial = _reuniones_hoja_auxiliar(
+            libro, _REUNIONES_HIST_TITULO, _REUNIONES_HIST_CABECERAS, crear=True,
+        )
+        fecha_cambio = _reuniones_ahora().isoformat(timespec="seconds")
+        solicitudes = []
+        historial_nuevo = []
+        colores_realizada = {"red": .35, "green": .73, "blue": .47}
+        for r, indice, meta, actuales in verificadas:
+            # A:H originales permanecen en su lugar; solo se actualiza estado,
+            # usuario/fecha de modificación y se conserva la preferencia en I.
+            nueva_meta = meta[:9]
+            nueva_meta[2] = "Realizada"
+            nueva_meta[6] = "sistema"
+            nueva_meta[7] = fecha_cambio
+            solicitudes.append({"updateCells": {
+                "range": {"sheetId": hoja_meta.id, "startRowIndex": indice - 1,
+                          "endRowIndex": indice, "startColumnIndex": 0, "endColumnIndex": 9},
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": str(v)}} for v in nueva_meta]}],
+                "fields": "userEnteredValue",
+            }})
+            previo = {"datos": actuales, "estado": "Programada", "cierre_automatico": True}
+            nuevo = {"datos": actuales, "estado": "Realizada", "cierre_automatico": True}
+            historial_nuevo.append([
+                r["id"], str(r["fila"]), "Finalización automática", "sistema",
+                fecha_cambio, json.dumps(previo, ensure_ascii=False),
+                json.dumps(nuevo, ensure_ascii=False),
+            ])
+            solicitudes.append({"repeatCell": {
+                "range": {"sheetId": hoja.id, "startRowIndex": r["fila"] - 1,
+                          "endRowIndex": r["fila"], "startColumnIndex": 0, "endColumnIndex": 7},
+                "cell": {"userEnteredFormat": {"backgroundColor": colores_realizada}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }})
+        solicitudes.append({"appendCells": {
+            "sheetId": hoja_historial.id,
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": str(v)}} for v in registro]}
+                     for registro in historial_nuevo],
+            "fields": "userEnteredValue",
+        }})
+        # Estado, color y bitácora se guardan en el mismo batch de Sheets.
+        libro.batch_update({"requests": solicitudes})
+        for r, _, _, _ in verificadas:
+            r["estado"] = "Realizada"
+            r["meta"]["estado"] = "Realizada"
+
+    _reuniones_avisos_cacheadas.clear()
+    _setf_notificaciones_por_usuario.clear()
+    return len(verificadas)
 
 
 def _reuniones_historial(libro, limite=40):
@@ -11917,6 +12097,8 @@ def _reuniones_historial(libro, limite=40):
                                and anteriores[i] != posteriores[i]]
                 if antes.get("estado") != despues.get("estado"):
                     modificados.append("Estado")
+                if antes.get("cierre_automatico") != despues.get("cierre_automatico"):
+                    modificados.append("Cierre automático")
                 cambios = ", ".join(modificados) or "Actualización"
         except (ValueError, TypeError, KeyError, IndexError):
             asunto, cambios = "", "Sin detalle"
@@ -12084,9 +12266,7 @@ def _modulo_reuniones_setf():
     # Minutas, Oficios ni la pantalla de selección de áreas.
     ruta_fondo_reuniones = ASSETS_DIR / "fondo_consulta_reuniones_setf.png"
     if ruta_fondo_reuniones.is_file():
-        imagen_fondo_reuniones = base64.b64encode(
-            ruta_fondo_reuniones.read_bytes()
-        ).decode("ascii")
+        imagen_fondo_reuniones = _asset_base64(ruta_fondo_reuniones)
         st.markdown(
             '<style>'
             '[data-testid="stAppViewContainer"] {'
@@ -12514,6 +12694,15 @@ def _modulo_reuniones_setf():
         st.info("Comprueba que [setf].minutas_spreadsheet_id apunte a Control Interno SETF, "
                 "que la cuenta de servicio pueda editarlo y que pueda crear la pestaña REUNIONES_APP. La pestaña Reuniones original no se modifica.")
         return
+    # No marca reuniones pasadas sin autorización explícita; consulta los datos
+    # ya leídos y solo escribe si alguna Programada tiene cierre automático.
+    try:
+        cerradas = _reuniones_cerrar_programadas_vencidas(libro, ws, reuniones)
+        if cerradas:
+            st.toast(f"{cerradas} reunión(es) finalizada(s) automáticamente.", icon="✅")
+    except Exception:
+        st.warning("No se pudo aplicar el cierre automático de algunas reuniones. "
+                   "Las reuniones conservan su estado anterior; puedes actualizarlas manualmente.")
     if st.session_state.pop("reun_exito", ""):
         st.success("La reunión se guardó en Control Interno SETF y se registró su historial.")
 
@@ -12706,6 +12895,13 @@ def _modulo_reuniones_setf():
             antecedente_n = st.text_input("Antecedente (oficio, referencia o enlace)",
                                            key="reun_n_antecedente")
             estado_n = st.selectbox("Estado", _REUNIONES_ESTADOS, key="reun_n_estado")
+            cierre_n = st.checkbox(
+                "Marcar automáticamente como realizada al día siguiente",
+                value=True, key="reun_n_cierre_auto",
+                help="Solo se aplica a reuniones que continúen Programadas después de su fecha. "
+                     "No modifica las Canceladas ni las Por confirmar.",
+                disabled=estado_n != "Programada",
+            )
             registrar = st.form_submit_button("Guardar reunión", type="primary", use_container_width=True)
         if registrar:
             try:
@@ -12713,7 +12909,8 @@ def _modulo_reuniones_setf():
                 if responsable_n == "— Selecciona responsable —":
                     raise ValueError("Selecciona a la persona responsable de la reunión.")
                 _reuniones_guardar_nueva(fecha_n, hora_n, asunto_n, ubicacion_n,
-                                         responsable_n, antecedente_n, estado_n)
+                                         responsable_n, antecedente_n, estado_n,
+                                         cierre_automatico=cierre_n and estado_n == "Programada")
                 st.session_state.reun_exito = "Registro correcto"
                 st.rerun()
             except Exception as error:
@@ -12757,6 +12954,13 @@ def _modulo_reuniones_setf():
                     help="Si ya existe un hipervínculo con texto en Google Sheets, déjalo igual para conservar su URL.")
                 estado_e = st.selectbox("Estado", _REUNIONES_ESTADOS,
                                         index=_REUNIONES_ESTADOS.index(r["estado"]))
+                cierre_e = st.checkbox(
+                    "Marcar automáticamente como realizada al día siguiente",
+                    value=bool(r.get("cierre_automatico")),
+                    help="Las reuniones antiguas tienen esta opción desactivada hasta que la habilites. "
+                         "Solo opera mientras el estado sea Programada.",
+                    disabled=estado_e != "Programada",
+                )
                 guardar_e = st.form_submit_button("Guardar cambios", type="primary", use_container_width=True)
             if guardar_e:
                 try:
@@ -12764,7 +12968,8 @@ def _modulo_reuniones_setf():
                     if asignado_e == "— Selecciona responsable —":
                         raise ValueError("Selecciona a la persona responsable de la reunión.")
                     _reuniones_guardar_edicion(r, fecha_e, hora_e, asunto_e, ubicacion_e,
-                                               asignado_e, antecedente_e, estado_e)
+                                               asignado_e, antecedente_e, estado_e,
+                                               cierre_automatico=cierre_e and estado_e == "Programada")
                     st.session_state.reun_exito = "Actualización correcta"
                     st.rerun()
                 except Exception as error:
