@@ -12917,65 +12917,274 @@ def _modulo_reuniones_setf():
                 st.error(f"No se pudo completar el registro: {error}")
 
     with pestana_editar:
-        st.markdown('<div class="setf-reun-seccion">Edición compartida</div>', unsafe_allow_html=True)
-        st.markdown('<div class="setf-reun-sub">Todos los integrantes de SETF pueden modificar cualquier '
-                    'reunión. Para evitar sobrescrituras, se comprueba que el registro no haya cambiado.</div>',
+        # Solo presentación: utiliza la lista 'reuniones' ya obtenida arriba.
+        # Los filtros y la selección NO realizan nuevas consultas a Sheets.
+        st.markdown("""
+        <style>
+        [class*="st-key-reun_editar_filtros"] {
+            background:rgba(255,255,255,.97)!important;
+            border:1px solid #e1dfd7!important;border-radius:14px!important;
+            padding:16px 19px 9px!important;
+            box-shadow:0 6px 18px rgba(29,50,63,.055)!important;
+            margin:12px 0 16px!important;
+        }
+        [class*="st-key-reun_editar_registro_"] {
+            background:rgba(255,255,255,.97)!important;
+            border:1px solid #e0e5e5!important;
+            border-left:4px solid #c29b60!important;
+            border-radius:12px!important;
+            padding:11px 16px!important;margin-bottom:9px!important;
+            box-shadow:0 4px 14px rgba(18,49,64,.045)!important;
+        }
+        [class*="st-key-reun_editar_registro_"]:has(button:disabled) {
+            border-left-color:#507b6e!important;
+            background:#f6faf7!important;
+        }
+        [class*="st-key-reun_editar_registro_"] button {
+            min-height:38px!important;border-radius:8px!important;
+            border:1px solid #cfb68b!important;color:#244659!important;
+            font-size:12px!important;font-weight:700!important;
+        }
+        [class*="st-key-reun_editar_registro_"] button:disabled {
+            color:#386653!important;background:#e5efe7!important;
+            opacity:1!important;
+        }
+        .reun-edit-fila-info {line-height:1.4;padding:3px 0}
+        .reun-edit-fila-info h4 {font-size:15px!important;font-weight:750!important;
+            color:#18384b!important;margin:8px 0 5px!important;line-height:1.34!important;}
+        .reun-edit-fila-info p {font-size:12px!important;color:#687c85!important;
+            margin:0!important;line-height:1.5!important}
+        .reun-edit-chip {display:inline-flex;align-items:center;border:1px solid #d9e1e3;
+            border-radius:7px;padding:4px 8px;font-size:11px;font-weight:700;
+            color:#355269;background:#f3f6f6;margin-right:5px;margin-bottom:2px}
+        .reun-edit-estado {font-size:10px;font-weight:800;border-radius:20px;
+            display:inline-block;padding:4px 9px;vertical-align:middle;margin-left:3px}
+        .reun-edit-estado.programada {background:#fff2c9;color:#866017}
+        .reun-edit-estado.realizada {background:#deefdf;color:#336448}
+        .reun-edit-estado.cancelada {background:#fae0df;color:#a34a42}
+        .reun-edit-estado.confirmar {background:#e8edf2;color:#526b7f}
+        [class*="st-key-reun_editar_vista"] {background:rgba(252,250,246,.98)!important;
+            border:1px solid #d8c5a9!important;border-left:4px solid #b58e51!important;
+            border-radius:15px!important;padding:18px 22px!important;
+            box-shadow:0 7px 21px rgba(27,48,62,.07)!important;
+            margin-top:18px!important;}
+        [class*="st-key-reun_editar_vista"] h3 {color:#183749!important;margin:3px 0 10px!important}
+        [class*="st-key-reun_editar_vista"] .reun-edit-resumen {font-size:13px;
+            color:#4f6672;line-height:1.8;margin:8px 0 14px;}
+        [class*="st-key-reun_editar_vista"] button[kind="primary"] {
+            background:#294f4b!important;border-color:#294f4b!important;color:white!important;
+            border-radius:9px!important;font-weight:750!important;
+        }
+        [class*="st-key-reun_editar_formulario"] {border-top:1px solid #dedbd2;
+            padding-top:14px;margin-top:13px}
+        </style>
+        """, unsafe_allow_html=True)
+        st.markdown('<div class="setf-reun-seccion">Buscar y editar reuniones</div>',
+                    unsafe_allow_html=True)
+        st.markdown('<div class="setf-reun-sub">Primero localiza la reunión por fecha o asunto, '
+                    'confirma sus datos y después abre el formulario de edición.</div>',
                     unsafe_allow_html=True)
         if not reuniones:
             st.info("No hay reuniones con una fecha reconocible para editar.")
         else:
-            ordenadas = sorted(reuniones, key=lambda r: (r["fecha"], r["fila"]), reverse=True)
-            por_fila = {r["fila"]: r for r in ordenadas}
-            seleccion = st.selectbox("Selecciona la reunión", list(por_fila),
-                                     format_func=lambda fila: f'{por_fila[fila]["fecha"].strftime("%d/%m/%Y")} · '
-                                         f'{por_fila[fila]["asunto"] or "Sin asunto"} · fila {fila}',
-                                     key="reun_editar_seleccion")
-            r = por_fila[seleccion]
-            if not r["hora"]:
-                st.warning("El registro tiene una hora antigua no reconocible. Indica la hora correcta antes de guardar.")
-            with st.form(key=f"reun_editar_form_{seleccion}"):
-                asunto_e = st.text_input("Asunto *", value=r["asunto"])
-                c1, c2 = st.columns(2)
-                with c1:
-                    fecha_e = st.date_input("Fecha *", value=r["fecha"], format="DD/MM/YYYY")
-                with c2:
-                    from datetime import time as _time_reun
-                    hora_e = st.time_input("Hora *", value=r["hora"] or _time_reun(9, 0), step=1800)
-                ubicacion_e = st.text_input("Ubicación o enlace *", value=r["ubicacion"])
-                opciones_edicion = ["— Selecciona responsable —", *opciones_filtro_responsables]
-                if r["responsable"] and r["responsable"] not in opciones_edicion:
-                    opciones_edicion.append(r["responsable"])
-                if "Otro responsable (externo)…" not in opciones_edicion:
-                    opciones_edicion.append("Otro responsable (externo)…")
-                responsable_e = st.selectbox("Responsable *", opciones_edicion,
-                    index=opciones_edicion.index(r["responsable"]) if r["responsable"] in opciones_edicion else 0)
-                manual_e = st.text_input("Nombre del responsable externo")
-                antecedente_e = st.text_input("Antecedente", value=r["antecedente"],
-                    help="Si ya existe un hipervínculo con texto en Google Sheets, déjalo igual para conservar su URL.")
-                estado_e = st.selectbox("Estado", _REUNIONES_ESTADOS,
-                                        index=_REUNIONES_ESTADOS.index(r["estado"]))
-                cierre_e = st.checkbox(
-                    "Marcar automáticamente como realizada al día siguiente",
-                    value=bool(r.get("cierre_automatico")),
-                    help="Las reuniones antiguas tienen esta opción desactivada hasta que la habilites. "
-                         "Solo opera mientras el estado sea Programada.",
-                    disabled=estado_e != "Programada",
-                )
-                guardar_e = st.form_submit_button("Guardar cambios", type="primary", use_container_width=True)
-            if guardar_e:
-                try:
-                    asignado_e = manual_e.strip() if responsable_e == "Otro responsable (externo)…" else responsable_e
-                    if asignado_e == "— Selecciona responsable —":
-                        raise ValueError("Selecciona a la persona responsable de la reunión.")
-                    _reuniones_guardar_edicion(r, fecha_e, hora_e, asunto_e, ubicacion_e,
-                                               asignado_e, antecedente_e, estado_e,
-                                               cierre_automatico=cierre_e and estado_e == "Programada")
-                    st.session_state.reun_exito = "Actualización correcta"
-                    st.rerun()
-                except Exception as error:
-                    st.error(f"No se pudo completar la edición: {error}")
-            st.caption("Antecedente original: " + (r["antecedente"] or "Sin antecedente") +
-                       f" · Consulta en la hoja Reuniones, fila {seleccion}.")
+            # Identificación real por fila, nunca por el texto (puede repetirse).
+            ordenadas = sorted(reuniones,
+                key=lambda registro: (registro["fecha"], registro["hora"] or datetime.min.time(), registro["fila"]),
+                reverse=True)
+            por_fila = {registro["fila"]: registro for registro in ordenadas}
+            periodos = sorted({(registro["fecha"].year, registro["fecha"].month)
+                               for registro in ordenadas}, reverse=True)
+            nombres_periodos = {f'{_REUNIONES_MESES[mes-1].capitalize()} {anio}': (anio, mes)
+                                for anio, mes in periodos}
+            nombres_periodos = {"Todos los meses": None, **nombres_periodos}
+            opciones_estado_editar = ["Todos", *_REUNIONES_ESTADOS]
+            opciones_responsable_editar = ["Todos", *opciones_filtro_responsables]
+
+            def _reun_editar_reiniciar_pagina():
+                st.session_state.reun_editar_pagina = 0
+
+            with st.container(key="reun_editar_filtros"):
+                col_buscar, col_periodo = st.columns([2, 1], gap="small")
+                with col_buscar:
+                    buscar_editar = st.text_input(
+                        "Buscar reunión", placeholder="Asunto, ubicación o responsable...",
+                        key="reun_editar_busqueda", on_change=_reun_editar_reiniciar_pagina)
+                with col_periodo:
+                    periodo_editar = st.selectbox(
+                        "Mes de la reunión", list(nombres_periodos), key="reun_editar_periodo",
+                        on_change=_reun_editar_reiniciar_pagina)
+                col_estado, col_responsable = st.columns(2, gap="small")
+                with col_estado:
+                    estado_filtro_editar = st.selectbox(
+                        "Estado", opciones_estado_editar, key="reun_editar_estado_filtro",
+                        on_change=_reun_editar_reiniciar_pagina)
+                with col_responsable:
+                    responsable_filtro_editar = st.selectbox(
+                        "Responsable", opciones_responsable_editar,
+                        key="reun_editar_responsable_filtro", on_change=_reun_editar_reiniciar_pagina)
+
+            # Filtrar en memoria: no se llama a Google con cada letra escrita.
+            def _texto_local(valor):
+                return unicodedata.normalize("NFKD", str(valor or "")).encode(
+                    "ascii", errors="ignore").decode("ascii").casefold()
+
+            texto_buscado = _texto_local(buscar_editar.strip())
+            periodo_activo = nombres_periodos[periodo_editar]
+            reuniones_filtradas = []
+            for registro in ordenadas:
+                if periodo_activo and ((registro["fecha"].year, registro["fecha"].month) != periodo_activo):
+                    continue
+                if estado_filtro_editar != "Todos" and registro["estado"] != estado_filtro_editar:
+                    continue
+                if responsable_filtro_editar != "Todos" and registro["responsable"] != responsable_filtro_editar:
+                    continue
+                contenido_busqueda = " ".join((registro["asunto"], registro["ubicacion"],
+                    registro["responsable"], registro["antecedente"],
+                    registro["fecha"].strftime("%d/%m/%Y")))
+                if texto_buscado and texto_buscado not in _texto_local(contenido_busqueda):
+                    continue
+                reuniones_filtradas.append(registro)
+
+            st.markdown(f"**{len(reuniones_filtradas)} reunión(es) encontradas**")
+            seleccion_actual = st.session_state.get("reun_editar_actual")
+            por_pagina = 5
+            total_paginas = max(1, (len(reuniones_filtradas) + por_pagina - 1) // por_pagina)
+            pagina = min(max(int(st.session_state.get("reun_editar_pagina", 0)), 0), total_paginas - 1)
+            st.session_state.reun_editar_pagina = pagina
+            visibles = reuniones_filtradas[pagina * por_pagina:(pagina + 1) * por_pagina]
+            clases_estado = {"Programada": "programada", "Realizada": "realizada",
+                              "Cancelada": "cancelada", "Por confirmar": "confirmar"}
+
+            if not visibles:
+                st.info("No se encontraron reuniones con estos filtros. Prueba otro mes o una búsqueda diferente.")
+            for registro in visibles:
+                fila = registro["fila"]
+                esta_seleccionada = fila == seleccion_actual
+                hora_texto = (registro["hora"].strftime("%H:%M") if registro["hora"]
+                              else (str(registro["datos"][2]).strip() or "Hora sin definir"))
+                fecha_texto = registro["fecha"].strftime("%d/%m/%Y")
+                estado_seguro = html.escape(registro["estado"])
+                clase_estado = clases_estado.get(registro["estado"], "confirmar")
+                with st.container(key=f"reun_editar_registro_{fila}"):
+                    info, accion = st.columns([5, 1.15], gap="medium", vertical_alignment="center")
+                    with info:
+                        st.markdown(
+                            '<div class="reun-edit-fila-info">'
+                            f'<span class="reun-edit-chip">📅 {fecha_texto}</span>'
+                            f'<span class="reun-edit-chip">◷ {html.escape(hora_texto)}</span>'
+                            f'<span class="reun-edit-estado {clase_estado}">{estado_seguro}</span>'
+                            f'<h4>{html.escape(registro["asunto"] or "Sin asunto")}</h4>'
+                            f'<p>Responsable: {html.escape(registro["responsable"] or "Sin asignar")}'
+                            f' &nbsp; · &nbsp; {html.escape(registro["ubicacion"] or "Sin ubicación")}</p>'
+                            '</div>', unsafe_allow_html=True)
+                    with accion:
+                        if esta_seleccionada:
+                            st.button("✓ Seleccionada", disabled=True, use_container_width=True,
+                                      key=f"reun_editar_sel_{fila}")
+                        elif st.button("Seleccionar", key=f"reun_editar_sel_{fila}",
+                                       use_container_width=True):
+                            st.session_state.reun_editar_actual = fila
+                            st.session_state.reun_editar_modo = False
+                            st.rerun()
+
+            if total_paginas > 1:
+                anterior, indicador, siguiente = st.columns([1, 3, 1], vertical_alignment="center")
+                with anterior:
+                    if st.button("← Anteriores", key="reun_editar_anterior",
+                                 use_container_width=True, disabled=pagina == 0):
+                        st.session_state.reun_editar_pagina = pagina - 1
+                        st.rerun()
+                with indicador:
+                    st.caption(f"Página {pagina + 1} de {total_paginas} · {len(reuniones_filtradas)} reuniones")
+                with siguiente:
+                    if st.button("Siguientes →", key="reun_editar_siguiente",
+                                 use_container_width=True, disabled=pagina == total_paginas - 1):
+                        st.session_state.reun_editar_pagina = pagina + 1
+                        st.rerun()
+
+            if seleccion_actual in por_fila:
+                r = por_fila[seleccion_actual]
+                fecha_texto = r["fecha"].strftime("%d/%m/%Y")
+                hora_texto = r["hora"].strftime("%H:%M") if r["hora"] else str(r["datos"][2])
+                with st.container(key="reun_editar_vista"):
+                    st.markdown('**REUNIÓN SELECCIONADA · VISTA PREVIA**')
+                    st.markdown(f'<h3>{html.escape(r["asunto"] or "Sin asunto")}</h3>',
+                                unsafe_allow_html=True)
+                    st.markdown(
+                        '<div class="reun-edit-resumen">'
+                        f'<strong>Fecha y hora:</strong> {fecha_texto} · {html.escape(hora_texto)}'
+                        f'<br><strong>Responsable:</strong> {html.escape(r["responsable"] or "Sin asignar")}'
+                        f'<br><strong>Ubicación:</strong> {html.escape(r["ubicacion"] or "Sin ubicación")}'
+                        f'<br><strong>Estado:</strong> {html.escape(r["estado"])}'
+                        f'<br><strong>Antecedente:</strong> {html.escape(r["antecedente"] or "Sin antecedente")}'
+                        '</div>', unsafe_allow_html=True)
+                    if not st.session_state.get("reun_editar_modo", False):
+                        editar_boton, quitar_boton = st.columns([2, 1])
+                        with editar_boton:
+                            if st.button("✎ Editar esta reunión", type="primary",
+                                         use_container_width=True, key="reun_editar_abrir"):
+                                st.session_state.reun_editar_modo = True
+                                st.rerun()
+                        with quitar_boton:
+                            if st.button("Cancelar selección", use_container_width=True,
+                                         key="reun_editar_quitar"):
+                                st.session_state.reun_editar_actual = None
+                                st.session_state.reun_editar_modo = False
+                                st.rerun()
+                    else:
+                        with st.container(key="reun_editar_formulario"):
+                            st.markdown("**Editar datos y seguimiento**")
+                            st.caption("Los cambios se guardan únicamente al confirmar el formulario.")
+                            if not r["hora"]:
+                                st.warning("La hora original no se reconoció. Indica la hora correcta antes de guardar.")
+                            with st.form(key=f"reun_editar_form_{seleccion_actual}"):
+                                asunto_e = st.text_input("Asunto *", value=r["asunto"])
+                                c1, c2 = st.columns(2)
+                                with c1:
+                                    fecha_e = st.date_input("Fecha *", value=r["fecha"], format="DD/MM/YYYY")
+                                with c2:
+                                    from datetime import time as _time_reun
+                                    hora_e = st.time_input("Hora *", value=r["hora"] or _time_reun(9, 0), step=1800)
+                                ubicacion_e = st.text_input("Ubicación o enlace *", value=r["ubicacion"])
+                                opciones_edicion = ["— Selecciona responsable —", *opciones_filtro_responsables]
+                                if r["responsable"] and r["responsable"] not in opciones_edicion:
+                                    opciones_edicion.append(r["responsable"])
+                                if "Otro responsable (externo)…" not in opciones_edicion:
+                                    opciones_edicion.append("Otro responsable (externo)…")
+                                responsable_e = st.selectbox("Responsable *", opciones_edicion,
+                                    index=opciones_edicion.index(r["responsable"]) if r["responsable"] in opciones_edicion else 0)
+                                manual_e = st.text_input("Nombre del responsable externo")
+                                antecedente_e = st.text_input("Antecedente", value=r["antecedente"],
+                                    help="Si ya existe un hipervínculo con texto en Google Sheets, déjalo igual para conservar su URL.")
+                                estado_e = st.selectbox("Estado", _REUNIONES_ESTADOS,
+                                                        index=_REUNIONES_ESTADOS.index(r["estado"]))
+                                cierre_e = st.checkbox(
+                                    "Marcar automáticamente como realizada al día siguiente",
+                                    value=bool(r.get("cierre_automatico")),
+                                    help="Las reuniones antiguas tienen esta opción desactivada hasta que la habilites. "
+                                         "Solo opera mientras el estado sea Programada.",
+                                    disabled=estado_e != "Programada",
+                                )
+                                guardar_e = st.form_submit_button("Guardar cambios", type="primary", use_container_width=True)
+                            if guardar_e:
+                                try:
+                                    asignado_e = manual_e.strip() if responsable_e == "Otro responsable (externo)…" else responsable_e
+                                    if asignado_e == "— Selecciona responsable —":
+                                        raise ValueError("Selecciona a la persona responsable de la reunión.")
+                                    _reuniones_guardar_edicion(r, fecha_e, hora_e, asunto_e, ubicacion_e,
+                                                               asignado_e, antecedente_e, estado_e,
+                                                               cierre_automatico=cierre_e and estado_e == "Programada")
+                                    st.session_state.reun_exito = "Actualización correcta"
+                                    st.session_state.reun_editar_modo = False
+                                    st.session_state.reun_editar_actual = None
+                                    st.rerun()
+                                except Exception as error:
+                                    st.error(f"No se pudo completar la edición: {error}")
+                        if st.button("← Volver a la vista previa sin guardar", key="reun_editar_cancelar_form"):
+                            st.session_state.reun_editar_modo = False
+                            st.rerun()
+            else:
+                st.caption("Selecciona una reunión de la lista para revisar sus datos antes de editarla.")
 
     with pestana_historial:
         st.markdown('<div class="setf-reun-seccion">Historial de modificaciones</div>', unsafe_allow_html=True)
