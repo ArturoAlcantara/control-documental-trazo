@@ -16800,65 +16800,113 @@ elif st.session_state.menu_activo == "oficios":
         # sin URLs manuales, JavaScript en iframe ni consultas adicionales.
         st.markdown("""
         <style>
-          /* PANORAMA DOCUMENTAL · ACCESOS RÁPIDOS SETF */
+          /* PANORAMA DOCUMENTAL · PANEL INSTITUCIONAL SETF (2026-10-30).
+             Estos selectores se limitan a las cuatro tarjetas, sin modificar
+             los menús, otras áreas o la lógica del expediente. */
           div[class*="st-key-setf_of_kpi_"] {
+              --kpi-acento:#BE9B60;
               position:relative !important;
-              border:1.5px solid #C6A36D !important;
-              border-left:4px solid #C6A36D !important;
+              background:#FFFFFF !important;
+              border:1px solid #DCE4E8 !important;
               border-radius:13px !important;
-              background:#F8F5ED !important;
-              padding:12px 13px 11px !important;
-              min-height:158px !important;
-              box-shadow:0 5px 16px rgba(16,40,59,.07) !important;
-              transition:transform .15s ease, box-shadow .15s ease !important;
+              padding:14px 16px 10px !important;
+              min-height:166px !important;
+              box-shadow:0 3px 12px rgba(20,44,60,.048) !important;
+              overflow:visible !important;
+              transition:border-color .15s ease, box-shadow .15s ease, transform .15s ease !important;
           }
+          div[class*="st-key-setf_of_kpi_"]::before {
+              content:"";position:absolute;left:0;top:16px;bottom:16px;width:3px;
+              border-radius:0 3px 3px 0;background:var(--kpi-acento);
+              opacity:.8;pointer-events:none;
+          }
+          div[class*="st-key-setf_of_kpi_firma"] {--kpi-acento:#678BA3;}
+          div[class*="st-key-setf_of_kpi_concluidos"] {
+              --kpi-acento:#4C9374;border-color:#BAD7C7 !important;
+          }
+          div[class*="st-key-setf_of_kpi_pendientes"] {--kpi-acento:#B77E66;}
           div[class*="st-key-setf_of_kpi_"]:hover {
+              border-color:#C2D0D7 !important;
+              box-shadow:0 7px 20px rgba(20,44,60,.09) !important;
               transform:translateY(-1px);
-              box-shadow:0 8px 20px rgba(16,40,59,.11) !important;
           }
-          div[class*="st-key-setf_of_kpi_firma"] {background:#F0F6FA !important;border-color:#6887A0 !important;border-left-color:#6887A0 !important;}
-          div[class*="st-key-setf_of_kpi_concluidos"] {background:#F0F8F4 !important;border-color:#4F927B !important;border-left-color:#4F927B !important;}
-          div[class*="st-key-setf_of_kpi_pendientes"] {background:#FBF3EF !important;border-color:#B77D61 !important;border-left-color:#B77D61 !important;}
-          div[class*="st-key-setf_of_kpi_"] [data-testid="stVerticalBlock"] {gap:.24rem !important;}
-          .setf-of-kpi-top {display:flex;align-items:center;justify-content:space-between;gap:8px;}
-          .setf-of-kpi-number {font-size:32px;line-height:1;letter-spacing:-.8px;font-weight:800;color:#152E3C;font-variant-numeric:tabular-nums;}
-          .setf-of-kpi-icon {width:31px;height:31px;border-radius:9px;background:rgba(255,255,255,.65);border:1px solid rgba(110,125,135,.16);color:#7C6135;display:grid;place-items:center;font-size:17px;}
-          .setf-of-kpi-title {margin:7px 0 2px;font-weight:800;font-size:13px;line-height:1.2;color:#1B3546;}
-          .setf-of-kpi-desc {font-size:10.5px;line-height:1.25;color:#6B7D87;min-height:13px;}
-          .st-key-setf_of_kpi_firma .setf-of-kpi-icon {color:#3F698A;}
-          .st-key-setf_of_kpi_concluidos .setf-of-kpi-icon {color:#317A60;}
-          .st-key-setf_of_kpi_pendientes .setf-of-kpi-icon {color:#A05E45;}
-          div[class*="st-key-setf_of_kpi_"] [data-testid="stHorizontalBlock"] {gap:6px !important;align-items:center!important;}
+          div[class*="st-key-setf_of_kpi_concluidos"]:hover {border-color:#8FBEA7 !important;}
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stVerticalBlock"] {gap:.16rem !important;}
+          .setf-of-kpi-content {min-width:0;}
+          .setf-of-kpi-top {
+              display:flex;align-items:center;justify-content:space-between;gap:9px;
+          }
+          .setf-of-kpi-kicker {
+              font-size:9px;font-weight:750;letter-spacing:1.1px;
+              color:#72818C;text-transform:uppercase;white-space:nowrap;
+          }
+          .setf-of-kpi-icon {
+              width:29px;height:29px;flex:0 0 29px;
+              display:grid;place-items:center;border-radius:9px;
+              color:var(--kpi-acento);background:#F6F8F9;
+              border:1px solid #E8ECEE;font-size:15px;font-weight:750;
+          }
+          .setf-of-kpi-number {
+              display:block;margin:2px 0 0;color:#182F40;
+              font-size:34px;line-height:1.05;letter-spacing:-1px;
+              font-weight:800;font-variant-numeric:tabular-nums;
+          }
+          div[class*="st-key-setf_of_kpi_concluidos"] .setf-of-kpi-number {color:#277152;}
+          .setf-of-kpi-title {
+              font-size:13px;font-weight:800;line-height:1.25;
+              color:#223A48;margin:4px 0 1px;
+          }
+          .setf-of-kpi-desc {
+              color:#71818B;font-size:10.5px;line-height:1.3;
+              min-height:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+          }
+          /* Pie con un acceso directo discreto y menú contextual persistente. */
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stHorizontalBlock"] {
+              gap:5px !important;align-items:center !important;
+              border-top:1px solid #E9EDF0;padding-top:7px;margin-top:7px;
+          }
           div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button,
           div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button {
-              min-height:30px !important;height:30px !important;
-              border-radius:8px !important;padding:2px 8px !important;
-              font-size:11px !important;font-weight:700 !important;
-              border:1px solid #C7D1D5 !important;background:rgba(255,255,255,.75) !important;
-              color:#253C49 !important;box-shadow:none!important;
+              min-height:28px !important;height:28px !important;
+              border-radius:7px !important;padding:3px 7px !important;
+              border:1px solid transparent !important;
+              background:transparent !important;color:#2D5062 !important;
+              box-shadow:none !important;font-size:11px !important;
+              font-weight:700 !important;
           }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button p {color:inherit !important;}
           div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button:hover,
           div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button:hover {
-              background:#E5EBE9 !important;border-color:#9BADB2!important;color:#1D3D42!important;
+              background:#F1F5F6 !important;color:#17394A !important;
+              border-color:#E2E9EC !important;
+          }
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stButton"] button:focus-visible,
+          div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button:focus-visible {
+              outline:2px solid #648FA4 !important;outline-offset:1px;
           }
           div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button {
-              line-height:1!important;padding:0!important;
+              min-width:30px!important;padding:0!important;line-height:1!important;
           }
           div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button p {
               font-size:0!important;line-height:0!important;
           }
           div[class*="st-key-setf_of_kpi_"] [data-testid="stPopover"] button::after {
-              content:"▾";font-size:17px;font-weight:800;color:#253C49;
-              line-height:1;display:block;
+              content:"⋯";font-size:20px;font-weight:750;
+              color:#607683;line-height:1;display:block;
           }
-          /* Las cuatro tarjetas tienen la misma altura y el pie a la misma cota. */
+          /* Alinear las cuatro tarjetas aunque una descripción sea más larga. */
           div[class*="st-key-setf_of_kpi_"] > div[data-testid="stVerticalBlock"] {
-              min-height:132px!important;display:flex!important;flex-direction:column!important;
-              justify-content:space-between!important;
+              min-height:140px!important;display:flex!important;
+              flex-direction:column!important;justify-content:space-between!important;
           }
           @media(max-width:1100px) {
-            div[class*="st-key-setf_of_kpi_"] {min-height:162px!important;}
-            .setf-of-kpi-number {font-size:28px;}
+              div[class*="st-key-setf_of_kpi_"] {padding:12px 12px 9px!important;min-height:161px!important;}
+              .setf-of-kpi-kicker {font-size:8px;letter-spacing:.7px;}
+              .setf-of-kpi-number {font-size:31px;}
+          }
+          @media(max-width:730px) {
+              div[class*="st-key-setf_of_kpi_"] {min-height:155px!important;}
+              div[class*="st-key-setf_of_kpi_"] > div[data-testid="stVerticalBlock"] {min-height:128px!important;}
           }
         </style>
         """, unsafe_allow_html=True)
@@ -16885,25 +16933,26 @@ elif st.session_state.menu_activo == "oficios":
             navegar_a(modulo)
 
         opciones_kpi = (
-            ("revision", int(n_revision), "En revisión", "Documentación en análisis", "◷",
+            ("revision", int(n_revision), "01 / REVISIÓN", "En revisión", "Documentos por validar", "◷",
              ("oficios", {"estado": "En revisión"})),
-            ("firma", int(n_firma), "En firma", "Pendiente de formalización", "✎",
+            ("firma", int(n_firma), "02 / FIRMA", "En firma", "Pendientes de firma externa", "✎",
              ("pendientes", {"vista": "Mis pendientes", "bandeja": "En proceso de firma"})),
-            ("concluidos", int(n_concluidos), "Firmados", "Documentos formalizados", "✓",
+            ("concluidos", int(n_concluidos), "03 / FINALIZADOS", "Firmados", "Expedientes concluidos", "✓",
              ("firmados", {"vista_firmados": "todos"})),
-            ("pendientes", int(n_pendientes), "Pendientes", "Requieren seguimiento", "!",
+            ("pendientes", int(n_pendientes), "04 / SEGUIMIENTO", "Pendientes", "Requieren atención", "!",
              ("pendientes", {"vista": "Pendientes de la mesa"})),
         )
-        for columna, (clave, numero, titulo, descripcion, icono, destino) in zip(
+        for columna, (clave, numero, categoria, titulo, descripcion, icono, destino) in zip(
                 st.columns(4, gap="small"), opciones_kpi):
             with columna:
                 with st.container(key=f"setf_of_kpi_{clave}"):
                     st.markdown(
                         '<div class="setf-of-kpi-content" translate="no">'
                         '<div class="setf-of-kpi-top">'
-                        f'<span class="setf-of-kpi-number">{numero:02d}</span>'
+                        f'<span class="setf-of-kpi-kicker">{html.escape(categoria)}</span>'
                         f'<span class="setf-of-kpi-icon" aria-hidden="true">{icono}</span>'
                         '</div>'
+                        f'<span class="setf-of-kpi-number">{numero}</span>'
                         f'<div class="setf-of-kpi-title">{html.escape(titulo)}</div>'
                         f'<div class="setf-of-kpi-desc">{html.escape(descripcion)}</div>'
                         '</div>', unsafe_allow_html=True,
@@ -16911,14 +16960,14 @@ elif st.session_state.menu_activo == "oficios":
                     accion_col, flecha_col = st.columns([4.6, 1], gap="small",
                                                           vertical_alignment="center")
                     with accion_col:
-                        if st.button("Abrir listado", key=f"setf_of_abrir_{clave}",
+                        if st.button("Ver listado ↗", key=f"setf_of_abrir_{clave}",
                                      use_container_width=True,
                                      help=f"Consultar {titulo.lower()}"):
                             _setf_ir_desde_kpi(destino[0], **destino[1])
                     with flecha_col:
-                        # Popover real de Streamlit: el menú flota sobre la página
-                        # y NO aumenta el alto de ninguna de las cuatro tarjetas.
-                        with st.popover(f"Accesos {titulo}", use_container_width=True):
+                        # Conserva los accesos secundarios y sus permisos.
+                        # El menú flota y no aumenta el alto de las tarjetas.
+                        with st.popover(f"Más accesos de {titulo}", use_container_width=True):
                             st.markdown(f"**{titulo} · Accesos rápidos**")
                             if clave == "revision":
                                 if st.button("Ver oficios en revisión", key="setf_kpi_rev_listado",
