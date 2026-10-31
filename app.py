@@ -3672,7 +3672,7 @@ def _mover_documento_formulario(tipo, posicion, movimiento):
         st.session_state[segunda] = valor_primero
 
 
-def documentos_formulario(tipo, ordenar=False):
+def documentos_formulario(tipo, ordenar=False, despues_de_recibido=False):
     if tipo not in st.session_state:
         st.session_state[tipo] = []
 
@@ -3680,7 +3680,8 @@ def documentos_formulario(tipo, ordenar=False):
 
     for indice, documento in enumerate(documentos):
         if ordenar:
-            etiqueta = "Antecedente más cercano" if indice == 0 else "Antecedente anterior"
+            etiqueta = ("Antecedente anterior más cercano" if despues_de_recibido else
+                        "Antecedente más cercano") if indice == 0 else "Antecedente anterior"
             col_titulo, col_subir, col_bajar = st.columns([5.4, 1, 1], vertical_alignment="center")
             with col_titulo:
                 st.markdown(f"**{etiqueta}**")
@@ -3716,6 +3717,53 @@ def documentos_formulario(tipo, ordenar=False):
         st.rerun()
 
     return documentos
+
+
+def _antecedentes_con_recibido(numero_recibido, enlace_recibido, adicionales):
+    """Primero el oficio recibido; despues, antecedentes anteriores en orden manual.
+
+    No guarda dos veces el mismo archivo aunque se haya incluido por error entre
+    los adicionales. No realiza consultas a Sheets ni a Drive y no toca los anexos.
+    """
+    from urllib.parse import urlparse, parse_qs
+
+    def clave(url):
+        url = str(url or "").strip()
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        dominio = (parsed.hostname or "").lower()
+        if dominio in ("drive.google.com", "docs.google.com"):
+            match = re.search(r"/(?:file|document|spreadsheets|presentation)/d/([^/?#]+)",
+                              parsed.path, flags=re.I)
+            if match:
+                return "drive:" + match.group(1)
+            identificador = parse_qs(parsed.query).get("id", [])
+            if identificador and identificador[0]:
+                return "drive:" + identificador[0]
+        return url.rstrip("/")
+
+    resultado, vistos = [], set()
+    url_principal = str(enlace_recibido or "").strip()
+    if url_principal:
+        numero = str(numero_recibido or "").strip()
+        resultado.append({"nombre": f"Oficio No. {numero}" if numero else "Oficio recibido",
+                          "url": url_principal})
+        vistos.add(clave(url_principal))
+
+    for item in (adicionales or []):
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "") or "").strip()
+        if not url:
+            continue
+        id_documento = clave(url)
+        if id_documento in vistos:
+            continue
+        vistos.add(id_documento)
+        resultado.append({"nombre": str(item.get("nombre", "") or "").strip() or "Documento",
+                          "url": url})
+    return resultado
 
 
 # =========================================================
@@ -4624,9 +4672,13 @@ def formulario_nuevo_oficio():
         help="Si no existe folio, el expediente se identifica por el número del documento.",
     )
     tiene_antecedentes = st.checkbox(
-        "Este expediente tiene antecedentes" if es_par_cei else "Este oficio tiene antecedentes", value=True,
+        "Este expediente tiene antecedentes" if es_par_cei
+        else "Este oficio tiene antecedentes anteriores", value=True,
         key=f"tiene_antecedentes_{version}",
-        help="Si no tiene antecedentes, el registro continúa normalmente.",
+        help=("Indica si agregarás documentos anteriores al oficio recibido. "
+              "El oficio recibido se vincula automáticamente con su enlace, "
+              "independientemente de esta casilla." if not es_par_cei
+              else "Si no tiene antecedentes, el registro continúa normalmente."),
     )
     # Caso especial: el oficio aún no tiene folio ni antecedentes. El número
     # definitivo de salida se captura en «Oficio que saldrá firmado» más abajo.
@@ -4816,6 +4868,27 @@ def formulario_nuevo_oficio():
         height=75,
         key=f"asunto_{version}"
     )
+
+    # El folio y número de arriba pertenecen al oficio RECIBIDO, no al nuevo
+    # documento de respuesta. El enlace de ese oficio se captura solo una vez.
+    # Unicamente aparece en la modalidad Oficios: para C.E.I + Tarjeta se
+    # conserva su registro conjunto y ambos números en el bloque inferior.
+    enlace_oficio_recibido = ""
+    if not es_par_cei and not registro_solo_numero_salida:
+        st.markdown("**▣ Oficio recibido · antecedente inmediato**")
+        enlace_oficio_recibido = st.text_input(
+            "Enlace de Google Drive del oficio recibido (opcional)",
+            key=f"enlace_oficio_recibido_{version}",
+            placeholder="https://drive.google.com/...",
+            help="El folio y número ya se capturaron arriba. Al guardar, el enlace "
+                 "se incorporará automáticamente como primer antecedente, sin repetir la captura.",
+        ).strip()
+        if enlace_oficio_recibido:
+            st.caption("Este documento se incluirá al inicio de los antecedentes. "
+                       "Debajo puedes agregar los antecedentes más antiguos, si existen.")
+        else:
+            st.caption("Si tienes el documento recibido en Drive, vincúlalo aquí; "
+                       "no necesitas volver a agregarlo abajo.")
 
     st.markdown(
         """
@@ -5125,14 +5198,26 @@ def formulario_nuevo_oficio():
                 """,
                 unsafe_allow_html=True
             )
+            if not es_par_cei and enlace_oficio_recibido:
+                st.markdown(f"**{'Oficio No. ' + numero.strip() if numero.strip() else 'Oficio recibido'}** · Antecedente inmediato")
+                st.caption("Vinculado automáticamente desde los datos principales. "
+                           "Se mostrará antes de los documentos que agregues aquí.")
             if tiene_antecedentes:
-                st.caption("Orden documental: primero va el oficio firmado; después, el antecedente "
-                           "más cercano a ese oficio y luego los anteriores, en cadena. "
-                           "Usa ↑ y ↓ si necesitas ajustar el orden. Se guardará tal cual.")
-                antecedentes = documentos_formulario(f"antecedentes_{version}", ordenar=True)
+                if es_par_cei:
+                    st.caption("Agrega los antecedentes de la entrega del más cercano "
+                               "al más antiguo. Usa ↑ y ↓ para ajustar el orden.")
+                else:
+                    st.caption("Antecedentes anteriores: agrega solo los documentos previos "
+                               "al oficio recibido, del más cercano al más antiguo. "
+                               "Usa ↑ y ↓ para ordenar; no se añadirán números a los nombres.")
+                antecedentes = documentos_formulario(
+                    f"antecedentes_{version}", ordenar=True,
+                    despues_de_recibido=(not es_par_cei and bool(enlace_oficio_recibido)))
             else:
                 antecedentes = []
-                st.caption("Sin antecedentes · este campo quedará vacío en Google Sheets.")
+                st.caption("Sin antecedentes adicionales. El oficio recibido conservará "
+                           "su vínculo si lo agregaste arriba." if not es_par_cei
+                           else "Sin antecedentes · este campo quedará vacío en Google Sheets.")
         with col_doc2:
             st.markdown(
                 """
@@ -5148,6 +5233,12 @@ def formulario_nuevo_oficio():
                 unsafe_allow_html=True
             )
             anexos = documentos_formulario(f"anexos_{version}")
+
+    # No duplicar el oficio recibido en el listado: toda la aplicación ya
+    # lee el campo Antecedente en el orden original (Tte., En firma y Firmados).
+    if not es_par_cei and enlace_oficio_recibido:
+        antecedentes = _antecedentes_con_recibido(
+            numero, enlace_oficio_recibido, antecedentes)
 
     observaciones = st.text_area(
         "Observaciones",
@@ -5185,6 +5276,15 @@ def formulario_nuevo_oficio():
                 else "Debes capturar el número de oficio."
             )
             return
+        if enlace_oficio_recibido:
+            from urllib.parse import urlparse
+            parsed_recibido = urlparse(enlace_oficio_recibido)
+            if (parsed_recibido.scheme != "https" or
+                    (parsed_recibido.hostname or "").lower() not in
+                    ("drive.google.com", "docs.google.com")):
+                st.error("El enlace del oficio recibido debe ser una liga HTTPS "
+                         "válida de Google Drive.")
+                return
         if es_par_cei:
             if not numero_tarjeta.strip():
                 st.error("Debes capturar el número único de Tarjeta.")
@@ -5355,7 +5455,7 @@ def formulario_nuevo_oficio():
                     _registrar_modalidad(
                         folio.strip(), numero.strip(),
                         "Directo" if tramite_directo else "Ordinario",
-                        tiene_antecedentes, nombre_principal.strip(), url_principal.strip(),
+                        bool(antecedentes), nombre_principal.strip(), url_principal.strip(),
                     )
                 except Exception as error:
                     st.error("El oficio quedó guardado en OFICIOS, pero falló el registro "
