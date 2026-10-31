@@ -3719,7 +3719,7 @@ def documentos_formulario(tipo, ordenar=False, despues_de_recibido=False):
     return documentos
 
 
-def _antecedentes_con_recibido(numero_recibido, enlace_recibido, adicionales):
+def _antecedentes_con_recibido(numero_recibido, enlace_recibido, adicionales, *, conservar_sin_enlace=False):
     """Primero el oficio recibido; despues, antecedentes anteriores en orden manual.
 
     No guarda dos veces el mismo archivo aunque se haya incluido por error entre
@@ -3745,11 +3745,16 @@ def _antecedentes_con_recibido(numero_recibido, enlace_recibido, adicionales):
 
     resultado, vistos = [], set()
     url_principal = str(enlace_recibido or "").strip()
-    if url_principal:
-        numero = str(numero_recibido or "").strip()
-        resultado.append({"nombre": f"Oficio No. {numero}" if numero else "Oficio recibido",
-                          "url": url_principal})
-        vistos.add(clave(url_principal))
+    numero = str(numero_recibido or "").strip()
+    if url_principal or (numero and conservar_sin_enlace):
+        principal = {"nombre": f"Oficio No. {numero}" if numero else "Oficio recibido",
+                     "url": url_principal}
+        if not url_principal:
+            # Metadato recuperable: no crear un vínculo falso en Streamlit.
+            principal["tipo"] = "oficio_recibido"
+        resultado.append(principal)
+        if url_principal:
+            vistos.add(clave(url_principal))
 
     for item in (adicionales or []):
         if not isinstance(item, dict):
@@ -4675,28 +4680,29 @@ def formulario_nuevo_oficio():
     tipo_documento = tipo_visible
     etiqueta_principal_par = tipo_visible if es_par_cei else "Oficio"
     if es_par_cei:
-        st.caption(f"{etiqueta_principal_par} y su Tarjeta llevan números distintos, "
-                   "pero se entregan juntos. Responsable, asunto, antecedentes y anexos "
-                   "se capturan una sola vez.")
+        st.caption(f"El folio y el No. de oficio recibido identifican el antecedente. "
+                   f"Los números propios de {etiqueta_principal_par} y de su Tarjeta "
+                   "se capturan abajo y son distintos. El resto de los datos se comparte.")
     tiene_folio = st.checkbox(
-        ("Este documento tiene folio" if tipo_visible == "Intersecretarial" else
-         "Este mensaje tiene folio" if es_par_cei else "Este oficio tiene folio"), value=True,
+        ("El oficio recibido tiene folio" if es_par_cei else
+         "Este oficio tiene folio"), value=True,
         key=f"tiene_folio_{version}",
         help="Si no existe folio, el expediente se identifica por el número del documento.",
     )
     tiene_antecedentes = st.checkbox(
-        "Este expediente tiene antecedentes" if es_par_cei
+        "Este expediente tiene antecedentes anteriores" if es_par_cei
         else "Este oficio tiene antecedentes anteriores", value=True,
         key=f"tiene_antecedentes_{version}",
         help=("Indica si agregarás documentos anteriores al oficio recibido. "
               "El oficio recibido se vincula automáticamente con su enlace, "
               "independientemente de esta casilla." if not es_par_cei
-              else "Si no tiene antecedentes, el registro continúa normalmente."),
+              else "El oficio recibido se incorpora como antecedente inmediato; marca esta opción "
+                   "si existen documentos anteriores adicionales."),
     )
     # Caso especial: el oficio aún no tiene folio ni antecedentes. El número
     # definitivo de salida se captura en «Oficio que saldrá firmado» más abajo.
     # Sigue siendo un trámite ORDINARIO, sin saltar las etapas de revisión/firma.
-    registro_solo_numero_salida = not tiene_folio and not tiene_antecedentes
+    registro_solo_numero_salida = (not es_par_cei and not tiene_folio and not tiene_antecedentes)
     if registro_solo_numero_salida:
         st.info(
             "**Registro sin folio ni antecedentes.** Indica el proyecto y el número "
@@ -4734,6 +4740,7 @@ def formulario_nuevo_oficio():
     )
     if not responsables_disponibles:
         st.warning("No hay responsables SETF configurados. Agrega al menos un usuario con area = 'setf' en Secrets.")
+    numero_oficio_recibido = ""
     if registro_solo_numero_salida:
         # Estos campos no se dibujan arriba ni como placeholders.
         # «numero» recibirá el valor del campo de salida antes de guardar.
@@ -4755,9 +4762,16 @@ def formulario_nuevo_oficio():
                 st.caption("No aplica · expediente sin folio")
         with col2:
             if es_par_cei:
-                numero = ""  # Se captura en la sección conjunta inferior, sin duplicarlo.
-                st.markdown(f"**Número de {etiqueta_principal_par}**")
-                st.caption("Se captura abajo, en «Documentos de la entrega».")
+                # Identidad de ENTRADA: oficio al que contestamos. Es diferente
+                # de los números de salida del Mensaje/Intersecretarial y Tarjeta.
+                numero = ""  # El número de salida se captura abajo.
+                numero_oficio_recibido = st.text_input(
+                    "No. de oficio recibido (antecedente)",
+                    key=f"numero_oficio_antecedente_{version}",
+                    placeholder="Ej. 0002",
+                    help="Oficio recibido al que se responde con el Mensaje o Intersecretarial. "
+                         "No sustituye al número único del documento de salida.",
+                ).strip()
             else:
                 numero = st.text_input("No. de oficio", key=f"numero_{version}")
         with col3:
@@ -4884,10 +4898,10 @@ def formulario_nuevo_oficio():
 
     # El folio y número de arriba pertenecen al oficio RECIBIDO, no al nuevo
     # documento de respuesta. El enlace de ese oficio se captura solo una vez.
-    # Unicamente aparece en la modalidad Oficios: para C.E.I + Tarjeta se
-    # conserva su registro conjunto y ambos números en el bloque inferior.
+    # También se usa en Mensaje C.E.I / Intersecretarial. El vínculo se
+    # convierte en primer antecedente, sin duplicar un archivo en Drive.
     enlace_oficio_recibido = ""
-    if not es_par_cei and not registro_solo_numero_salida:
+    if not registro_solo_numero_salida:
         st.markdown("**▣ Oficio recibido · antecedente inmediato**")
         enlace_oficio_recibido = st.text_input(
             "Enlace de Google Drive del oficio recibido (opcional)",
@@ -4901,6 +4915,10 @@ def formulario_nuevo_oficio():
                        "Debajo puedes agregar los antecedentes más antiguos, si existen.")
         else:
             st.caption("Si tienes el documento recibido en Drive, vincúlalo aquí; "
+                       "no necesitas volver a agregarlo abajo. "
+                       "En Mensajes C.E.I e Intersecretariales se conserva su número "
+                       "aunque todavía no dispongas del enlace." if es_par_cei else
+                       "Si tienes el documento recibido en Drive, vincúlalo aquí; "
                        "no necesitas volver a agregarlo abajo.")
 
     st.markdown(
@@ -5212,26 +5230,22 @@ def formulario_nuevo_oficio():
                 """,
                 unsafe_allow_html=True
             )
-            if not es_par_cei and enlace_oficio_recibido:
-                st.markdown(f"**{'Oficio No. ' + numero.strip() if numero.strip() else 'Oficio recibido'}** · Antecedente inmediato")
+            if enlace_oficio_recibido or (es_par_cei and numero_oficio_recibido):
+                numero_entrada = numero_oficio_recibido if es_par_cei else numero
+                st.markdown(f"**{'Oficio No. ' + numero_entrada.strip() if numero_entrada.strip() else 'Oficio recibido'}** · Antecedente inmediato")
                 st.caption("Vinculado automáticamente desde los datos principales. "
                            "Se mostrará antes de los documentos que agregues aquí.")
             if tiene_antecedentes:
-                if es_par_cei:
-                    st.caption("Agrega los antecedentes de la entrega del más cercano "
-                               "al más antiguo. Usa ↑ y ↓ para ajustar el orden.")
-                else:
-                    st.caption("Antecedentes anteriores: agrega solo los documentos previos "
-                               "al oficio recibido, del más cercano al más antiguo. "
-                               "Usa ↑ y ↓ para ordenar; no se añadirán números a los nombres.")
+                st.caption("Antecedentes anteriores: agrega solo los documentos previos "
+                           "al oficio recibido, del más cercano al más antiguo. "
+                           "Usa ↑ y ↓ para ordenar; no se añadirán números a los nombres.")
                 antecedentes = documentos_formulario(
                     f"antecedentes_{version}", ordenar=True,
-                    despues_de_recibido=(not es_par_cei and bool(enlace_oficio_recibido)))
+                    despues_de_recibido=bool(enlace_oficio_recibido or numero_oficio_recibido))
             else:
                 antecedentes = []
                 st.caption("Sin antecedentes adicionales. El oficio recibido conservará "
-                           "su vínculo si lo agregaste arriba." if not es_par_cei
-                           else "Sin antecedentes · este campo quedará vacío en Google Sheets.")
+                           "su número y su vínculo si lo capturaste arriba.")
         with col_doc2:
             st.markdown(
                 """
@@ -5248,11 +5262,13 @@ def formulario_nuevo_oficio():
             )
             anexos = documentos_formulario(f"anexos_{version}")
 
-    # No duplicar el oficio recibido en el listado: toda la aplicación ya
-    # lee el campo Antecedente en el orden original (Tte., En firma y Firmados).
-    if not es_par_cei and enlace_oficio_recibido:
+    # Preservar la identidad del documento recibido aun cuando el PDF no esté
+    # vinculado todavía. No se consulta ni sube nada adicional a Google Drive.
+    numero_entrada = numero_oficio_recibido if es_par_cei else numero
+    if enlace_oficio_recibido or (es_par_cei and numero_oficio_recibido):
         antecedentes = _antecedentes_con_recibido(
-            numero, enlace_oficio_recibido, antecedentes)
+            numero_entrada, enlace_oficio_recibido, antecedentes,
+            conservar_sin_enlace=es_par_cei)
 
     observaciones = st.text_area(
         "Observaciones",
@@ -5290,6 +5306,9 @@ def formulario_nuevo_oficio():
                 else "Debes capturar el número de oficio."
             )
             return
+        if es_par_cei and enlace_oficio_recibido and not numero_oficio_recibido:
+            st.error("Captura el No. de oficio recibido para identificar su antecedente.")
+            return
         if enlace_oficio_recibido:
             from urllib.parse import urlparse
             parsed_recibido = urlparse(enlace_oficio_recibido)
@@ -5325,7 +5344,7 @@ def formulario_nuevo_oficio():
             st.error("Selecciona el proyecto al que pertenece el oficio.")
             return
         if tiene_folio and not folio.strip():
-            st.error("Captura el folio o desmarca «Este oficio tiene folio».")
+            st.error("Captura el folio o desmarca la opción «tiene folio».")
             return
 
         if not responsable:
@@ -5529,7 +5548,7 @@ def formulario_nuevo_oficio():
 # CONSULTA DE DOCUMENTOS
 # =========================================================
 
-def leer_documentos(valor):
+def leer_documentos(valor, *, incluir_sin_enlace=False):
     """Acepta JSON de varios documentos o enlaces pegados en Sheets."""
     if not valor:
         return []
@@ -5554,6 +5573,9 @@ def leer_documentos(valor):
             nombre = f"Documento {i}"
         if url.startswith(("https://", "http://")):
             documentos.append({"nombre": nombre, "url": url})
+        elif (incluir_sin_enlace and isinstance(elemento, dict)
+              and elemento.get("tipo") == "oficio_recibido" and not url):
+            documentos.append({"nombre": nombre, "url": "", "tipo": "oficio_recibido"})
     return documentos
 
 
@@ -5633,7 +5655,7 @@ def _modificar_vinculos(folio, numero, categoria, accion, *, indice=None,
     oficio = {"Responsable": valor(fila, "Responsable")}
     if not _permiso_vinculos(oficio):
         raise PermissionError("No tienes permiso para modificar estos documentos.")
-    actuales = leer_documentos(valor(fila, categoria))
+    actuales = leer_documentos(valor(fila, categoria), incluir_sin_enlace=(categoria == "Antecedente"))
     anterior = None
     if accion != "Agregar":
         if indice is None or not (0 <= indice < len(actuales)):
@@ -5664,7 +5686,7 @@ def _modificar_vinculos(folio, numero, categoria, accion, *, indice=None,
                      json.dumps(actuales, ensure_ascii=False))
     _invalidar_cache_documental(oficios=True)
     verificado = hoja.cell(fila_num, cab.index(categoria) + 1).value or ""
-    if leer_documentos(verificado) != actuales:
+    if leer_documentos(verificado, incluir_sin_enlace=(categoria == "Antecedente")) != actuales:
         raise RuntimeError("No se pudo verificar el cambio en Sheets. Revisa el expediente antes de repetir.")
     try:
         eventos.append_row([
@@ -5681,13 +5703,16 @@ def _panel_gestion_vinculos(oficio, categoria, etiqueta, icono, clave):
     """Edición de nombre y enlace como en el registro inicial del oficio."""
     folio = str(oficio.get("Folio", "")).strip()
     numero = str(oficio.get("No. de oficio", "")).strip()
-    documentos = leer_documentos(oficio.get(categoria, ""))
+    documentos = leer_documentos(oficio.get(categoria, ""), incluir_sin_enlace=(categoria == "Antecedente"))
     editable = _permiso_vinculos(oficio)
     with st.expander(f"{icono}  {etiqueta} ({len(documentos)})"):
         if not documentos:
             st.caption("Sin documentos registrados.")
         for i, doc in enumerate(documentos):
-            st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+            if doc.get("url"):
+                st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+            else:
+                st.caption(doc["nombre"] + " · Enlace pendiente")
             if editable:
                 with st.expander(f"Editar documento {i + 1}", expanded=False):
                     modo = st.radio("Acción", ["Modificar nombre o enlace", "Desvincular"],
@@ -5749,7 +5774,7 @@ def mostrar_documentos(oficio, titulo=True):
         st.link_button(documento["nombre"], documento["url"])
 
     antecedentes = leer_documentos(
-        oficio.get("Antecedente", "")
+        oficio.get("Antecedente", ""), incluir_sin_enlace=True
     )
 
     with st.expander("Ver antecedentes"):
@@ -5762,6 +5787,8 @@ def mostrar_documentos(oficio, titulo=True):
                     documento.get("nombre") or "Ver antecedente",
                     documento["url"]
                 )
+            else:
+                st.caption(documento.get("nombre", "Oficio recibido") + " · Enlace pendiente")
 
     anexos = leer_documentos(
         oficio.get("Anexo", "")
@@ -5800,7 +5827,8 @@ def _documentos_relacionados_revision_tte(oficio):
         ("Antecedentes", "Antecedente", "▤", "antecedente"),
         ("Anexos", "Anexo", "◇", "anexo"),
     ):
-        documentos = leer_documentos(oficio.get(campo, ""))
+        documentos = leer_documentos(
+            oficio.get(campo, ""), incluir_sin_enlace=(campo == "Antecedente"))
         with st.expander(f"{icono} {titulo} ({len(documentos)})", expanded=False):
             if not documentos:
                 st.caption(f"Sin {titulo.lower()} vinculados al oficio.")
@@ -5811,6 +5839,8 @@ def _documentos_relacionados_revision_tte(oficio):
                         documento.get("nombre") or f"Abrir {singular}",
                         url, use_container_width=True,
                     )
+                else:
+                    st.caption((documento.get("nombre") or "Oficio recibido") + " · Enlace pendiente")
 
 
 def _panel_revision_tte(registro, oficio_relacionado=None):
@@ -9815,12 +9845,15 @@ def _documentos_seccion(oficio):
     grupos = (("Oficio firmado", "Firmado"), ("Oficio original / antecedentes", "Antecedente"),
               ("Anexos", "Anexo"))
     for titulo, campo in grupos:
-        docs = leer_documentos(oficio.get(campo, ""))
+        docs = leer_documentos(oficio.get(campo, ""), incluir_sin_enlace=(campo == "Antecedente"))
         with st.expander(f"{titulo} ({len(docs)})", expanded=(campo == "Firmado")):
             if not docs:
                 st.caption("Sin documentos vinculados en el registro.")
             for doc in docs:
-                st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+                if doc.get("url"):
+                    st.link_button(doc["nombre"], doc["url"], use_container_width=True)
+                else:
+                    st.caption(doc["nombre"] + " · Enlace pendiente")
 
 
 def _modulo_lateral_documentos(tipo):
@@ -10798,14 +10831,18 @@ def _modulo_lateral_documentos(tipo):
                                         (ca, "Antecedente", "Antecedentes"),
                                         (cb, "Anexo", "Anexos"),
                                     ):
-                                        archivos = leer_documentos(cei.get(campo, ""))
+                                        archivos = leer_documentos(
+                                            cei.get(campo, ""), incluir_sin_enlace=(campo == "Antecedente"))
                                         with columna:
                                             if archivos:
                                                 with st.popover(etiqueta, use_container_width=True):
                                                     for archivo in archivos:
                                                         # El JSON almacena el orden elegido en el registro.
-                                                        st.link_button(archivo["nombre"], archivo["url"],
-                                                                       use_container_width=True)
+                                                        if archivo.get("url"):
+                                                            st.link_button(archivo["nombre"], archivo["url"],
+                                                                           use_container_width=True)
+                                                        else:
+                                                            st.caption(archivo["nombre"] + " · Enlace pendiente")
                                             else:
                                                 st.button(etiqueta, disabled=True,
                                                           key=f"sin_{campo}_{token_par}",
@@ -10816,7 +10853,8 @@ def _modulo_lateral_documentos(tipo):
                         responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
                         documentos = {
                             "firmado": leer_documentos(oficio.get("Firmado", "")),
-                            "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
+                            "antecedentes": leer_documentos(
+                                oficio.get("Antecedente", ""), incluir_sin_enlace=True),
                             "anexos": leer_documentos(oficio.get("Anexo", "")),
                         }
                         fecha = _fecha_firma(oficio)
@@ -10916,8 +10954,11 @@ def _modulo_lateral_documentos(tipo):
                                                     # No se numeran ni se ordenan alfabeticamente;
                                                     # se conserva la secuencia registrada en Sheets.
                                                     for archivo in archivos:
-                                                        st.link_button(archivo["nombre"], archivo["url"],
-                                                                       use_container_width=True)
+                                                        if archivo.get("url"):
+                                                            st.link_button(archivo["nombre"], archivo["url"],
+                                                                           use_container_width=True)
+                                                        else:
+                                                            st.caption(archivo["nombre"] + " · Enlace pendiente")
                                             else:
                                                 st.button(etiqueta, key=f"firm_arch_vacio_{categoria}_{token}",
                                                           disabled=True, use_container_width=True,
@@ -10945,7 +10986,8 @@ def _modulo_lateral_documentos(tipo):
                 responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
                 documentos = {
                     "firmado": leer_documentos(oficio.get("Firmado", "")),
-                    "antecedentes": leer_documentos(oficio.get("Antecedente", "")),
+                    "antecedentes": leer_documentos(
+                        oficio.get("Antecedente", ""), incluir_sin_enlace=True),
                     "anexos": leer_documentos(oficio.get("Anexo", "")),
                 }
                 fecha = _fecha_firma(oficio)
