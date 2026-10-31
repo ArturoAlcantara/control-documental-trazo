@@ -3654,14 +3654,49 @@ def agregar_documento(tipo):
     })
 
 
-def documentos_formulario(tipo):
+def _mover_documento_formulario(tipo, posicion, movimiento):
+    """Reordena adjuntos sin alterar sus URLs ni descargar archivos de Drive."""
+    documentos = st.session_state.get(tipo, [])
+    destino = posicion + movimiento
+    if not (0 <= posicion < len(documentos) and 0 <= destino < len(documentos)):
+        return
+    documentos[posicion], documentos[destino] = documentos[destino], documentos[posicion]
+    # Los widgets usan claves basadas en la posicion: intercambiar tambien su estado.
+    # La funcion se invoca como callback, antes de dibujar los campos en el rerun.
+    for campo in ("nombre", "url"):
+        primera = f"{tipo}_{campo}_{posicion}"
+        segunda = f"{tipo}_{campo}_{destino}"
+        valor_primero = st.session_state.get(primera, documentos[destino].get(campo, ""))
+        valor_segundo = st.session_state.get(segunda, documentos[posicion].get(campo, ""))
+        st.session_state[primera] = valor_segundo
+        st.session_state[segunda] = valor_primero
+
+
+def documentos_formulario(tipo, ordenar=False):
     if tipo not in st.session_state:
         st.session_state[tipo] = []
 
     documentos = st.session_state[tipo]
 
     for indice, documento in enumerate(documentos):
-        st.markdown(f"**Documento {indice + 1}**")
+        if ordenar:
+            etiqueta = "Antecedente más cercano" if indice == 0 else "Antecedente anterior"
+            col_titulo, col_subir, col_bajar = st.columns([5.4, 1, 1], vertical_alignment="center")
+            with col_titulo:
+                st.markdown(f"**{etiqueta}**")
+            with col_subir:
+                st.button("↑", key=f"{tipo}_subir_{indice}", disabled=indice == 0,
+                          help="Mover este antecedente hacia el principio",
+                          on_click=_mover_documento_formulario, args=(tipo, indice, -1),
+                          use_container_width=True)
+            with col_bajar:
+                st.button("↓", key=f"{tipo}_bajar_{indice}",
+                          disabled=indice == len(documentos) - 1,
+                          help="Mover este antecedente hacia el final",
+                          on_click=_mover_documento_formulario, args=(tipo, indice, 1),
+                          use_container_width=True)
+        else:
+            st.markdown(f"**Documento {indice + 1}**")
         documento["nombre"] = st.text_input(
             "Nombre del documento",
             value=documento["nombre"],
@@ -3743,6 +3778,176 @@ def _registrar_modalidad(folio, numero, tipo, tiene_antecedentes,
         identificador_sesion(), fecha, "", "", "",
     ], value_input_option="RAW")
     _leer_modalidades_por_area.clear()
+
+
+# =========================================================
+# C.E.I. + TARJETA: CLASIFICACIÓN Y ENTREGA CONJUNTA (SETF)
+# Hoja AUXILIAR: OFICIOS y sus doce columnas permanecen intactos.
+# =========================================================
+COLUMNAS_TIPOS_DOCUMENTALES = [
+    "Folio", "No. de oficio", "Tipo de documento", "Folio relacionado",
+    "No. relacionado", "Registrado por", "Fecha de registro",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _hoja_tipos_documentales_por_area(area):
+    libro = conectar_google_sheets_por_area(area).spreadsheet
+    try:
+        hoja = libro.worksheet("TIPOS_DOCUMENTALES")
+    except gspread.WorksheetNotFound:
+        hoja = libro.add_worksheet(title="TIPOS_DOCUMENTALES", rows=1000,
+                                   cols=len(COLUMNAS_TIPOS_DOCUMENTALES))
+        hoja.append_row(COLUMNAS_TIPOS_DOCUMENTALES, value_input_option="RAW")
+    if hoja.row_values(1) != COLUMNAS_TIPOS_DOCUMENTALES:
+        raise ValueError("Encabezados inesperados en TIPOS_DOCUMENTALES; no se modificaron datos.")
+    return hoja
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def _leer_tipos_documentales_por_area(area):
+    # Solo se consulta al visualizar Firmados o al registrar; nunca en el inicio.
+    try:
+        return _hoja_tipos_documentales_por_area(area).get_all_records()
+    except gspread.WorksheetNotFound:
+        return []
+
+
+def _mapa_tipos_documentales(area):
+    return {
+        (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip()): r
+        for r in _leer_tipos_documentales_por_area(area)
+    }
+
+
+def _filas_tipos_documentales(identidades, tipo, relacionado=None):
+    from zoneinfo import ZoneInfo
+    ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+    resultado = []
+    for folio, numero in identidades:
+        otro = relacionado.get((folio, numero), ("", "")) if relacionado else ("", "")
+        etiqueta = tipo.get((folio, numero), "Oficio") if isinstance(tipo, dict) else tipo
+        resultado.append([folio, numero, etiqueta, otro[0], otro[1],
+                          identificador_sesion(), ahora])
+    return resultado
+
+
+def _registrar_clasificacion_documental(filas):
+    """Escribe todos los vínculos en una solicitud; nunca duplica archivos Drive."""
+    if _area_activa_validada() != "setf":
+        return
+    exigir_sesion()
+    _hoja_tipos_documentales_por_area("setf").append_rows(filas, value_input_option="RAW")
+    _leer_tipos_documentales_por_area.clear()
+
+
+def _validar_numeros_pareja(folio_cei, numero_cei, numero_tarjeta, registros):
+    """Números únicos globales para el alta conjunta; evita igualar CEI y Tarjeta."""
+    a, b = str(numero_cei).strip(), str(numero_tarjeta).strip()
+    if not a or not b:
+        raise ValueError("Captura el número del Mensaje C.E.I y el número de Tarjeta.")
+    if normalizar_texto(a) == normalizar_texto(b):
+        raise ValueError("Mensaje C.E.I y Tarjeta deben tener números diferentes.")
+    vistos = {normalizar_texto(r.get("No. de oficio", ""))
+              for r in registros if str(r.get("No. de oficio", "")).strip()}
+    if normalizar_texto(a) in vistos or normalizar_texto(b) in vistos:
+        raise ValueError("Uno de los dos números ya existe en OFICIOS. Revisa ambos antes de guardar.")
+    if folio_cei and any(str(r.get("Folio", "")).strip() == folio_cei for r in registros):
+        raise ValueError("Ese folio ya está registrado en OFICIOS.")
+
+
+def _guardar_pareja_cei_tarjeta(datos_cei, numero_tarjeta, enlace_tarjeta,
+                                tiene_antecedentes):
+    """Una captura, dos documentos numerados, referencias compartidas.
+
+    Las escrituras en tres hojas no son transaccionales. Si una hoja auxiliar falla,
+    se informa la etapa exacta para conciliación SIN volver a crear los oficios.
+    """
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("El registro conjunto C.E.I. + Tarjeta solo está disponible en SETF.")
+    cei = list(datos_cei)
+    folio, numero_cei = str(cei[0]).strip(), str(cei[1]).strip()
+    numero_tarjeta = str(numero_tarjeta).strip()
+    # La Tarjeta se identifica por su número; no se reutiliza el folio del C.E.I.,
+    # ya que los módulos históricos esperan que el folio sea único.
+    tarjeta = list(cei)
+    tarjeta[0] = ""
+    tarjeta[1] = numero_tarjeta
+    tarjeta[10] = (json.dumps([{"nombre": numero_tarjeta, "url": enlace_tarjeta.strip()}],
+                              ensure_ascii=False) if enlace_tarjeta.strip() else "")
+    identidades = [(folio, numero_cei), ("", numero_tarjeta)]
+    relaciones = {identidades[0]: identidades[1], identidades[1]: identidades[0]}
+    tipos = {identidades[0]: "Mensaje C.E.I", identidades[1]: "Tarjeta"}
+
+    hoja_oficios = conectar_google_sheets()
+    hoja_modalidades = _hoja_modalidades()
+    hoja_tipos = _hoja_tipos_documentales_por_area("setf")
+    # Validación de identidad con una lectura FRESCA, no con caché compartida.
+    encabezados = hoja_oficios.row_values(1)
+    if "Folio" not in encabezados or "No. de oficio" not in encabezados:
+        raise ValueError("OFICIOS no tiene los encabezados esperados.")
+    filas_vivas = hoja_oficios.get_all_records()
+    _validar_numeros_pareja(folio, numero_cei, numero_tarjeta, filas_vivas)
+    if any((str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
+           in identidades for r in hoja_tipos.get_all_records()):
+        raise ValueError("Estos documentos ya tienen clasificación. Actualiza el listado.")
+
+    from zoneinfo import ZoneInfo
+    ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
+    filas_modalidades = [[f, n, "Ordinario", "Sí" if tiene_antecedentes else "No",
+                          "", "", "Registro ordinario", identificador_sesion(),
+                          ahora, "", "", ""] for f, n in identidades]
+    # Dos filas en UN llamado a OFICIOS; no se suben duplicados a Google Drive.
+    hoja_oficios.append_rows([cei, tarjeta], value_input_option="USER_ENTERED")
+    _invalidar_cache_documental(oficios=True)
+    try:
+        hoja_modalidades.append_rows(filas_modalidades, value_input_option="RAW")
+        _leer_modalidades_por_area.clear()
+    except Exception as error:
+        raise RuntimeError("Los DOS documentos ya existen en OFICIOS, pero falló "
+                           "MODALIDADES_TRAMITE. No registres de nuevo: solicita conciliación. "
+                           + str(error)) from error
+    try:
+        _registrar_clasificacion_documental(
+            _filas_tipos_documentales(identidades, tipos, relaciones))
+    except Exception as error:
+        raise RuntimeError("Los DOS documentos y modalidades ya fueron registrados, "
+                           "pero falló TIPOS_DOCUMENTALES. No registres de nuevo: "
+                           "solicita conciliación. " + str(error)) from error
+    return identidades
+
+
+def _agrupar_firmados_cei_tarjeta(lista, registros, mapa_tipos):
+    """Agrupa visualmente solo parejas completas y firmadas; deja legado intacto."""
+    por_id = {(str(r.get("Folio", "")).strip(),
+               str(r.get("No. de oficio", "")).strip()): r for r in registros}
+    vistos, salida = set(), []
+    for registro in lista:
+        identidad = (str(registro.get("Folio", "")).strip(),
+                     str(registro.get("No. de oficio", "")).strip())
+        if identidad in vistos:
+            continue
+        tipo = mapa_tipos.get(identidad, {})
+        relacionado = (str(tipo.get("Folio relacionado", "")).strip(),
+                       str(tipo.get("No. relacionado", "")).strip())
+        otro = por_id.get(relacionado)
+        otro_tipo = mapa_tipos.get(relacionado, {})
+        if (tipo.get("Tipo de documento") in ("Mensaje C.E.I", "Tarjeta")
+            and otro and otro_tipo.get("Tipo de documento") in ("Mensaje C.E.I", "Tarjeta")
+            and tipo.get("Tipo de documento") != otro_tipo.get("Tipo de documento")
+            and str(otro_tipo.get("No. relacionado", "")).strip() == identidad[1]
+            and str(otro_tipo.get("Folio relacionado", "")).strip() == identidad[0]
+            and normalizar_texto(otro.get("Estatus", "")) == "firmado"
+            and normalizar_texto(registro.get("Estatus", "")) == "firmado"):
+            cei, tarjeta = ((registro, otro) if tipo.get("Tipo de documento") == "Mensaje C.E.I"
+                            else (otro, registro))
+            salida.append((cei, tarjeta))
+            vistos.update((identidad, relacionado))
+        else:
+            salida.append(registro)
+            vistos.add(identidad)
+    return salida
 
 
 def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
@@ -4308,6 +4513,28 @@ def formulario_nuevo_oficio():
                 st.error("El registro del envío sigue pendiente: " + _mensaje_error_sheets(error))
         return
 
+    envios_pareja_pendientes = st.session_state.get("alta_envios_par_pendientes")
+    if envios_pareja_pendientes and _area_activa_validada() == "setf":
+        st.warning("Ambos documentos ya existen. Falta conciliar el envío a firma "
+                   "de uno o ambos. No registres de nuevo el C.E.I y la Tarjeta.")
+        if st.button("Reintentar envíos pendientes C.E.I / Tarjeta", key="reintentar_cei_tarjeta"):
+            for pend in list(envios_pareja_pendientes):
+                try:
+                    # Si el envío se registró justo antes de fallar la respuesta,
+                    # no duplicarlo al reintentar.
+                    if not any((str(r.get("Folio", "")).strip(),
+                                str(r.get("No. de oficio origen", "")).strip()) == (pend[0], pend[1])
+                               for r in _hoja_envios_firma_por_area("setf").get_all_records()):
+                        _registrar_envio_firma(*pend)
+                    envios_pareja_pendientes.remove(pend)
+                except Exception as error:
+                    st.error("No fue posible conciliar el envío: " + _mensaje_error_sheets(error))
+                    return
+            st.session_state.pop("alta_envios_par_pendientes", None)
+            st.success("Envíos C.E.I y Tarjeta conciliados correctamente.")
+            st.rerun()
+        return
+
     # =========================================================
     # FORMULARIO NUEVO OFICIO - DISEÑO COMPACTO
     # =========================================================
@@ -4377,7 +4604,17 @@ def formulario_nuevo_oficio():
     # Los trámites directos LEGADOS siguen siendo consultables, pero no se crean
     # nuevos trámites directos desde este formulario.
     tramite_directo = False
-    st.markdown("#### Identificación del oficio")
+    st.markdown("#### Identificación del documento")
+    tipo_documento = (
+        st.selectbox("Tipo de documento", ["Oficio", "Mensaje C.E.I", "Tarjeta"],
+                     key=f"tipo_documento_{version}",
+                     help="Mensaje C.E.I registra también su Tarjeta en una sola captura.")
+        if _area_activa_validada() == "setf" else "Oficio"
+    )
+    es_par_cei = tipo_documento == "Mensaje C.E.I"
+    if es_par_cei:
+        st.caption("El Mensaje C.E.I y su Tarjeta llevan números distintos, pero se entregan "
+                   "juntos. Responsable, asunto, antecedentes y anexos se capturan una sola vez.")
     tiene_folio = st.checkbox(
         "Este oficio tiene folio", value=True,
         key=f"tiene_folio_{version}",
@@ -4449,7 +4686,9 @@ def formulario_nuevo_oficio():
                 st.markdown("**Folio**")
                 st.caption("No aplica · expediente sin folio")
         with col2:
-            numero = st.text_input("No. de oficio", key=f"numero_{version}")
+            etiqueta_numero = ("Número de Mensaje C.E.I" if es_par_cei else
+                               "Número de Tarjeta" if tipo_documento == "Tarjeta" else "No. de oficio")
+            numero = st.text_input(etiqueta_numero, key=f"numero_{version}")
         with col3:
             responsable = st.selectbox(
                 "Responsable", responsables_disponibles, index=None,
@@ -4647,8 +4886,8 @@ def formulario_nuevo_oficio():
             if registro_solo_numero_salida:
                 st.caption("Se utilizará el número de salida como número del oficio enviado a firma.")
                 numero_envio_firma = st.text_input(
-                    "Nombre o número del oficio enviado a firma *",
-                    placeholder="Ej. LFSLPSTL-IB-26-2119",
+                    "Número de Mensaje C.E.I *" if es_par_cei else "Nombre o número del oficio enviado a firma *",
+                    placeholder="Ej. C.E.I-2026-001" if es_par_cei else "Ej. LFSLPSTL-IB-26-2119",
                     key=f"nuevo_numero_salida_{version}",
                 )
                 numero = numero_envio_firma.strip()
@@ -4679,8 +4918,10 @@ def formulario_nuevo_oficio():
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             numero_salida = st.text_input(
-                "Nombre o número del oficio firmado *" if es_firmado
-                else "Nombre o número del oficio que saldrá firmado *",
+                ("Número de Mensaje C.E.I *" if es_par_cei else
+                 "Número de Tarjeta *" if tipo_documento == "Tarjeta" else
+                 "Nombre o número del oficio firmado *" if es_firmado
+                 else "Nombre o número del oficio que saldrá firmado *"),
                 placeholder="Ej. LFSLPSTL-IB-26-2119",
                 key=f"nuevo_numero_salida_{version}",
                 help="Este número identificará al expediente sin folio en OFICIOS.",
@@ -4749,6 +4990,26 @@ def formulario_nuevo_oficio():
         unsafe_allow_html=True
     )
 
+    # El C.E.I. y la Tarjeta se entregan juntos, pero cada cual posee número y
+    # enlace propio. El resto del formulario se captura UNA vez para ambos.
+    numero_tarjeta = ""
+    enlace_tarjeta = ""
+    if es_par_cei:
+        st.markdown("**▣ Tarjeta que acompaña al Mensaje C.E.I**")
+        col_num_tarjeta, col_url_tarjeta = st.columns([1, 1.6])
+        with col_num_tarjeta:
+            numero_tarjeta = st.text_input(
+                "Número único de Tarjeta *", key=f"num_tarjeta_cei_{version}",
+                placeholder="Número de Tarjeta")
+        with col_url_tarjeta:
+            enlace_tarjeta = st.text_input(
+                "Enlace del documento firmado · Tarjeta",
+                key=f"url_tarjeta_cei_{version}",
+                placeholder="https://drive.google.com/..." if es_firmado else "Disponible al recibir la firma",
+                disabled=not es_firmado)
+        st.caption("Ambos documentos comparten proyecto, responsable, asunto, "
+                   "antecedentes, anexos y fecha. El C.E.I conserva su propio PDF.")
+
     # =========================================================
     # 03 · DOCUMENTACIÓN
     # =========================================================
@@ -4813,7 +5074,10 @@ def formulario_nuevo_oficio():
                 unsafe_allow_html=True
             )
             if tiene_antecedentes:
-                antecedentes = documentos_formulario(f"antecedentes_{version}")
+                st.caption("Orden documental: primero va el oficio firmado; después, el antecedente "
+                           "más cercano a ese oficio y luego los anteriores, en cadena. "
+                           "Usa ↑ y ↓ si necesitas ajustar el orden. Se guardará tal cual.")
+                antecedentes = documentos_formulario(f"antecedentes_{version}", ordenar=True)
             else:
                 antecedentes = []
                 st.caption("Sin antecedentes · este campo quedará vacío en Google Sheets.")
@@ -4855,7 +5119,7 @@ def formulario_nuevo_oficio():
     # =====================================================
 
     if st.button(
-        "Guardar oficio",
+        "Guardar Mensaje C.E.I y Tarjeta" if es_par_cei else "Guardar documento",
         key="guardar_nuevo_oficio",
         use_container_width=True,
         type="primary"
@@ -4869,6 +5133,20 @@ def formulario_nuevo_oficio():
                 else "Debes capturar el número de oficio."
             )
             return
+        if es_par_cei:
+            if not numero_tarjeta.strip():
+                st.error("Debes capturar el número único de Tarjeta.")
+                return
+            if normalizar_texto(numero_tarjeta) == normalizar_texto(numero):
+                st.error("El C.E.I y la Tarjeta deben llevar números diferentes.")
+                return
+            if enlace_tarjeta.strip():
+                from urllib.parse import urlparse
+                url_t = urlparse(enlace_tarjeta.strip())
+                if url_t.scheme != "https" or (url_t.hostname or "").lower() not in (
+                        "drive.google.com", "docs.google.com"):
+                    st.error("La liga del documento firmado de la Tarjeta debe ser de Google Drive.")
+                    return
         if registro_solo_numero_salida and not proyecto:
             st.error("Selecciona el proyecto al que pertenece el oficio.")
             return
@@ -4930,6 +5208,13 @@ def formulario_nuevo_oficio():
                             st.error("Ese oficio ya está registrado.")
                             return
 
+                if (tipo_documento == "Tarjeta" and not existentes.empty
+                        and "No. de oficio" in existentes.columns):
+                    if any(normalizar_texto(valor) == normalizar_texto(numero)
+                           for valor in existentes["No. de oficio"].tolist()):
+                        st.error("Este número de Tarjeta ya está registrado. Usa otro número único.")
+                        return
+
                 # Verificar que existe la hoja auxiliar antes de registrar en OFICIOS.
                 # No cambia las 12 columnas originales.
                 _hoja_modalidades()
@@ -4962,6 +5247,42 @@ def formulario_nuevo_oficio():
                     observaciones.strip()
                 ]
 
+                if es_par_cei:
+                    # Registrar ambos números en una sola captura. Los datos
+                    # documentales comunes se referencian, no se suben dos veces a Drive.
+                    try:
+                        identidades_pareja = _guardar_pareja_cei_tarjeta(
+                            datos, numero_tarjeta, enlace_tarjeta, tiene_antecedentes)
+                    except Exception as error:
+                        st.error("No se pudo completar el alta conjunta: " + _mensaje_error_sheets(error))
+                        return
+                    if es_en_firma:
+                        # Las dos salidas se registran por separado, porque son
+                        # documentos con números únicos aunque viajen juntos.
+                        pendientes = [
+                            (identidades_pareja[0][0], identidades_pareja[0][1],
+                             numero_envio_firma.strip(), asunto_envio_firma.strip()),
+                            (identidades_pareja[1][0], identidades_pareja[1][1],
+                             numero_tarjeta.strip(), asunto_envio_firma.strip()),
+                        ]
+                        st.session_state["alta_envios_par_pendientes"] = pendientes
+                        # El control de reintento está arriba del formulario.
+                        for pend in pendientes.copy():
+                            try:
+                                _registrar_envio_firma(*pend)
+                                st.session_state["alta_envios_par_pendientes"].remove(pend)
+                            except Exception as error:
+                                st.error("Ambos documentos fueron registrados, pero no se pudo "
+                                         "completar el envío a firma. No repitas el alta; "
+                                         "utiliza el reintento arriba del formulario. "
+                                         + _mensaje_error_sheets(error))
+                                return
+                        st.session_state.pop("alta_envios_par_pendientes", None)
+                    st.session_state.oficio_guardado = True
+                    st.session_state.version_formulario += 1
+                    st.rerun()
+                    return
+
                 # Validación anticipada de la hoja de envíos antes de crear el expediente.
                 # Así se evita guardar un alta cuyos datos de firma ya están ocupados.
                 if es_en_firma:
@@ -4986,6 +5307,15 @@ def formulario_nuevo_oficio():
                              "conciliación de MODALIDADES_TRAMITE al administrador. "
                              f"Detalle: {error}")
                     return
+                if _area_activa_validada() == "setf":
+                    try:
+                        _registrar_clasificacion_documental(
+                            _filas_tipos_documentales(
+                                [(folio.strip(), numero.strip())], tipo_documento))
+                    except Exception as error:
+                        st.warning("El documento ya se guardó en OFICIOS. No vuelvas "
+                                   "a registrarlo. Su clasificación auxiliar quedó "
+                                   "pendiente de conciliación: " + str(error))
 
             # El envío se registra después de guardar el expediente, utilizando
             # el mismo registro y sello horario que alimenta los indicadores.
@@ -10189,6 +10519,15 @@ def _modulo_lateral_documentos(tipo):
             except Exception as error:
                 words_archivados = {}
                 st.warning("No fue posible consultar el resguardo Word: " + _mensaje_error_sheets(error))
+            # Una ficha para cada C.E.I + Tarjeta cuando ambos están firmados.
+            # Las parejas se consultan de la hoja auxiliar únicamente aquí.
+            try:
+                tipos_archivo = _mapa_tipos_documentales("setf")
+                lista = _agrupar_firmados_cei_tarjeta(lista, registros, tipos_archivo)
+            except Exception as error:
+                st.warning("Se mostrarán los documentos por separado porque no "
+                           "pudo leerse su relación: " + _mensaje_error_sheets(error))
+
             # Archivo SETF: una superficie continua y filas compactas, sin
             # duplicar la información ni convertir el estado en un botón.
             if not lista:
@@ -10199,9 +10538,102 @@ def _modulo_lateral_documentos(tipo):
                         '<div class="firm-archive-head">'
                         '<div><div class="firm-archive-title">Archivo completo de oficios</div>'
                         '<div class="firm-archive-subtitle">PDF firmado, Word resguardado cuando exista, antecedentes y anexos</div></div>'
-                        f'<span class="firm-archive-count">{len(lista)} expedientes</span>'
+                        f'<span class="firm-archive-count">{len(lista)} expedientes · '
+                        f'{sum(2 if isinstance(item, tuple) else 1 for item in lista)} documentos</span>'
                         '</div>', unsafe_allow_html=True)
                     for indice, oficio in enumerate(lista):
+                        if isinstance(oficio, tuple):
+                            cei, tarjeta = oficio
+                            folio_cei = str(cei.get("Folio", "")).strip()
+                            numero_cei = str(cei.get("No. de oficio", "")).strip()
+                            numero_tarjeta = str(tarjeta.get("No. de oficio", "")).strip()
+                            token_par = hashlib.sha256(
+                                (folio_cei + "|" + numero_cei + "|" + numero_tarjeta).encode("utf-8")
+                            ).hexdigest()[:16]
+                            with st.container(key=f"firm_archive_row_par_{token_par}"):
+                                st.markdown(
+                                    '<div class="firm-archive-name">Mensaje C.E.I y Tarjeta</div>'
+                                    '<div class="firm-archive-meta">'
+                                    'C.E.I: ' + html.escape(numero_cei) +
+                                    ' · Tarjeta: ' + html.escape(numero_tarjeta) +
+                                    ' · ' + html.escape(str(cei.get("Responsable", ""))) +
+                                    '</div>', unsafe_allow_html=True)
+                                st.markdown('<span class="firm-signed-state">Ambos firmados</span>',
+                                            unsafe_allow_html=True)
+                                # C.E.I. y Tarjeta viajan juntos: un unico desplegable
+                                # conserva ambos PDF, sus nombres y el orden de entrega.
+                                col_documentos, col_editable = st.columns(
+                                    2, gap="small", vertical_alignment="top")
+                                with col_documentos:
+                                    documentos_pareja = (
+                                        ("Mensaje C.E.I", numero_cei,
+                                         leer_documentos(cei.get("Firmado", ""))),
+                                        ("Tarjeta", numero_tarjeta,
+                                         leer_documentos(tarjeta.get("Firmado", ""))),
+                                    )
+                                    if any(archivos for _, _, archivos in documentos_pareja):
+                                        with st.popover("Abrir documentos firmados",
+                                                        use_container_width=True):
+                                            for etiqueta_doc, numero_doc, archivos in documentos_pareja:
+                                                st.caption(f"{etiqueta_doc} · {numero_doc}")
+                                                if archivos:
+                                                    for archivo in archivos:
+                                                        st.link_button(
+                                                            archivo["nombre"], archivo["url"],
+                                                            use_container_width=True,
+                                                            help="Abrir el documento firmado en Drive")
+                                                else:
+                                                    st.caption("Sin PDF vinculado")
+                                    else:
+                                        st.button("Sin PDF vinculado", disabled=True,
+                                                  key=f"sin_pdf_par_{token_par}",
+                                                  use_container_width=True)
+                                with col_editable:
+                                    word_cei = words_archivados.get((folio_cei, numero_cei))
+                                    word_tarjeta = words_archivados.get(("", numero_tarjeta))
+                                    if word_cei and word_tarjeta:
+                                        with st.popover("Word editable", use_container_width=True):
+                                            st.caption("Mensaje C.E.I")
+                                            _setf_boton_descarga_word_firma(
+                                                folio_cei, numero_cei, word_cei,
+                                                f"par_cei_{token_par}", en_dialogo=True)
+                                            st.caption("Tarjeta")
+                                            _setf_boton_descarga_word_firma(
+                                                "", numero_tarjeta, word_tarjeta,
+                                                f"par_tar_{token_par}", en_dialogo=True)
+                                    elif word_cei or word_tarjeta:
+                                        info_word = (folio_cei, numero_cei, word_cei,
+                                                     "par_cei") if word_cei else (
+                                                     "", numero_tarjeta, word_tarjeta, "par_tar")
+                                        _setf_boton_descarga_word_firma(
+                                            info_word[0], info_word[1], info_word[2],
+                                            f"{info_word[3]}_{token_par}", en_dialogo=True)
+                                    else:
+                                        st.button("Sin Word editable", disabled=True,
+                                                  key=f"sin_word_par_{token_par}",
+                                                  use_container_width=True)
+                                st.markdown('<div class="firm-archive-meta">'
+                                            'Documentación común de la entrega</div>',
+                                            unsafe_allow_html=True)
+                                with st.container(key=f"firm_archive_support_{token_par}"):
+                                    ca, cb = st.columns(2, gap="small")
+                                    for columna, campo, etiqueta in (
+                                        (ca, "Antecedente", "Antecedentes"),
+                                        (cb, "Anexo", "Anexos"),
+                                    ):
+                                        archivos = leer_documentos(cei.get(campo, ""))
+                                        with columna:
+                                            if archivos:
+                                                with st.popover(etiqueta, use_container_width=True):
+                                                    for archivo in archivos:
+                                                        # El JSON almacena el orden elegido en el registro.
+                                                        st.link_button(archivo["nombre"], archivo["url"],
+                                                                       use_container_width=True)
+                                            else:
+                                                st.button(etiqueta, disabled=True,
+                                                          key=f"sin_{campo}_{token_par}",
+                                                          use_container_width=True)
+                            continue
                         folio = str(oficio.get("Folio", "")).strip()
                         numero = str(oficio.get("No. de oficio", "")).strip()
                         responsable = str(oficio.get("Responsable", "") or "No asignado").strip()
@@ -10302,14 +10734,10 @@ def _modulo_lateral_documentos(tipo):
                                     ):
                                         archivos = documentos[categoria]
                                         with columna:
-                                            if len(archivos) == 1:
-                                                st.link_button(
-                                                    etiqueta, archivos[0]["url"], use_container_width=True,
-                                                    help=f'Abrir en Drive: {archivos[0]["nombre"]}',
-                                                )
-                                            elif len(archivos) > 1:
+                                            if archivos:
                                                 with st.popover(etiqueta, use_container_width=True):
-                                                    st.caption(f"{len(archivos)} archivos · {etiqueta}")
+                                                    # No se numeran ni se ordenan alfabeticamente;
+                                                    # se conserva la secuencia registrada en Sheets.
                                                     for archivo in archivos:
                                                         st.link_button(archivo["nombre"], archivo["url"],
                                                                        use_container_width=True)
