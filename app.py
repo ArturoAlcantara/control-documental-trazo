@@ -4605,23 +4605,26 @@ def formulario_nuevo_oficio():
     # nuevos trámites directos desde este formulario.
     tramite_directo = False
     st.markdown("#### Identificación del documento")
-    tipo_documento = (
-        st.selectbox("Tipo de documento", ["Oficio", "Mensaje C.E.I", "Tarjeta"],
+    # El selector presenta las DOS opciones solicitadas. La clasificación
+    # interna conserva "Oficio" para respetar los registros anteriores.
+    tipo_visible = (
+        st.selectbox("Tipo de documento", ["Oficios", "Mensajes C.E.I"],
                      key=f"tipo_documento_{version}",
-                     help="Mensaje C.E.I registra también su Tarjeta en una sola captura.")
-        if _area_activa_validada() == "setf" else "Oficio"
+                     help="Cada Mensaje C.E.I se registra junto con su Tarjeta en una sola captura.")
+        if _area_activa_validada() == "setf" else "Oficios"
     )
-    es_par_cei = tipo_documento == "Mensaje C.E.I"
+    es_par_cei = tipo_visible == "Mensajes C.E.I"
+    tipo_documento = "Mensaje C.E.I" if es_par_cei else "Oficio"
     if es_par_cei:
         st.caption("El Mensaje C.E.I y su Tarjeta llevan números distintos, pero se entregan "
                    "juntos. Responsable, asunto, antecedentes y anexos se capturan una sola vez.")
     tiene_folio = st.checkbox(
-        "Este oficio tiene folio", value=True,
+        "Este mensaje tiene folio" if es_par_cei else "Este oficio tiene folio", value=True,
         key=f"tiene_folio_{version}",
-        help="Si no existe folio, el expediente se identifica por su número de oficio.",
+        help="Si no existe folio, el expediente se identifica por el número del documento.",
     )
     tiene_antecedentes = st.checkbox(
-        "Este oficio tiene antecedentes", value=True,
+        "Este expediente tiene antecedentes" if es_par_cei else "Este oficio tiene antecedentes", value=True,
         key=f"tiene_antecedentes_{version}",
         help="Si no tiene antecedentes, el registro continúa normalmente.",
     )
@@ -4686,9 +4689,12 @@ def formulario_nuevo_oficio():
                 st.markdown("**Folio**")
                 st.caption("No aplica · expediente sin folio")
         with col2:
-            etiqueta_numero = ("Número de Mensaje C.E.I" if es_par_cei else
-                               "Número de Tarjeta" if tipo_documento == "Tarjeta" else "No. de oficio")
-            numero = st.text_input(etiqueta_numero, key=f"numero_{version}")
+            if es_par_cei:
+                numero = ""  # Se captura en la sección conjunta inferior, sin duplicarlo.
+                st.markdown("**Número de Mensaje C.E.I**")
+                st.caption("Se captura abajo, en «Documentos de la entrega».")
+            else:
+                numero = st.text_input("No. de oficio", key=f"numero_{version}")
         with col3:
             responsable = st.selectbox(
                 "Responsable", responsables_disponibles, index=None,
@@ -4879,7 +4885,21 @@ def formulario_nuevo_oficio():
     numero_envio_firma = ""
     asunto_envio_firma = ""
 
-    if es_en_firma:
+    if es_par_cei:
+        # El C.E.I y la Tarjeta tienen sus números y ligas en un solo bloque
+        # inferior. No mostrar el formulario de "Oficio firmado" ni exigir
+        # un segundo número o asunto de salida en la pantalla.
+        nombre_firmado, liga_firmado, firmado = "", "", ""
+        if es_en_firma:
+            st.caption("El número del C.E.I y el de su Tarjeta se capturan abajo. "
+                       "El asunto de esta entrega se utilizará al registrar el envío a firma.")
+        elif es_firmado:
+            st.caption("Vincula abajo el C.E.I firmado y la Tarjeta firmada, cada uno "
+                       "con su propio número y enlace de Google Drive.")
+        else:
+            st.caption("Los enlaces a los documentos firmados se habilitarán "
+                       "cuando el expediente llegue a Firmado.")
+    elif es_en_firma:
         st.markdown("**▣ Identificación del oficio enviado a firma**")
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
@@ -4918,9 +4938,7 @@ def formulario_nuevo_oficio():
         col_firmado_nombre, col_firmado_link = st.columns([1, 1.6])
         with col_firmado_nombre:
             numero_salida = st.text_input(
-                ("Número de Mensaje C.E.I *" if es_par_cei else
-                 "Número de Tarjeta *" if tipo_documento == "Tarjeta" else
-                 "Nombre o número del oficio firmado *" if es_firmado
+                ("Nombre o número del oficio firmado *" if es_firmado
                  else "Nombre o número del oficio que saldrá firmado *"),
                 placeholder="Ej. LFSLPSTL-IB-26-2119",
                 key=f"nuevo_numero_salida_{version}",
@@ -4990,25 +5008,59 @@ def formulario_nuevo_oficio():
         unsafe_allow_html=True
     )
 
-    # El C.E.I. y la Tarjeta se entregan juntos, pero cada cual posee número y
-    # enlace propio. El resto del formulario se captura UNA vez para ambos.
+    # Una sola entrega, con DOS documentos y números únicos. Cada liga se
+    # conserva en su propia fila de OFICIOS; los datos comunes se capturan una vez.
     numero_tarjeta = ""
     enlace_tarjeta = ""
     if es_par_cei:
-        st.markdown("**▣ Tarjeta que acompaña al Mensaje C.E.I**")
-        col_num_tarjeta, col_url_tarjeta = st.columns([1, 1.6])
-        with col_num_tarjeta:
-            numero_tarjeta = st.text_input(
-                "Número único de Tarjeta *", key=f"num_tarjeta_cei_{version}",
-                placeholder="Número de Tarjeta")
-        with col_url_tarjeta:
-            enlace_tarjeta = st.text_input(
-                "Enlace del documento firmado · Tarjeta",
-                key=f"url_tarjeta_cei_{version}",
-                placeholder="https://drive.google.com/..." if es_firmado else "Disponible al recibir la firma",
-                disabled=not es_firmado)
-        st.caption("Ambos documentos comparten proyecto, responsable, asunto, "
-                   "antecedentes, anexos y fecha. El C.E.I conserva su propio PDF.")
+        st.markdown("#### Documentos de la entrega")
+        st.caption("Captura los dos números únicos. Los enlaces pueden añadirse "
+                   "cuando ambos documentos regresen firmados.")
+        col_cei, col_tarjeta = st.columns(2, gap="medium")
+        with col_cei:
+            with st.container(border=True):
+                st.markdown("**▣ Mensaje C.E.I**")
+                numero = st.text_input(
+                    "Número único de Mensaje C.E.I *",
+                    key=f"numero_{version}",
+                    placeholder="Número del Mensaje C.E.I",
+                ).strip()
+                enlace_cei = st.text_input(
+                    "Enlace del Mensaje C.E.I firmado",
+                    key=f"url_firmado_cei_{version}",
+                    placeholder="https://drive.google.com/..." if es_firmado
+                                else "Disponible al recibir la firma",
+                    disabled=not es_firmado,
+                )
+        with col_tarjeta:
+            with st.container(border=True):
+                st.markdown("**▣ Tarjeta**")
+                numero_tarjeta = st.text_input(
+                    "Número único de Tarjeta *",
+                    key=f"num_tarjeta_cei_{version}",
+                    placeholder="Número de Tarjeta",
+                ).strip()
+                enlace_tarjeta = st.text_input(
+                    "Enlace de la Tarjeta firmada",
+                    key=f"url_tarjeta_cei_{version}",
+                    placeholder="https://drive.google.com/..." if es_firmado
+                                else "Disponible al recibir la firma",
+                    disabled=not es_firmado,
+                )
+        # El registro se permite sin archivos firmados mientras se tramitan.
+        # Al volver firmado, cada documento conserva SU propia liga.
+        nombre_firmado = numero if es_firmado else ""
+        liga_firmado = enlace_cei.strip() if es_firmado else ""
+        firmado = (json.dumps([{"nombre": nombre_firmado, "url": liga_firmado}],
+                              ensure_ascii=False)
+                   if liga_firmado else "")
+        if es_en_firma:
+            # No solicitar por duplicado identidad y asunto de salida: se
+            # reutilizan el número del C.E.I y el asunto ya capturado arriba.
+            numero_envio_firma = numero
+            asunto_envio_firma = asunto.strip()
+        st.caption("Ambos documentos comparten proyecto, responsable, asunto, fechas, "
+                   "antecedentes y anexos. Cada uno conserva su número y PDF.")
 
     # =========================================================
     # 03 · DOCUMENTACIÓN
@@ -5140,13 +5192,21 @@ def formulario_nuevo_oficio():
             if normalizar_texto(numero_tarjeta) == normalizar_texto(numero):
                 st.error("El C.E.I y la Tarjeta deben llevar números diferentes.")
                 return
-            if enlace_tarjeta.strip():
-                from urllib.parse import urlparse
-                url_t = urlparse(enlace_tarjeta.strip())
-                if url_t.scheme != "https" or (url_t.hostname or "").lower() not in (
-                        "drive.google.com", "docs.google.com"):
-                    st.error("La liga del documento firmado de la Tarjeta debe ser de Google Drive.")
-                    return
+            # Si se agrega cualquiera de los dos enlaces, debe ser una URL
+            # válida de Drive. Ambos enlaces pueden quedar pendientes mientras
+            # el expediente aún está en elaboración o en firma.
+            from urllib.parse import urlparse
+            for etiqueta_doc, url_documento in (
+                ("Mensaje C.E.I", liga_firmado),
+                ("Tarjeta", enlace_tarjeta),
+            ):
+                if url_documento.strip():
+                    url_d = urlparse(url_documento.strip())
+                    if url_d.scheme != "https" or (url_d.hostname or "").lower() not in (
+                            "drive.google.com", "docs.google.com"):
+                        st.error(f"La liga del documento firmado de {etiqueta_doc} "
+                                 "debe ser de Google Drive.")
+                        return
         if registro_solo_numero_salida and not proyecto:
             st.error("Selecciona el proyecto al que pertenece el oficio.")
             return
@@ -5208,12 +5268,8 @@ def formulario_nuevo_oficio():
                             st.error("Ese oficio ya está registrado.")
                             return
 
-                if (tipo_documento == "Tarjeta" and not existentes.empty
-                        and "No. de oficio" in existentes.columns):
-                    if any(normalizar_texto(valor) == normalizar_texto(numero)
-                           for valor in existentes["No. de oficio"].tolist()):
-                        st.error("Este número de Tarjeta ya está registrado. Usa otro número único.")
-                        return
+                # La validación conjunta de ambos números se ejecuta con lectura
+                # fresca de OFICIOS dentro de _guardar_pareja_cei_tarjeta.
 
                 # Verificar que existe la hoja auxiliar antes de registrar en OFICIOS.
                 # No cambia las 12 columnas originales.
