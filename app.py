@@ -1317,7 +1317,7 @@ def _verificar_expediente_documental(folio, numero):
     return coincidencias[0]
 
 
-def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No especificada", origen=""):
+def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No especificada", origen="", pdf_revision=None):
     oficio = _verificar_expediente_documental(folio, numero)
     anteriores = _borradores_expediente(folio, numero)
     etapa = str(anteriores[-1].get("Etapa", "")) if anteriores else ""
@@ -1350,22 +1350,22 @@ def _registrar_borrador(folio, numero, responsable, archivo, procedencia="No esp
                                   f"Procedencia: {procedencia}. Entregado/elaborado por: {origen or 'No indicado'}")
     except Exception as error:
         st.warning(f"La versión quedó guardada, pero falló el registro de procedencia: {error}")
-    # Se guarda también una copia PDF privada e inmutable para el historial.
-    # El Word original permanece porque las correcciones requieren DOCX editable.
-    try:
-        _archivar_pdf_borrador(
-            folio, numero,
-            {"Folio": str(folio), "No. de oficio": str(numero),
-             "Version": version, "Nombre": subido["nombre"],
-             "Drive ID": subido["id"]},
-            docx_bytes=archivo.getvalue(),
-        )
-    except Exception as error:
-        st.warning(
-            "La versión Word quedó registrada, pero su copia histórica PDF está "
-            "pendiente de generar. Se podrá preparar después desde el historial. "
-            f"Detalle: {_mensaje_error_sheets(error)}"
-        )
+    # No convertir automáticamente: la maquetación de LibreOffice puede mover
+    # tablas, encabezados y márgenes de oficios que se imprimen para firma.
+    # Guardar en cambio el PDF exacto exportado por Microsoft Word por su autor.
+    subido["pdf_revision_ok"] = False
+    if pdf_revision is not None:
+        version_guardada = {"Version": version, "Nombre": subido["nombre"],
+                           "Drive ID": subido["id"]}
+        try:
+            _registrar_pdf_original_revision(folio, numero, version_guardada, pdf_revision)
+            subido["pdf_revision_ok"] = True
+        except Exception as error:
+            st.warning(
+                "Se guardó el Word, pero no fue posible adjuntar el PDF original. "
+                "Puedes añadirlo a esta misma versión antes de enviarla a revisión. "
+                f"Detalle: {_mensaje_error_sheets(error)}"
+            )
     return subido
 
 
@@ -1484,6 +1484,15 @@ def _cambiar_etapa_borrador(folio, numero, etapa_nueva, detalle=""):
         raise ValueError("Primero debes cargar un Word.")
     indice, ultima = max(coincidencias, key=lambda par: int(par[1][3]))
     actual = ultima[7]
+    if etapa_nueva == ETAPA_TTE:
+        version_actual = {"Version": int(ultima[3] or 0), "Drive ID": str(ultima[5] or "")}
+        if not _buscar_pdf_original_revision(folio, numero, version_actual, lectura_fresca=True):
+            raise ValueError(
+                "Para enviar el documento a revisión con la Tte. debes adjuntar "
+                "el PDF original exportado desde Microsoft Word para esta versión. "
+                "Ábrelo en el Centro de revisión documental y selecciona "
+                "'Adjuntar PDF original'. No se realizará una conversión automática."
+            )
     if actual == etapa_nueva:
         raise ValueError("Esta versión ya se encuentra en esa etapa. Actualiza la pantalla para ver el estado vigente.")
     admin = puede_gestionar_borradores()
@@ -1815,10 +1824,139 @@ try {
 
 # ================================================================
 # HISTORIAL DOCUMENTAL EN PDF + VISTA PREVIA PRIVADA
+# PDF original subido por el responsable = revisión e impresión.
+# PDF legado convertido = solo histórico, no apto sin verificación visual.
 # ================================================================
 # Nunca se borran ni sobreescriben los Word originales. Son los archivos
 # editables del flujo de correcciones. Los PDF quedan archivados en Drive
 # dentro de la carpeta privada del mismo expediente, con nombre estable.
+
+
+# ================================================================
+# PDF ORIGINAL DE REVISIÓN / IMPRESIÓN (SIN CONVERSIÓN DE OFFICE)
+# ================================================================
+# La copia PDF exportada por el responsable desde Microsoft Word se conserva
+# al lado de la versión DOCX a la que corresponde, con nombre inmutable.
+# Este nombre es distinto al de los PDF históricos creados anteriormente
+# mediante LibreOffice: un PDF convertido NUNCA se tratará como original.
+
+
+def _nombre_pdf_original_revision(version):
+    numero_version = int(version.get("Version") or 0)
+    id_docx = str(version.get("Drive ID") or "").strip()
+    if numero_version < 1 or not re.fullmatch(r"[A-Za-z0-9_-]{10,}", id_docx):
+        raise ValueError("No se pudo asociar el PDF a una versión Word registrada.")
+    marca = hashlib.sha256(id_docx.encode("utf-8")).hexdigest()[:14]
+    return f"V{numero_version:02d}_ORIGINAL_REVISION_{marca}.pdf"
+
+
+def _consultar_pdf_original_revision_directo(folio, numero, nombre):
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    consulta = (f"'{carpeta}' in parents and name = '{nombre}' "
+                "and mimeType = 'application/pdf' and trashed = false")
+    respuesta = _drive_sesion().get(
+        "https://www.googleapis.com/drive/v3/files",
+        params={"q": consulta,
+                "fields": "files(id,name,mimeType,webViewLink),nextPageToken",
+                "supportsAllDrives": "true", "includeItemsFromAllDrives": "true",
+                "pageSize": 20},
+        timeout=30,
+    )
+    archivos = _drive_json(respuesta, "localizar PDF original de revisión").get("files", [])
+    return archivos[0] if archivos else None
+
+
+@st.cache_data(ttl=45, max_entries=400, show_spinner=False)
+def _consultar_pdf_original_revision_cache(area, folio, numero, nombre):
+    # El área validada forma parte de la clave para no cruzar SETF con DG.
+    if _area_activa_validada() != area:
+        raise PermissionError("No es posible consultar documentos de otra área.")
+    return _consultar_pdf_original_revision_directo(folio, numero, nombre)
+
+
+def _buscar_pdf_original_revision(folio, numero, version, *, lectura_fresca=False):
+    area = _area_activa_validada()
+    nombre = _nombre_pdf_original_revision(version)
+    if lectura_fresca:
+        return _consultar_pdf_original_revision_directo(folio, numero, nombre)
+    return _consultar_pdf_original_revision_cache(area, str(folio), str(numero), nombre)
+
+
+def _registrar_pdf_original_revision(folio, numero, version, archivo_pdf):
+    """Sube bytes PDF aportados por el responsable; nunca convierte el DOCX.
+
+    Una copia de cada versión es inmutable. Para corregir el PDF se registra
+    otra versión DOCX+PDF, conservando la trazabilidad de lo revisado.
+    """
+    oficio = _verificar_expediente_documental(folio, numero)
+    if puede_realizar_revision_final() and not puede_gestionar_borradores():
+        raise PermissionError("La Tte. consulta los PDF, pero no carga versiones.")
+    es_responsable = puede_editar_responsable(oficio.get("Responsable", ""))
+    if not (puede_gestionar_borradores() or es_responsable):
+        raise PermissionError("Solo el responsable o Gestión Documental puede adjuntar el PDF.")
+
+    versiones = _borradores_expediente(folio, numero)
+    objetivo = next((v for v in versiones if
+                     int(v.get("Version") or 0) == int(version.get("Version") or 0)
+                     and str(v.get("Drive ID") or "") == str(version.get("Drive ID") or "")), None)
+    if objetivo is None or not versiones or objetivo != versiones[-1]:
+        raise ValueError("Solo se puede adjuntar el PDF de la última versión Word registrada.")
+    # Lectura fresca para que otro usuario no haya formalizado entre sesiones.
+    filas = _hoja_borradores().get_all_values()[1:]
+    coincidentes = [r for r in filas if len(r) >= 8 and
+                    r[0].strip() == str(folio).strip() and
+                    r[1].strip() == str(numero).strip()]
+    if not coincidentes:
+        raise ValueError("No se encontró la versión Word del expediente.")
+    fila_actual = max(coincidentes, key=lambda r: int(r[3] or 0))
+    if str(fila_actual[5]).strip() != str(version.get("Drive ID") or ""):
+        raise ValueError("Se registró otra versión Word. Actualiza el expediente.")
+    if fila_actual[7] not in (ETAPA_BORRADOR, ETAPA_ENVIADO, ETAPA_CORRECCIONES,
+                             ETAPA_RETORNO_FIRMA, ETAPA_TTE):
+        raise ValueError("La versión ya fue autorizada o está en firma. No se sustituye su PDF.")
+
+    if archivo_pdf is None or not archivo_pdf.name.lower().endswith(".pdf"):
+        raise ValueError("Adjunta un archivo PDF exportado desde Microsoft Word.")
+    datos = archivo_pdf.getvalue()
+    if not datos.startswith(b"%PDF-") or len(datos) < 200:
+        raise ValueError("El archivo adjunto no tiene un encabezado PDF válido.")
+    if len(datos) > 40 * 1024 * 1024:
+        raise ValueError("El archivo PDF no puede superar los 40 MB.")
+    if _buscar_pdf_original_revision(folio, numero, version, lectura_fresca=True):
+        raise ValueError("Ya existe un PDF original para esta versión. Para reemplazarlo, "
+                         "registra una nueva versión Word con su PDF actualizado.")
+
+    nombre = _nombre_pdf_original_revision(version)
+    carpeta = _drive_carpeta_expediente(folio, numero)
+    sesion = _drive_sesion()
+    inicio = sesion.post(
+        "https://www.googleapis.com/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,name", "supportsAllDrives": "true"},
+        json={"name": nombre, "parents": [carpeta], "mimeType": "application/pdf"},
+        headers={"X-Upload-Content-Type": "application/pdf",
+                 "X-Upload-Content-Length": str(len(datos))},
+        timeout=30,
+    )
+    if not inicio.ok:
+        _drive_json(inicio, "iniciar subida del PDF de revisión")
+    url_subida = inicio.headers.get("Location", "")
+    if not url_subida.startswith("https://www.googleapis.com/"):
+        raise RuntimeError("Drive no devolvió una URL segura para almacenar el PDF.")
+    resultado = sesion.put(
+        url_subida, data=datos,
+        headers={"Content-Type": "application/pdf", "Content-Length": str(len(datos))},
+        timeout=120,
+    )
+    creado = _drive_json(resultado, "guardar PDF original para revisión")
+    _consultar_pdf_original_revision_cache.clear()
+    try:
+        _registrar_evento_borrador(folio, numero, int(version.get("Version") or 0),
+                                   "PDF original de revisión cargado",
+                                   "Archivo exportado por responsable desde Word: " + nombre)
+    except Exception as error:
+        st.warning("El PDF quedó guardado en Drive, pero no se registró su evento: "
+                   + _mensaje_error_sheets(error))
+    return creado
 
 
 def _nombre_pdf_archivado(version):
@@ -1903,7 +2041,11 @@ def _descargar_pdf_privado(drive_id):
 
 
 def _archivar_pdf_borrador(folio, numero, version, docx_bytes=None):
-    """Obtiene la copia PDF; las versiones antiguas se convierten una sola vez."""
+    """Ruta heredada: NO usar como PDF para revisión e impresión oficial.
+
+    Se conserva por compatibilidad con documentos anteriores; la interfaz
+    ya no llama a este conversor para las versiones nuevas.
+    """
     _verificar_expediente_documental(folio, numero)
     documento_id = str(version.get("Drive ID") or "")
     if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", documento_id):
@@ -1977,7 +2119,7 @@ def _fila_version_pdf(folio, numero, version, version_vigente=False, *, compacto
     """Histórico PDF en Drive: enlace directo, sin descargas ni visor duplicado.
 
     Las versiones DOCX de origen se conservan para recuperación y auditoría.
-    Una versión antigua sin copia PDF ofrece archivarla una única vez.
+    Los PDF convertidos históricamente se identifican como no verificados.
     """
     import hashlib
 
@@ -1989,15 +2131,23 @@ def _fila_version_pdf(folio, numero, version, version_vigente=False, *, compacto
     titulo = f"V{n:02d} · {Path(str(version.get('Nombre') or 'documento')).stem}.pdf"
 
     try:
-        archivo = _buscar_pdf_archivado(folio, numero, version)
+        archivo = _buscar_pdf_original_revision(folio, numero, version)
+        pdf_heredado = False
+        if archivo is None:
+            archivo = _buscar_pdf_archivado(folio, numero, version)
+            pdf_heredado = bool(archivo)
     except Exception as error:
         st.warning("No fue posible consultar el archivo histórico en Drive: " +
                    _mensaje_error_sheets(error))
         return
 
     if archivo:
-        # Abre el PDF real en Drive; los permisos siguen controlados por Google.
+        # El histórico convertido se conserva para consulta, NO se certifica
+        # como fiel al Word ni debe usarse para impresión sin comprobarlo.
         url = _enlace_pdf_drive(archivo)
+        if pdf_heredado:
+            st.warning("PDF histórico generado con el conversor anterior: verifica "
+                       "la maquetación antes de imprimir. Solicita el original si es necesario.")
         if compacto:
             st.markdown(
                 '<div class="hist-pdf-link-row">'
@@ -2027,21 +2177,13 @@ def _fila_version_pdf(folio, numero, version, version_vigente=False, *, compacto
     else:
         if compacto:
             st.markdown(
-                f'<div class="hist-pdf-pending">PDF de V{n:02d} pendiente de archivar en Drive</div>',
+                f'<div class="hist-pdf-pending">V{n:02d} · No se adjuntó PDF original de revisión.</div>',
                 unsafe_allow_html=True,
             )
         else:
             st.markdown(f"**📑 {html.escape(titulo)}**", unsafe_allow_html=True)
-            st.caption("Esta versión aún no tiene PDF archivado en Google Drive.")
-        if st.button("↻ Archivar PDF histórico en Drive", key=f"{clave}_archivar",
-                     use_container_width=True):
-            try:
-                with st.spinner("Convirtiendo y guardando el PDF histórico en Drive..."):
-                    _archivar_pdf_borrador(folio, numero, version)
-                st.rerun()
-            except Exception as error:
-                st.error("No se pudo archivar el PDF histórico: " +
-                         _mensaje_error_sheets(error))
+            st.caption("Esta versión no tiene un PDF original adjunto. "
+                       "No se generará una copia automática que pueda alterar el formato.")
 
 
 
@@ -2281,11 +2423,11 @@ def _mostrar_historial_pdf_por_version(folio, numero, versiones_anteriores, movi
                            f"{_texto_detalle_historial(evento)}")
 
 
-def _botones_word_y_pdf(drive_id, nombre, clave):
+def _botones_word_y_pdf(drive_id, nombre, clave, *, folio, numero, version):
     """Accesos elegantes para Word/PDF, conservando Drive privado y el flujo actual.
 
-    Preparar Word guarda el DOCX en la sesión y Preparar PDF convierte esa misma
-    versión vigente. Las descargas aparecen únicamente cuando están listas.
+    Preparar Word recupera el DOCX. Preparar PDF recupera el PDF original
+    aportado por el responsable para ESA MISMA versión, sin reconvertirlo.
     """
     import hashlib
 
@@ -2490,12 +2632,17 @@ def _botones_word_y_pdf(drive_id, nombre, clave):
                 if st.button("Preparar archivo .pdf",
                              key=f"{base}_prep_pdf", use_container_width=True):
                     try:
-                        with st.spinner("Convirtiendo el Word vigente a PDF..."):
-                            word = st.session_state.get(f"{base}_word")
-                            if word is None:
-                                word = _descargar_docx_drive(id_actual)
-                                st.session_state[f"{base}_word"] = word
-                            st.session_state[f"{base}_pdf"] = _convertir_word_pdf_privado(word)
+                        with st.spinner("Recuperando el PDF original de revisión desde Drive..."):
+                            expediente = {"Version": int(version), "Drive ID": id_actual}
+                            original = _buscar_pdf_original_revision(
+                                folio, numero, expediente, lectura_fresca=True)
+                            if not original:
+                                raise ValueError(
+                                    "Esta versión aún no tiene un PDF exportado desde Word. "
+                                    "El responsable debe adjuntarlo desde el Centro de revisión. "
+                                    "No se convertirá automáticamente porque el formato puede cambiar."
+                                )
+                            st.session_state[f"{base}_pdf"] = _descargar_pdf_privado(original["id"])
                         st.rerun()  # Habilita descarga y vista previa inmediatamente.
                     except Exception as error:
                         st.error(f"No se pudo preparar PDF: {_mensaje_error_sheets(error)}")
@@ -2796,6 +2943,7 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
         _botones_word_y_pdf(
             ultimo.get("Drive ID", ""), ultimo.get("Nombre", "Documento Word"),
             f"borrador_{folio}_{numero}_{ultimo.get('Version', '')}",
+            folio=folio, numero=numero, version=int(ultimo.get("Version") or 0),
         )
         with st.expander(f"Historial PDF y observaciones · {max(len(versiones)-1,0)} anteriores",
                          expanded=False):
@@ -2837,6 +2985,14 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
             with st.form(key=f"doc_carga_{folio}_{numero}"):
                 archivo = st.file_uploader("Documento Word editable (.docx)", type=["docx"],
                                            key=f"doc_archivo_{folio}_{numero}")
+                pdf_revision = st.file_uploader(
+                    "PDF de revisión e impresión, exportado desde Microsoft Word (.pdf)",
+                    type=["pdf"], key=f"doc_pdf_original_{folio}_{numero}",
+                    help="Debe corresponder exactamente a la versión Word que estás cargando. "
+                         "Se conserva sin conversión y se utilizará para revisión e impresión.",
+                )
+                st.caption("Puedes guardar el Word como borrador; para enviarlo a la Tte. "
+                           "también debes adjuntar el PDF original de esa misma versión.")
                 procedencia = st.selectbox("¿Cómo se recibió o elaboró el documento?",
                                            ["Elaboración propia", "Memoria USB", "Correo electrónico",
                                             "Entregado por auxiliar", "Otro medio"],
@@ -2872,18 +3028,53 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
                                               key=f"doc_origen_lista_{_area_activa_validada()}_{folio}_{numero}")
                 origen = (st.text_input("Especifica el nombre", key=f"doc_origen_otro_{folio}_{numero}")
                           if persona_elegida == "Otro" else persona_elegida)
-                guardar = st.form_submit_button("Guardar Word y conservar versión", use_container_width=True)
+                guardar = st.form_submit_button("Guardar versión documental", use_container_width=True)
             if guardar:
                 if archivo is None:
                     st.warning("Selecciona un archivo .docx.")
                 else:
                     try:
                         with st.spinner("Guardando nueva versión en Drive y Sheets..."):
-                            _registrar_borrador(folio, numero, responsable, archivo, procedencia, origen)
-                        st.success("Versión registrada sin sobrescribir archivos anteriores.")
+                            resultado_guardado = _registrar_borrador(
+                                folio, numero, responsable, archivo, procedencia, origen,
+                                pdf_revision=pdf_revision,
+                            )
+                        if resultado_guardado.get("pdf_revision_ok"):
+                            st.success("Word y PDF original registrados en la misma versión.")
+                        else:
+                            st.info("Word registrado. Adjunta su PDF original antes de enviarlo a revisión.")
                         st.rerun()
                     except Exception as error:
                         st.error(str(error))
+
+    if ultimo and (puede_subir or
+                   (etapa == ETAPA_TTE and not puede_realizar_revision_final() and
+                    puede_editar_responsable(responsable))):
+        with st.expander("Adjuntar PDF original a la versión Word vigente", expanded=False):
+            st.caption("Úsalo si primero guardaste el Word sin PDF. Debe ser la exportación "
+                       "a PDF de esa misma versión, realizada en Microsoft Word. "
+                       "No se permite sustituir un PDF original ya registrado.")
+            with st.form(key=f"doc_pdf_posterior_{folio}_{numero}_{ultimo.get('Version', '')}"):
+                pdf_posterior = st.file_uploader(
+                    "PDF original (.pdf)", type=["pdf"],
+                    key=f"doc_pdf_posterior_archivo_{folio}_{numero}_{ultimo.get('Version', '')}",
+                )
+                confirmar_pdf = st.checkbox(
+                    "Confirmo que este PDF corresponde al Word vigente del expediente.",
+                    key=f"doc_pdf_coincide_{folio}_{numero}_{ultimo.get('Version', '')}",
+                )
+                adjuntar = st.form_submit_button("Guardar PDF original", use_container_width=True)
+            if adjuntar:
+                if not confirmar_pdf or pdf_posterior is None:
+                    st.warning("Adjunta el archivo y confirma que corresponde a la versión Word vigente.")
+                else:
+                    try:
+                        with st.spinner("Guardando PDF original sin modificar su formato..."):
+                            _registrar_pdf_original_revision(folio, numero, ultimo, pdf_posterior)
+                        st.success("PDF original registrado para esta versión. Ya está disponible para revisión.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(_mensaje_error_sheets(error))
 
     if not ultimo:
         return
@@ -4680,30 +4871,30 @@ def formulario_nuevo_oficio():
     tipo_documento = tipo_visible
     etiqueta_principal_par = tipo_visible if es_par_cei else "Oficio"
     if es_par_cei:
-        st.caption(
-            f"Los números propios de {etiqueta_principal_par} y su Tarjeta se capturan "
-            "más abajo. Si este expediente responde a un oficio recibido, "
-            "activa antecedentes para registrar su identificación y sus vínculos."
-        )
-        # Para C.E.I. e Intersecretarial, esta casilla determina si existe
-        # CUALQUIER antecedente, incluido el oficio recibido inmediato.
+        st.caption(f"Los números propios de {etiqueta_principal_par} y su Tarjeta "
+                   "se capturan abajo. Si no existe un oficio recibido como antecedente, "
+                   "no es necesario capturar folio ni número de entrada.")
+        # Para C.E.I. e Intersecretarial, esta casilla controla TODOS los
+        # antecedentes, incluido el oficio recibido inmediato. No es un
+        # indicador de documentos adicionales como en el flujo ordinario.
         tiene_antecedentes = st.checkbox(
-            "Este expediente tiene antecedentes",
-            value=True,
+            "Este expediente tiene antecedentes anteriores", value=False,
             key=f"tiene_antecedentes_{version}",
-            help="Desmarca si no existe oficio recibido ni ningún antecedente. "
-                 "En ese caso no se pedirá folio ni número de oficio recibido.",
+            help="Marca esta opción solo cuando exista un oficio recibido "
+                 "u otro documento anterior que deba vincularse.",
         )
         if tiene_antecedentes:
             tiene_folio = st.checkbox(
                 "El oficio recibido tiene folio", value=True,
                 key=f"tiene_folio_{version}",
-                help="Si el oficio recibido no tiene folio, desmarca esta opción.",
+                help="Indica si el oficio antecedente cuenta con folio.",
             )
         else:
             tiene_folio = False
+            st.caption("Sin antecedentes: el folio, número y enlace del oficio "
+                       "recibido no se solicitarán ni guardarán.")
     else:
-        # Conservar íntegro el comportamiento histórico de Oficios normales.
+        # Conservar intacto el comportamiento histórico de Oficio ordinario.
         tiene_folio = st.checkbox(
             "Este oficio tiene folio", value=True,
             key=f"tiene_folio_{version}",
@@ -4779,20 +4970,19 @@ def formulario_nuevo_oficio():
                 st.caption("No aplica · expediente sin folio")
         with col2:
             if es_par_cei:
-                # La identidad de ENTRADA solo existe si el usuario declaró
-                # antecedentes; los números de salida se capturan abajo.
+                # La identidad de entrada SOLO se solicita si hay antecedentes.
+                # El número propio del C.E.I./Intersecretarial se captura abajo.
                 numero = ""
                 if tiene_antecedentes:
                     numero_oficio_recibido = st.text_input(
                         "No. de oficio recibido (antecedente)",
                         key=f"numero_oficio_antecedente_{version}",
                         placeholder="Ej. 0002",
-                        help="Número del oficio recibido, distinto del número "
-                             "único del C.E.I./Intersecretarial y de la Tarjeta.",
+                        help="Oficio recibido al que se responde con el Mensaje o Intersecretarial. "
+                             "No sustituye al número único del documento de salida.",
                     ).strip()
                 else:
-                    st.markdown("**Antecedente recibido**")
-                    st.caption("No aplica · expediente sin antecedentes")
+                    st.caption("Sin oficio recibido como antecedente")
             else:
                 numero = st.text_input("No. de oficio", key=f"numero_{version}")
         with col3:
@@ -5229,11 +5419,10 @@ def formulario_nuevo_oficio():
                 "Enlace del oficio (Drive)", key=f"directo_url_{version}",
                 placeholder="https://drive.google.com/...")
 
-    # Sin folio y sin antecedentes: ocultar también el bloque vacío de
-    # antecedentes; anexos continúa disponible si algún expediente los requiere.
+    # Sin antecedentes para C.E.I./Intersecretarial: no mostrar el bloque
+    # ni conservar documentos anteriores guardados en el estado del formulario.
+    # El caso sin folio ni antecedentes de Oficio ordinario se mantiene.
     if registro_solo_numero_salida or (es_par_cei and not tiene_antecedentes):
-        # En C.E.I./Intersecretarial sin antecedentes no mostrar ni conservar
-        # documentos recibidos, incluso si hay valores viejos en session_state.
         antecedentes = []
         st.markdown("**Anexos (opcionales)**")
         anexos = documentos_formulario(f"anexos_{version}")
@@ -5288,9 +5477,7 @@ def formulario_nuevo_oficio():
     # Preservar la identidad del documento recibido aun cuando el PDF no esté
     # vinculado todavía. No se consulta ni sube nada adicional a Google Drive.
     numero_entrada = numero_oficio_recibido if es_par_cei else numero
-    if (not es_par_cei or tiene_antecedentes) and (
-            enlace_oficio_recibido or (es_par_cei and numero_oficio_recibido)
-    ):
+    if (not es_par_cei or tiene_antecedentes) and (enlace_oficio_recibido or (es_par_cei and numero_oficio_recibido)):
         antecedentes = _antecedentes_con_recibido(
             numero_entrada, enlace_oficio_recibido, antecedentes,
             conservar_sin_enlace=es_par_cei)
@@ -5397,12 +5584,6 @@ def formulario_nuevo_oficio():
                          "para el oficio principal.")
                 return
 
-        if es_par_cei and not tiene_antecedentes:
-            folio = ""
-            numero_oficio_recibido = ""
-            enlace_oficio_recibido = ""
-            antecedentes = []
-
         try:
             with st.spinner("Guardando oficio en Google Sheets..."):
 
@@ -5444,6 +5625,13 @@ def formulario_nuevo_oficio():
 
                 # Preparar información
                 proyecto_str = str(proyecto) if proyecto else ""
+                # Sin antecedentes en C.E.I./Intersecretarial: forzar
+                # valores vacíos incluso si hubo entradas en un rerun anterior.
+                if es_par_cei and not tiene_antecedentes:
+                    folio = ""
+                    numero_oficio_recibido = ""
+                    enlace_oficio_recibido = ""
+                    antecedentes = []
                 datos = [
                     folio.strip(),
                     numero.strip(),
@@ -6120,7 +6308,8 @@ def _panel_revision_tte(registro, oficio_relacionado=None):
                         f'<small title="{html.escape(nombre, quote=True)}">{html.escape(nombre_breve)}</small>'
                         '</div></div>', unsafe_allow_html=True,
                     )
-                    _botones_word_y_pdf(drive_id, nombre, f"tte_{folio}_{numero}_{version}")
+                    _botones_word_y_pdf(drive_id, nombre, f"tte_{folio}_{numero}_{version}",
+                                        folio=folio, numero=numero, version=version)
                     with st.expander("Historial PDF · versiones anteriores", expanded=False):
                         try:
                             versiones = _borradores_expediente(folio, numero)
