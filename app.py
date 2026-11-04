@@ -4087,8 +4087,8 @@ def _registrar_clasificacion_documental(filas):
 
 def _validar_numeros_pareja(folio_cei, numero_cei, numero_tarjeta, registros,
                            tipo_principal="Mensaje C.E.I"):
-    """Números únicos para C.E.I/Intersecretarial y su Tarjeta vinculada."""
-    if tipo_principal not in ("Mensaje C.E.I", "Intersecretarial"):
+    """Números únicos para el documento principal y su Tarjeta vinculada."""
+    if tipo_principal not in ("Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio"):
         raise ValueError("Tipo de documento no válido para el registro conjunto.")
     a, b = str(numero_cei).strip(), str(numero_tarjeta).strip()
     if not a or not b:
@@ -4113,7 +4113,7 @@ def _guardar_pareja_cei_tarjeta(datos_cei, numero_tarjeta, enlace_tarjeta,
     exigir_sesion()
     if _area_activa_validada() != "setf":
         raise PermissionError("El registro conjunto con Tarjeta solo está disponible en SETF.")
-    if tipo_principal not in ("Mensaje C.E.I", "Intersecretarial"):
+    if tipo_principal not in ("Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio"):
         raise ValueError("Tipo de documento no válido para el registro conjunto.")
     cei = list(datos_cei)
     folio, numero_cei = str(cei[0]).strip(), str(cei[1]).strip()
@@ -4183,7 +4183,7 @@ def _agrupar_firmados_cei_tarjeta(lista, registros, mapa_tipos):
                        str(tipo.get("No. relacionado", "")).strip())
         otro = por_id.get(relacionado)
         otro_tipo = mapa_tipos.get(relacionado, {})
-        principales = ("Mensaje C.E.I", "Intersecretarial")
+        principales = ("Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio")
         tipo_actual = tipo.get("Tipo de documento")
         tipo_relacionado = otro_tipo.get("Tipo de documento")
         pareja_valida = ((tipo_actual in principales and tipo_relacionado == "Tarjeta")
@@ -4858,18 +4858,18 @@ def formulario_nuevo_oficio():
     # nuevos trámites directos desde este formulario.
     tramite_directo = False
     st.markdown("#### Identificación del documento")
-    # Intersecretarial utiliza exactamente el mismo flujo de Mensaje C.E.I:
-    # una captura, dos números, dos enlaces y una Tarjeta vinculada.
-    # "Oficio" mantiene su formato y comportamiento históricos.
+    # C.E.I., Intersecretarial y Tarjeta y oficio comparten un flujo de pareja:
+    # dos números y enlaces propios, con una Tarjeta vinculada.
+    # "Oficio" ordinario conserva su formato y comportamiento históricos.
     tipo_visible = (
-        st.selectbox("Tipo de documento", ["Oficio", "Mensaje C.E.I", "Intersecretarial"],
+        st.selectbox("Tipo de documento", ["Oficio", "Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio"],
                      key=f"tipo_documento_{version}",
-                     help="Mensaje C.E.I e Intersecretarial se registran con su Tarjeta en una sola captura.")
+                     help="Mensaje C.E.I, Intersecretarial y Tarjeta y oficio registran dos documentos vinculados en una sola captura.")
         if _area_activa_validada() == "setf" else "Oficio"
     )
-    es_par_cei = tipo_visible in ("Mensaje C.E.I", "Intersecretarial")
+    es_par_cei = tipo_visible in ("Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio")
     tipo_documento = tipo_visible
-    etiqueta_principal_par = tipo_visible if es_par_cei else "Oficio"
+    etiqueta_principal_par = ("Oficio" if tipo_visible == "Tarjeta y oficio" else tipo_visible)
     if es_par_cei:
         st.caption(f"Los números propios de {etiqueta_principal_par} y su Tarjeta "
                    "se capturan abajo. Si no existe un oficio recibido como antecedente, "
@@ -5504,7 +5504,7 @@ def formulario_nuevo_oficio():
     # =====================================================
 
     if st.button(
-        f"Guardar {etiqueta_principal_par} y Tarjeta" if es_par_cei else "Guardar documento",
+        (("Guardar Tarjeta y oficio" if tipo_visible == "Tarjeta y oficio" else f"Guardar {etiqueta_principal_par} y Tarjeta") if es_par_cei else "Guardar documento"),
         key="guardar_nuevo_oficio",
         use_container_width=True,
         type="primary"
@@ -5535,7 +5535,7 @@ def formulario_nuevo_oficio():
                 st.error("Debes capturar el número único de Tarjeta.")
                 return
             if normalizar_texto(numero_tarjeta) == normalizar_texto(numero):
-                st.error(f"{etiqueta_principal_par} y Tarjeta deben llevar números diferentes.")
+                st.error(f"El número de {etiqueta_principal_par} y el de Tarjeta deben ser diferentes.")
                 return
             # Si se agrega cualquiera de los dos enlaces, debe ser una URL
             # válida de Drive. Ambos enlaces pueden quedar pendientes mientras
@@ -10974,7 +10974,7 @@ def _modulo_lateral_documentos(tipo):
                             etiqueta_par_firmados = tipos_archivo.get(
                                 (folio_cei, numero_cei), {}).get(
                                     "Tipo de documento", "Mensaje C.E.I")
-                            if etiqueta_par_firmados not in ("Mensaje C.E.I", "Intersecretarial"):
+                            if etiqueta_par_firmados not in ("Mensaje C.E.I", "Intersecretarial", "Tarjeta y oficio"):
                                 etiqueta_par_firmados = "Mensaje C.E.I"
                             token_par = hashlib.sha256(
                                 (folio_cei + "|" + numero_cei + "|" + numero_tarjeta).encode("utf-8")
@@ -10983,8 +10983,8 @@ def _modulo_lateral_documentos(tipo):
                                 st.markdown(
                                     '<div class="firm-archive-name">'
                                     + html.escape(etiqueta_par_firmados)
-                                    + ' y Tarjeta</div><div class="firm-archive-meta">'
-                                    + html.escape(etiqueta_par_firmados) + ': ' + html.escape(numero_cei) +
+                                    + ('</div><div class="firm-archive-meta">' if etiqueta_par_firmados == "Tarjeta y oficio" else ' y Tarjeta</div><div class="firm-archive-meta">')
+                                    + html.escape("Oficio" if etiqueta_par_firmados == "Tarjeta y oficio" else etiqueta_par_firmados) + ': ' + html.escape(numero_cei) +
                                     ' · Tarjeta: ' + html.escape(numero_tarjeta) +
                                     ' · ' + html.escape(str(cei.get("Responsable", ""))) +
                                     '</div>', unsafe_allow_html=True)
@@ -10996,7 +10996,7 @@ def _modulo_lateral_documentos(tipo):
                                     2, gap="small", vertical_alignment="top")
                                 with col_documentos:
                                     documentos_pareja = (
-                                        (etiqueta_par_firmados, numero_cei,
+                                        ("Oficio" if etiqueta_par_firmados == "Tarjeta y oficio" else etiqueta_par_firmados, numero_cei,
                                          leer_documentos(cei.get("Firmado", ""))),
                                         ("Tarjeta", numero_tarjeta,
                                          leer_documentos(tarjeta.get("Firmado", ""))),
