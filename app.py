@@ -9,6 +9,7 @@ import hmac
 import secrets
 import requests
 from pathlib import Path
+from functools import lru_cache
 import textwrap
 import unicodedata
 import pandas as pd
@@ -82,7 +83,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner=False, max_entries=48)
+# El resultado es un str inmutable, compartible entre sesiones sin copiarlo en cada rerun.
+@st.cache_resource(show_spinner=False, max_entries=48)
 def _asset_base64_cacheado(ruta_absoluta, revision_ns):
     """Convert static images once per file version, not on each Streamlit rerun."""
     return base64.b64encode(Path(ruta_absoluta).read_bytes()).decode("ascii")
@@ -3236,13 +3238,19 @@ def mostrar_borradores_pendiente(folio, numero, responsable, compacto=False):
 # FUNCIONES DE BÚSQUEDA Y NORMALIZACIÓN
 # =========================================================
 
-def normalizar_texto(texto):
-    texto = str(texto or "").strip().lower()
+@lru_cache(maxsize=4096)
+def _normalizar_texto_cacheado(texto):
+    """Normalización pura e inmutable, usada en filtros y listas repetidos."""
     return "".join(
         caracter
         for caracter in unicodedata.normalize("NFD", texto)
         if unicodedata.category(caracter) != "Mn"
     )
+
+
+def normalizar_texto(texto):
+    # Convertir primero a str evita introducir en la caché listas o dicts no hashables.
+    return _normalizar_texto_cacheado(str(texto or "").strip().lower())
 
 
 def buscar_oficios(consulta):
@@ -3347,6 +3355,7 @@ def _eliminar_oficio_confirmado(folio, numero):
             hojas[nombre].delete_rows(indice)
     _invalidar_cache_documental(borradores=True, eventos=True, oficios=True)
     _leer_modalidades_por_area.clear()
+    _indice_modalidades_por_area.clear()
     # Comprobación de consistencia: ningún panel debe recuperar el expediente.
     for nombre, hoja in hojas.items():
         datos_restantes = hoja.get_all_values()
@@ -3999,11 +4008,27 @@ def _leer_modalidades_por_area(area):
     return _hoja_modalidades_por_area(area).get_all_records()
 
 
+@st.cache_data(ttl=25, max_entries=4, show_spinner=False)
+def _indice_modalidades_por_area(area):
+    """Índice de consulta de modalidades; evita recorrer toda la hoja por oficio.
+
+    Reutiliza la lectura existente y se invalida junto con ella tras escrituras.
+    """
+    indice = {}
+    for r in _leer_modalidades_por_area(area):
+        identidad = (str(r.get("Folio", "")).strip(),
+                     str(r.get("No. de oficio", "")).strip())
+        # Una eventual clave duplicada debe seguir devolviendo la PRIMERA fila,
+        # exactamente como hacía la búsqueda secuencial original.
+        indice.setdefault(identidad, r)
+    return indice
+
+
 def _modalidad_expediente(folio, numero):
     """Devuelve el registro auxiliar; ausencia equivale a trámite legado/ordinario."""
-    return next((r for r in _leer_modalidades()
-                 if str(r.get("Folio", "")).strip() == str(folio).strip()
-                 and str(r.get("No. de oficio", "")).strip() == str(numero).strip()), None)
+    return _indice_modalidades_por_area(_area_activa_validada()).get(
+        (str(folio).strip(), str(numero).strip())
+    )
 
 
 def _registrar_modalidad(folio, numero, tipo, tiene_antecedentes,
@@ -4022,6 +4047,7 @@ def _registrar_modalidad(folio, numero, tipo, tiene_antecedentes,
         identificador_sesion(), fecha, "", "", "",
     ], value_input_option="RAW")
     _leer_modalidades_por_area.clear()
+    _indice_modalidades_por_area.clear()
 
 
 # =========================================================
@@ -4154,6 +4180,7 @@ def _guardar_pareja_cei_tarjeta(datos_cei, numero_tarjeta, enlace_tarjeta,
     try:
         hoja_modalidades.append_rows(filas_modalidades, value_input_option="RAW")
         _leer_modalidades_por_area.clear()
+        _indice_modalidades_por_area.clear()
     except Exception as error:
         raise RuntimeError("Los DOS documentos ya existen en OFICIOS, pero falló "
                            "MODALIDADES_TRAMITE. No registres de nuevo: solicita conciliación. "
@@ -4229,6 +4256,7 @@ def _actualizar_modalidad_directa(folio, numero, estado, observaciones=""):
     hoja.batch_update([{"range": rowcol_to_a1(fila, col), "values": [[valor]]}
                        for col, valor in cambios.items()], value_input_option="RAW")
     _leer_modalidades_por_area.clear()
+    _indice_modalidades_por_area.clear()
 
 
 def _autorizar_tramite_directo(folio, numero, autorizar, observaciones="", nuevo_numero="", nuevo_asunto=""):
@@ -4312,6 +4340,7 @@ def _actualizar_datos_directo_revisor(folio, numero, estado_previo, estado_nuevo
     hoja.batch_update([{"range": rowcol_to_a1(fila, columna), "values": [[dato]]}
                        for columna, dato in cambios.items()], value_input_option="RAW")
     _leer_modalidades_por_area.clear()
+    _indice_modalidades_por_area.clear()
 
 
 def _guardar_resultado_directo(folio, numero, resultado, nombre="", url="", fecha=None, comentario=""):
@@ -4424,6 +4453,7 @@ def _setf_registrar_firmado_desde_bandeja(folio, numero, enlace, fecha, comentar
     # Se actualizan las listas compartidas y los indicadores solo después de guardar.
     _invalidar_cache_documental(oficios=True, borradores=True, eventos=True)
     _leer_modalidades_por_area.clear()
+    _indice_modalidades_por_area.clear()
 
 
 def _reenviar_tramite_directo(folio, numero, nombre, url):
@@ -9475,7 +9505,9 @@ _FONDOS_SETf_POR_PAGINA = {
 }
 
 
-@st.cache_data(show_spinner=False)
+# La imagen codificada es inmutable. Evita serializar una cadena base64 grande
+# en cada interacción del usuario; el mtime mantiene la invalidación por versión.
+@st.cache_resource(show_spinner=False, max_entries=16)
 def _imagen_setf_pagina_cacheada(ruta_absoluta, fecha_modificacion_ns):
     """Evita recodificar los PNG grandes ante cada interacción de Streamlit."""
     ruta = Path(ruta_absoluta)
@@ -9581,10 +9613,17 @@ def _setf_notificaciones_por_usuario(usuario, responsable):
         pass  # Otros eventos siguen disponibles si hay problemas en la agenda.
     try:
         df = obtener_oficios_por_area("setf")
-        if not df.empty and "Responsable" in df.columns:
-            for _, r in df.iterrows():
-                nombre = str(r.get("Responsable", "")).strip()
-                if not responsable or normalizar_texto(nombre) != normalizar_texto(responsable):
+        # Un recorrido para asignaciones y expedientes vigentes; antes se iteraba
+        # dos veces sobre el DataFrame y se repetía la normalización por registro.
+        validos = set()
+        if not df.empty:
+            responsable_normalizado = normalizar_texto(responsable) if responsable else ""
+            for r in df.to_dict("records"):
+                validos.add((str(r.get("Folio", "")).strip(),
+                             str(r.get("No. de oficio", "")).strip()))
+                if not responsable_normalizado or "Responsable" not in df.columns:
+                    continue
+                if normalizar_texto(str(r.get("Responsable", "")).strip()) != responsable_normalizado:
                     continue
                 estatus = str(r.get("Estatus", r.get("Estado", ""))).strip()
                 if normalizar_texto(estatus) in ("firmado", "firmados", "cancelado"):
@@ -9597,14 +9636,9 @@ def _setf_notificaciones_por_usuario(usuario, responsable):
                     "detalle": str(r.get("No. de oficio") or ident),
                     "destino": "oficios", "fecha": ""})
     except Exception:
-        pass
+        validos = set()
     try:
         # Solo se notifica un envío cuando su oficio de origen continúa vigente.
-        originales = obtener_oficios_por_area("setf")
-        validos = set()
-        if not originales.empty:
-            validos = {(str(r.get("Folio", "")).strip(), str(r.get("No. de oficio", "")).strip())
-                       for _, r in originales.iterrows()}
         for r in _envios_avisos_cacheados("setf"):
             ident = (str(r.get("Folio", "")).strip(), str(r.get("No. de oficio origen", "")).strip())
             if ident not in validos:
@@ -9645,10 +9679,21 @@ def _setf_hoja_lecturas():
     return hoja
 
 
-@st.cache_data(ttl=20, max_entries=64, show_spinner=False)
+@st.cache_data(ttl=20, max_entries=4, show_spinner=False)
+def _setf_indice_lecturas_compartidas():
+    """Una lectura de Sheets para TODOS los usuarios, no una por cada sesión.
+
+    Solo se exponen las marcas del usuario solicitado desde _setf_leidas.
+    """
+    por_usuario = {}
+    for r in _setf_hoja_lecturas().get_all_records():
+        usuario = str(r.get("Usuario", ""))
+        por_usuario.setdefault(usuario, set()).add(str(r.get("ID", "")))
+    return por_usuario
+
+
 def _setf_leidas(usuario):
-    hoja = _setf_hoja_lecturas()
-    return {str(r.get("ID", "")) for r in hoja.get_all_records() if str(r.get("Usuario", "")) == usuario}
+    return _setf_indice_lecturas_compartidas().get(str(usuario), set())
 
 
 def _setf_marcar_leida(evento_id):
@@ -9660,8 +9705,8 @@ def _setf_marcar_leida(evento_id):
         from zoneinfo import ZoneInfo
         ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat(timespec="seconds")
         hoja.append_row([usuario, evento_id, ahora], value_input_option="RAW")
-        # Refrescar inmediatamente el badge después de la escritura confirmada.
-        _setf_leidas.clear()
+        # Refrescar inmediatamente las lecturas después de la escritura confirmada.
+        _setf_indice_lecturas_compartidas.clear()
 
 
 def _setf_campana():
@@ -10035,9 +10080,9 @@ def _actualizar_urgencia(folio, numero, activar):
     _marcas_urgentes_cacheadas.clear()
 
 
-def _dias_desde_recepcion(valor):
-    """Días naturales desde recepción; ISO AAAA-MM-DD se interpreta sin invertir mes/día."""
-    texto = str(valor or "").strip()
+@lru_cache(maxsize=2048)
+def _fecha_recepcion_cacheada(texto):
+    """La fecha analizada es estable; los días transcurridos NO se cachean."""
     if not texto:
         return None
     try:
@@ -10045,11 +10090,15 @@ def _dias_desde_recepcion(valor):
             fecha = pd.to_datetime(texto, yearfirst=True, errors="coerce")
         else:
             fecha = pd.to_datetime(texto, dayfirst=True, errors="coerce")
-        if pd.isna(fecha):
-            return None
-        return max(0, (datetime.now().date() - fecha.date()).days)
+        return None if pd.isna(fecha) else fecha.date()
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def _dias_desde_recepcion(valor):
+    """Días naturales desde recepción, recalculados respecto al día actual."""
+    fecha = _fecha_recepcion_cacheada(str(valor or "").strip())
+    return None if fecha is None else max(0, (datetime.now().date() - fecha).days)
 
 
 def _documentos_seccion(oficio):
@@ -10945,12 +10994,15 @@ def _modulo_lateral_documentos(tipo):
                 st.warning("No fue posible consultar el resguardo Word: " + _mensaje_error_sheets(error))
             # Una ficha para cada C.E.I + Tarjeta cuando ambos están firmados.
             # Las parejas se consultan de la hoja auxiliar únicamente aquí.
-            try:
-                tipos_archivo = _mapa_tipos_documentales("setf")
-                lista = _agrupar_firmados_cei_tarjeta(lista, registros, tipos_archivo)
-            except Exception as error:
-                st.warning("Se mostrarán los documentos por separado porque no "
-                           "pudo leerse su relación: " + _mensaje_error_sheets(error))
+            # Las parejas solo se representan en el archivo completo: las demás
+            # vistas trabajan con expedientes individuales (diccionarios).
+            if vista_firmados == "todos":
+                try:
+                    tipos_archivo = _mapa_tipos_documentales("setf")
+                    lista = _agrupar_firmados_cei_tarjeta(lista, registros, tipos_archivo)
+                except Exception as error:
+                    st.warning("Se mostrarán los documentos por separado porque no "
+                               "pudo leerse su relación: " + _mensaje_error_sheets(error))
 
             # Archivo SETF: una superficie continua y filas compactas, sin
             # duplicar la información ni convertir el estado en un botón.
@@ -11276,8 +11328,20 @@ def _modulo_lateral_documentos(tipo):
 
         # La edición autorizada de la fecha conserva su funcionalidad, pero
         # queda fuera de las tres acciones principales de cada oficio.
-        editables = [r for r in lista if normalizar_texto(r.get("Estatus", "")) == "firmado"
-                     and puede_editar_responsable(r.get("Responsable", ""))]
+        # En SETF el archivo completo contiene tanto registros individuales
+        # (dict) como parejas vinculadas (tuple: C.E.I./Oficio y Tarjeta).
+        # Descomponerlas antes de consultar .get() para la edición de fechas.
+        registros_para_edicion = (
+            documento
+            for elemento in lista
+            for documento in (elemento if isinstance(elemento, tuple) else (elemento,))
+            if isinstance(documento, dict)
+        )
+        editables = [
+            r for r in registros_para_edicion
+            if normalizar_texto(r.get("Estatus", "")) == "firmado"
+            and puede_editar_responsable(r.get("Responsable", ""))
+        ]
         if editables:
             with st.expander("Administración · fecha de recepción del oficio firmado", expanded=False):
                 registros_editables = {
@@ -11648,11 +11712,15 @@ def _modulo_lateral_documentos(tipo):
         return {"dias": dias, "manual": manual, "automatico": automatico,
                 "urgente": (manual or automatico) and not _finalizado_urgencia(registro)}
 
-    lista = [r for r in registros if _prioridad_urgencia(r)["urgente"]]
-    lista.sort(key=lambda r: (_prioridad_urgencia(r)["dias"] is not None,
-                              _prioridad_urgencia(r)["dias"] or -1), reverse=True)
-    antiguedades = [d for r in lista if (d := _prioridad_urgencia(r)["dias"]) is not None]
-    manuales = sum(_prioridad_urgencia(r)["manual"] for r in lista)
+    # Cada registro se evalúa UNA vez por interacción. Antes la misma fecha
+    # se analizaba varias veces para filtrar, ordenar, contar y dibujar tarjetas.
+    prioridades = {id(r): _prioridad_urgencia(r) for r in registros}
+    lista = [r for r in registros if prioridades[id(r)]["urgente"]]
+    lista.sort(key=lambda r: (prioridades[id(r)]["dias"] is not None,
+                              prioridades[id(r)]["dias"] or -1), reverse=True)
+    antiguedades = [prioridades[id(r)]["dias"] for r in lista
+                    if prioridades[id(r)]["dias"] is not None]
+    manuales = sum(prioridades[id(r)]["manual"] for r in lista)
     proximos = sum(4 <= d <= 5 for r in registros if not _finalizado_urgencia(r)
                   if (d := _dias_desde_recepcion(r.get("Fecha de recepción"))) is not None)
     max_antiguedad = max(antiguedades) if antiguedades else None
@@ -12125,7 +12193,7 @@ def _modulo_lateral_documentos(tipo):
     for indice, oficio in enumerate(filtrados):
         folio = str(oficio.get("Folio", "")).strip()
         numero = str(oficio.get("No. de oficio", "")).strip()
-        prioridad = _prioridad_urgencia(oficio)
+        prioridad = prioridades[id(oficio)]
         dias = prioridad["dias"]
         fecha = str(oficio.get("Fecha de recepción", "")).strip() or "No registrada"
         fecha_visual = fecha
