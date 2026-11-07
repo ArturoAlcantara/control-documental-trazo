@@ -12482,6 +12482,7 @@ def _minutas_vista_compartida(libro_id):
         _filas_minutas_setf(hoja),
         _filas_minutas_externas_setf(libro),
         _vinculos_minutas_setf(libro),
+        _bajas_minutas_setf(libro),
     )
 
 
@@ -12697,6 +12698,162 @@ def _eliminar_vinculo_minuta_setf(registro):
                       values=[valores], value_input_option="RAW")
         else:
             ws.append_row(valores, value_input_option="RAW")
+    _minutas_vista_compartida.clear()
+    return True
+
+
+# La baja de minutas es lógica: no se eliminan filas históricas, fórmulas de
+# consecutivos ni documentos de Drive. Se conserva quién y cuándo la dio de baja.
+_MINUTAS_BAJAS_CAMPOS = [
+    "Identificador", "Clave", "Asunto original", "Motivo", "Eliminado por", "Fecha de baja",
+]
+
+
+def _hoja_bajas_minutas_setf(libro, crear=False):
+    nombre = "MINUTAS_BAJAS_APP"
+    try:
+        hoja = libro.worksheet(nombre)
+    except gspread.WorksheetNotFound:
+        if not crear:
+            return None
+        hoja = libro.add_worksheet(title=nombre, rows=1000, cols=len(_MINUTAS_BAJAS_CAMPOS))
+        hoja.append_row(_MINUTAS_BAJAS_CAMPOS, value_input_option="RAW")
+    if hoja.row_values(1) != _MINUTAS_BAJAS_CAMPOS:
+        raise ValueError("MINUTAS_BAJAS_APP tiene encabezados diferentes; no se modificó ningún dato.")
+    return hoja
+
+
+def _bajas_minutas_setf(libro):
+    """Identificadores retirados de la consulta. Sin fila borrada ni consecutivo reutilizado."""
+    hoja = _hoja_bajas_minutas_setf(libro)
+    if hoja is None:
+        return set()
+    return {str(fila[0]).strip() for fila in hoja.get_all_values()[1:]
+            if fila and str(fila[0]).strip()}
+
+
+def _minuta_registro_vigente_setf(registro, libro, hoja_maestra):
+    """Releer la fila real y rechazar cambios concurrentes o referencias obsoletas."""
+    origen = str(registro.get("origen", ""))
+    try:
+        fila = int(registro["fila"])
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError("No se pudo identificar la fila original de la minuta.") from exc
+    if fila < 2 or origen not in ("MINUTAS", "MINUTAS_EXTERNAS_APP"):
+        raise ValueError("El origen de esta minuta no es válido.")
+    if origen == "MINUTAS":
+        hoja = hoja_maestra
+    else:
+        hoja = _hoja_minutas_externas_setf(libro)
+        if hoja is None:
+            raise ValueError("No existe la pestaña de minutas externas.")
+    valores = hoja.row_values(fila)
+    valores = (list(valores) + [""] * 5)[:5]
+    actual = {
+        "numero": str(valores[0]).strip() or ("Sin clave" if origen != "MINUTAS" else ""),
+        "asunto": str(valores[1]).strip(),
+        "fecha": str(valores[2]).strip(),
+        "proyecto": str(valores[3]).strip(),
+    }
+    for campo in ("numero", "asunto", "fecha", "proyecto"):
+        if actual[campo] != str(registro.get(campo, "")).strip():
+            raise ValueError(
+                "Esta minuta cambió en Google Sheets desde que abriste la página. "
+                "Recarga antes de editarla o eliminarla. No se modificaron datos."
+            )
+    return hoja, fila
+
+
+def _fecha_edicion_minuta_setf(texto):
+    """Acepta los formatos observados en las hojas sin adivinar fechas."""
+    for formato in ("%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(str(texto).strip(), formato).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _asunto_con_hipervinculo_minuta_setf(hoja, fila, asunto):
+    """Preserva enlaces HYPERLINK en la columna B de la hoja maestra."""
+    formula = str(hoja.acell(f"B{fila}", value_render_option="FORMULA").value or "").strip()
+    if formula.startswith("="):
+        patron = r'^=HYPERLINK\(\s*"((?:[^"]|"")*)"\s*[,;]\s*"(?:[^"]|"")*"\s*\)$'
+        coincidencia = re.fullmatch(patron, formula, flags=re.IGNORECASE | re.DOTALL)
+        if not coincidencia:
+            raise ValueError(
+                "El asunto original usa una fórmula no estándar en Sheets. "
+                "Por seguridad, edítalo directamente en la hoja."
+            )
+        url = coincidencia.group(1)
+        return '=HYPERLINK("' + url + '","' + asunto.replace('"', '""') + '")'
+    return _texto_sheets_seguro(asunto)
+
+
+def _editar_minuta_setf(registro, asunto, fecha, proyecto):
+    """Edita solo metadatos, conservando identificador, enlaces y folio formulado."""
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Solo SETF puede editar sus minutas.")
+    asunto, proyecto = str(asunto or "").strip(), str(proyecto or "").strip()
+    if not asunto or not proyecto:
+        raise ValueError("Indica un asunto y un proyecto para guardar los cambios.")
+    if _fecha_edicion_minuta_setf(fecha.strftime("%d/%m/%Y")) is None:
+        raise ValueError("La fecha indicada no es válida.")
+    if registro.get("tipo") == "Propia SETF" and registro.get("anio") is not None:
+        if int(fecha.year) != int(registro["anio"]):
+            raise ValueError("El año de esta minuta debe coincidir con el de su folio. "
+                             "El código institucional no se puede modificar.")
+    proyecto_hoja = "México-Querétaro" if proyecto == "Extensión de Suburbanos Mex-Qro" else proyecto
+    with _candado_minutas_instancia():
+        libro, hoja_maestra = _hoja_minutas_setf()
+        if _clave_vinculo_minuta_setf(registro) in _bajas_minutas_setf(libro):
+            raise ValueError("La minuta ya fue dada de baja. Recarga la página.")
+        hoja, fila = _minuta_registro_vigente_setf(registro, libro, hoja_maestra)
+        if registro["origen"] == "MINUTAS":
+            asunto_valor = _asunto_con_hipervinculo_minuta_setf(hoja, fila, asunto)
+            proyecto_valor = _texto_sheets_seguro(proyecto_hoja)
+            modo = "USER_ENTERED"
+        else:
+            asunto_valor = asunto
+            proyecto_valor = proyecto_hoja
+            modo = "RAW"
+        hoja.update(
+            range_name=f"B{fila}:D{fila}",
+            values=[[asunto_valor, fecha.strftime("%d/%m/%Y"), proyecto_valor]],
+            value_input_option=modo,
+        )
+        # Verificar antes de confirmar; no modificar A (clave) ni E (enlace).
+        actualizado = hoja.row_values(fila)
+        if len(actualizado) < 4 or str(actualizado[1]).strip() != asunto or \
+                str(actualizado[2]).strip() != fecha.strftime("%d/%m/%Y") or \
+                str(actualizado[3]).strip() != proyecto_valor:
+            raise RuntimeError("No se pudo verificar la edición en Sheets. Revisa la hoja antes de reintentar.")
+    _minutas_vista_compartida.clear()
+    return True
+
+
+def _dar_baja_minuta_setf(registro, motivo=""):
+    """Oculta el registro en la app sin destruir el folio, la fila o el PDF en Drive."""
+    exigir_sesion()
+    if _area_activa_validada() != "setf":
+        raise PermissionError("Solo SETF puede eliminar minutas de su consulta.")
+    if not es_administrador_documental_setf():
+        raise PermissionError("La eliminación de minutas está reservada a la administración documental de SETF.")
+    ident = _clave_vinculo_minuta_setf(registro)
+    with _candado_minutas_instancia():
+        libro, hoja_maestra = _hoja_minutas_setf()
+        if ident in _bajas_minutas_setf(libro):
+            raise ValueError("Esta minuta ya fue eliminada de la consulta. Recarga la página.")
+        _minuta_registro_vigente_setf(registro, libro, hoja_maestra)
+        bajas = _hoja_bajas_minutas_setf(libro, crear=True)
+        bajas.append_row([
+            ident, str(registro.get("numero", "")), str(registro.get("asunto", "")),
+            str(motivo or "").strip(), identificador_sesion(),
+            datetime.now().astimezone().isoformat(timespec="seconds"),
+        ], value_input_option="RAW")
+        if ident not in _bajas_minutas_setf(libro):
+            raise RuntimeError("No se pudo confirmar la baja en Sheets. Verifica la pestaña MINUTAS_BAJAS_APP.")
     _minutas_vista_compartida.clear()
     return True
 
@@ -13010,12 +13167,14 @@ def _modulo_minutas_setf():
         id_libro = _id_libro_minutas_setf()
         libro, hoja = _hoja_minutas_setf()
         # Una instantánea por ventana de caché (no por cada botón o filtro).
-        actuales, externas_app, vinculos_manuales = _minutas_vista_compartida(id_libro)
-        total = actuales + externas_app
+        actuales, externas_app, vinculos_manuales, bajas = _minutas_vista_compartida(id_libro)
+        # No modificar los diccionarios devueltos por el caché compartido.
+        total = [dict(registro) for registro in actuales + externas_app]
         for registro in total:
-            enlace_manual = vinculos_manuales.get(_clave_vinculo_minuta_setf(registro))
-            if _clave_vinculo_minuta_setf(registro) in vinculos_manuales:
-                registro["enlace"] = enlace_manual
+            ident = _clave_vinculo_minuta_setf(registro)
+            if ident in vinculos_manuales:
+                registro["enlace"] = vinculos_manuales[ident]
+        visibles = [r for r in total if _clave_vinculo_minuta_setf(r) not in bajas]
         codigo, fila_reservada, prox = _consecutivo_siguiente_setf(actuales, 2026)
     except Exception as error:
         st.error(f"No se pudo abrir el control de minutas de SETF: {error}")
@@ -13027,11 +13186,13 @@ def _modulo_minutas_setf():
                     "Control Interno SETF y que exista la pestaña MINUTAS. "
                     "Los registros no se modificaron.")
         return
-    propias = [r for r in actuales if r["tipo"] == "Propia SETF" and r["registrada"]]
-    otras = [r for r in total if r["tipo"] == "Otra reunión" and r["registrada"]]
+    propias = [r for r in visibles if r["tipo"] == "Propia SETF" and r["registrada"]]
+    otras = [r for r in visibles if r["tipo"] == "Otra reunión" and r["registrada"]]
+    # La numeración conserva todos los folios usados, incluso los dados de baja.
+    historico_propias = [r for r in actuales if r["tipo"] == "Propia SETF" and r["registrada"]]
     k1,k2,k3,k4 = st.columns(4, gap="small")
     for columna,valor,etiqueta,clase in [
-        (k1, f"AIFA-ITEyPF-SETF-{max([58, *[r['consecutivo'] for r in propias if r['anio'] == 2026]]):04d}-2026", "Última minuta propia · 2026", "ultima"),
+        (k1, f"AIFA-ITEyPF-SETF-{max([58, *[r['consecutivo'] for r in historico_propias if r['anio'] == 2026]]):04d}-2026", "Última minuta propia · 2026", "ultima"),
         (k2, codigo, "Siguiente consecutivo · 2026", "siguiente"),
         (k3, str(len(propias)), "Minutas propias registradas", "propias"),
         (k4, str(len(otras)), "Minutas de otras reuniones", "otras"),
@@ -13126,9 +13287,9 @@ def _modulo_minutas_setf():
         with c2:
             filtro_tipo = st.selectbox("Tipo de minuta", ["Todas", "Propias SETF", "Otras reuniones"], key="minutas_filtro_tipo")
         with c3:
-            proyectos = sorted({r["proyecto"] for r in total if r["proyecto"]})
+            proyectos = sorted({r["proyecto"] for r in visibles if r["proyecto"]})
             filtro_proyecto = st.selectbox("Proyecto", ["Todos", *proyectos], key="minutas_filtro_proyecto")
-    registros = [r for r in total if r["registrada"]]
+    registros = [r for r in visibles if r["registrada"]]
     if filtro_tipo == "Propias SETF":
         registros = [r for r in registros if r["tipo"] == "Propia SETF"]
     elif filtro_tipo == "Otras reuniones":
@@ -13159,6 +13320,92 @@ def _modulo_minutas_setf():
                 else:
                     st.button("Sin enlace", disabled=True, use_container_width=True,
                               key=f"sin_enlace_minuta_{r['origen']}_{r['fila']}")
+            # Edición y baja seguras del registro: no tocar folios ni archivos en Drive.
+            clave_item = f"{r['origen']}_{r['fila']}"
+            col_editar, col_eliminar = st.columns(2, gap="small")
+            with col_editar:
+                if st.button("✏️ Editar minuta", key=f"minutas_boton_editar_{clave_item}",
+                             use_container_width=True, type="secondary"):
+                    st.session_state[f"minutas_mostrar_edicion_{clave_item}"] = not st.session_state.get(
+                        f"minutas_mostrar_edicion_{clave_item}", False)
+                    st.session_state.pop(f"minutas_mostrar_baja_{clave_item}", None)
+                    st.rerun()
+            with col_eliminar:
+                if es_administrador_documental_setf():
+                    if st.button("🗑️ Eliminar minuta", key=f"minutas_boton_eliminar_{clave_item}",
+                                 use_container_width=True, type="secondary"):
+                        st.session_state[f"minutas_mostrar_baja_{clave_item}"] = not st.session_state.get(
+                            f"minutas_mostrar_baja_{clave_item}", False)
+                        st.session_state.pop(f"minutas_mostrar_edicion_{clave_item}", None)
+                        st.rerun()
+            if st.session_state.get(f"minutas_mostrar_edicion_{clave_item}", False):
+                st.markdown("**Editar información de la minuta**")
+                st.caption("La clave institucional y el tipo no cambian. El enlace se edita en el apartado inferior.")
+                fecha_actual = _fecha_edicion_minuta_setf(r["fecha"])
+                with st.form(key=f"minutas_form_editar_{clave_item}"):
+                    asunto_editar = st.text_area("Asunto de la reunión", value=r["asunto"],
+                                                key=f"minutas_asunto_editar_{clave_item}", height=90)
+                    c_fecha, c_proyecto = st.columns([1, 2], gap="small")
+                    with c_fecha:
+                        if fecha_actual is not None:
+                            fecha_editar = st.date_input("Fecha de la reunión", value=fecha_actual,
+                                                         format="DD/MM/YYYY", key=f"minutas_fecha_editar_{clave_item}")
+                        else:
+                            fecha_texto = st.text_input("Fecha (DD/MM/AAAA)", value=r["fecha"],
+                                                         key=f"minutas_fecha_texto_{clave_item}")
+                            fecha_editar = _fecha_edicion_minuta_setf(fecha_texto)
+                    with c_proyecto:
+                        opciones_edicion = ["Tren Maya", "AIFA-Pachuca", "Extensión de Suburbanos Mex-Qro", "Otro proyecto"]
+                        proyecto_previo = ("Extensión de Suburbanos Mex-Qro" if r["proyecto"] == "México-Querétaro"
+                                           else r["proyecto"])
+                        proyecto_opcion = (proyecto_previo if proyecto_previo in opciones_edicion[:-1]
+                                           else "Otro proyecto")
+                        proyecto_elegido = st.selectbox("Proyecto", opciones_edicion,
+                                                         index=opciones_edicion.index(proyecto_opcion),
+                                                         key=f"minutas_proyecto_editar_{clave_item}")
+                        if proyecto_elegido == "Otro proyecto":
+                            proyecto_editar = st.text_input("Nombre del proyecto", value=r["proyecto"],
+                                                             key=f"minutas_otro_editar_{clave_item}")
+                        else:
+                            proyecto_editar = proyecto_elegido
+                    guardar_edicion = st.form_submit_button("Guardar cambios de la minuta", type="primary",
+                                                            use_container_width=True)
+                if guardar_edicion:
+                    try:
+                        if fecha_editar is None:
+                            raise ValueError("La fecha debe tener el formato DD/MM/AAAA.")
+                        _editar_minuta_setf(r, asunto_editar, fecha_editar, proyecto_editar)
+                        st.session_state.pop(f"minutas_mostrar_edicion_{clave_item}", None)
+                        for key_sufijo in ("asunto_editar", "fecha_editar", "fecha_texto",
+                                           "proyecto_editar", "otro_editar"):
+                            st.session_state.pop(f"minutas_{key_sufijo}_{clave_item}", None)
+                        st.session_state["minutas_confirmacion_setf"] = "Minuta actualizada correctamente."
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"No se pudieron guardar los cambios: {error}")
+            if st.session_state.get(f"minutas_mostrar_baja_{clave_item}", False):
+                st.warning("Esta acción retirará la minuta de la consulta. Se conservarán la fila, "
+                           "el folio y los archivos de Google Drive; el consecutivo no se reutilizará.")
+                with st.form(key=f"minutas_form_baja_{clave_item}"):
+                    motivo_baja = st.text_input("Motivo de eliminación (opcional)",
+                                                key=f"minutas_motivo_baja_{clave_item}")
+                    confirmar_baja = st.checkbox("Confirmo que deseo retirar esta minuta de la consulta",
+                                                 key=f"minutas_confirmar_baja_{clave_item}")
+                    ejecutar_baja = st.form_submit_button("Confirmar eliminación de la minuta",
+                                                           use_container_width=True)
+                if ejecutar_baja:
+                    if not confirmar_baja:
+                        st.error("Marca la casilla de confirmación antes de eliminar la minuta.")
+                    else:
+                        try:
+                            _dar_baja_minuta_setf(r, motivo_baja)
+                            st.session_state.pop(f"minutas_mostrar_baja_{clave_item}", None)
+                            st.session_state["minutas_confirmacion_setf"] = (
+                                "Minuta retirada de la consulta. Se conservaron el folio y el documento en Drive."
+                            )
+                            st.rerun()
+                        except Exception as error:
+                            st.error(f"No se pudo eliminar la minuta: {error}")
             with st.expander("🔗  Vincular o actualizar documento", expanded=False):
                 st.markdown(
                     '<div class="setf-min-link-intro"><strong>Enlace directo a la minuta</strong>'
