@@ -12723,13 +12723,19 @@ def _hoja_bajas_minutas_setf(libro, crear=False):
     return hoja
 
 
-def _bajas_minutas_setf(libro):
-    """Identificadores retirados de la consulta. Sin fila borrada ni consecutivo reutilizado."""
-    hoja = _hoja_bajas_minutas_setf(libro)
+def _bajas_minutas_setf(libro, hoja=None):
+    """Identificadores retirados; permite reutilizar la hoja ya consultada.
+
+    El snapshot de consulta sigue leyendo información fresca según su TTL;
+    una operación de escritura debe verificar bajas reales, sin usar caché.
+    """
+    if hoja is None:
+        hoja = _hoja_bajas_minutas_setf(libro)
     if hoja is None:
         return set()
-    return {str(fila[0]).strip() for fila in hoja.get_all_values()[1:]
-            if fila and str(fila[0]).strip()}
+    # Basta leer la columna A: el resto contiene datos de auditoría extensos.
+    return {str(ident).strip() for ident in hoja.col_values(1)[1:]
+            if str(ident).strip()}
 
 
 def _minuta_registro_vigente_setf(registro, libro, hoja_maestra):
@@ -12843,17 +12849,29 @@ def _dar_baja_minuta_setf(registro, motivo=""):
     ident = _clave_vinculo_minuta_setf(registro)
     with _candado_minutas_instancia():
         libro, hoja_maestra = _hoja_minutas_setf()
-        if ident in _bajas_minutas_setf(libro):
+        # Una sola resolución de la pestaña de bajas y una lectura SOLO de IDs.
+        # No crear una pestaña nueva antes de verificar la fila original.
+        bajas = _hoja_bajas_minutas_setf(libro)
+        if bajas is not None and ident in _bajas_minutas_setf(libro, hoja=bajas):
             raise ValueError("Esta minuta ya fue eliminada de la consulta. Recarga la página.")
         _minuta_registro_vigente_setf(registro, libro, hoja_maestra)
-        bajas = _hoja_bajas_minutas_setf(libro, crear=True)
-        bajas.append_row([
+        if bajas is None:
+            bajas = _hoja_bajas_minutas_setf(libro, crear=True)
+        respuesta = bajas.append_row([
             ident, str(registro.get("numero", "")), str(registro.get("asunto", "")),
             str(motivo or "").strip(), identificador_sesion(),
             datetime.now().astimezone().isoformat(timespec="seconds"),
         ], value_input_option="RAW")
-        if ident not in _bajas_minutas_setf(libro):
-            raise RuntimeError("No se pudo confirmar la baja en Sheets. Verifica la pestaña MINUTAS_BAJAS_APP.")
+        # Google Sheets values.append confirma la fila escrita en 'updates'.
+        # Evitar descargar otra vez TODA MINUTAS_BAJAS_APP si hay acuse.
+        detalles = respuesta.get("updates") if isinstance(respuesta, dict) else None
+        if isinstance(detalles, dict) and "updatedRows" in detalles:
+            if int(detalles["updatedRows"]) != 1:
+                raise RuntimeError("Google Sheets no confirmó exactamente una baja. Revisa MINUTAS_BAJAS_APP.")
+        elif ident not in _bajas_minutas_setf(libro, hoja=bajas):
+            # Compatibilidad con versiones/respuestas que omiten 'updates'.
+            raise RuntimeError("No se pudo confirmar la baja en Sheets. Verifica MINUTAS_BAJAS_APP.")
+    # Invalidar tras la escritura exitosa: otras sesiones no verán datos viejos.
     _minutas_vista_compartida.clear()
     return True
 
@@ -13302,8 +13320,24 @@ def _modulo_minutas_setf():
             (r["numero"],r["asunto"],r["fecha"],r["proyecto"])
         ).casefold()]
     registros.sort(key=lambda r: (str(r["fecha"]), r["numero"]), reverse=True)
+    # Hasta 100 tarjetas con formularios se construían en cada interacción.
+    # Paginamos sin alterar el diseño individual: el costo de los widgets no
+    # aumenta al acumular cientos de minutas o al dar de baja una antigua.
+    tamano_pagina = 18
+    filtros_actuales = (buscar.strip(), filtro_tipo, filtro_proyecto)
+    if st.session_state.get("minutas_filtro_vista_anterior") != filtros_actuales:
+        st.session_state["minutas_filtro_vista_anterior"] = filtros_actuales
+        st.session_state["minutas_pagina_actual"] = 0
+    total_paginas = max(1, (len(registros) + tamano_pagina - 1) // tamano_pagina)
+    pagina_actual = max(0, min(int(st.session_state.get("minutas_pagina_actual", 0)), total_paginas - 1))
+    st.session_state["minutas_pagina_actual"] = pagina_actual
+    inicio_pagina = pagina_actual * tamano_pagina
+    fin_pagina = min(inicio_pagina + tamano_pagina, len(registros))
     st.caption(f"{len(registros)} minuta(s) encontradas · Los folios preparados sin asunto no se consideran registros.")
-    for r in registros[:100]:
+    if total_paginas > 1:
+        st.caption(f"Mostrando {inicio_pagina + 1}–{fin_pagina} · Página {pagina_actual + 1} de {total_paginas}.")
+    puede_eliminar_minutas = es_administrador_documental_setf()
+    for r in registros[inicio_pagina:fin_pagina]:
         titulo = html.escape(r["numero"] or "Sin clave")
         asunto = html.escape(r["asunto"] or "Sin asunto")
         proyecto = html.escape(r["proyecto"] or "Sin proyecto")
@@ -13331,7 +13365,7 @@ def _modulo_minutas_setf():
                     st.session_state.pop(f"minutas_mostrar_baja_{clave_item}", None)
                     st.rerun()
             with col_eliminar:
-                if es_administrador_documental_setf():
+                if puede_eliminar_minutas:
                     if st.button("🗑️ Eliminar minuta", key=f"minutas_boton_eliminar_{clave_item}",
                                  use_container_width=True, type="secondary"):
                         st.session_state[f"minutas_mostrar_baja_{clave_item}"] = not st.session_state.get(
@@ -13450,8 +13484,20 @@ def _modulo_minutas_setf():
                         st.error(f"No se pudo guardar el enlace: {error}")
     if not registros:
         st.info("No hay minutas que coincidan con los filtros seleccionados.")
-    elif len(registros) > 100:
-        st.caption("Se muestran las primeras 100 minutas. Utiliza los filtros para encontrar otras.")
+    elif total_paginas > 1:
+        previa, indicador, siguiente = st.columns([1, 2, 1], gap="small")
+        with previa:
+            if st.button("← Página anterior", key="minutas_pagina_anterior", type="secondary",
+                         use_container_width=True, disabled=pagina_actual == 0):
+                st.session_state["minutas_pagina_actual"] = pagina_actual - 1
+                st.rerun()
+        with indicador:
+            st.caption(f"Página {pagina_actual + 1} de {total_paginas} · {len(registros)} resultados")
+        with siguiente:
+            if st.button("Página siguiente →", key="minutas_pagina_siguiente", type="secondary",
+                         use_container_width=True, disabled=pagina_actual >= total_paginas - 1):
+                st.session_state["minutas_pagina_actual"] = pagina_actual + 1
+                st.rerun()
 
 
 def _modulo_minutas_diseno_pendiente():
